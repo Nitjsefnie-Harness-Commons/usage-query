@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "usage-query"
+dynamic = ["version"]
+description = "Rate-limit and quota utilization across Claude Code, Kimi and Codex accounts"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Nitjsefnie" }]
+keywords = ["claude", "codex", "kimi", "rate-limit", "quota", "usage"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Debuggers",
+]
+# Stdlib only, deliberately: these run inside hooks on every tool call, and a
+# dependency here would be paid for on every one of them.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Nitjsefnie-Harness-Commons/usage-query"
+Issues = "https://github.com/Nitjsefnie-Harness-Commons/usage-query/issues"
+
+[project.scripts]
+usage-query = "usage_query_lib.query:main"
+
+[tool.setuptools]
+packages = ["usage_query_lib"]
+
+[tool.setuptools.dynamic]
+# Single source of truth: the wheel and the package can never disagree.
+version = { attr = "usage_query_lib.__version__" }
