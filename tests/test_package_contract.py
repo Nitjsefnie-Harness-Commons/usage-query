@@ -51,10 +51,16 @@ def test_every_module_is_importable_by_name(tmp):
 
 
 def test_the_module_reports_its_own_version(tmp):
+    """Own version: what the package declares, not a literal to keep in step.
+
+    Pinning the number here made a release bump fail a test that has nothing
+    to say about which version is correct -- only that the CLI and the package
+    agree, which is the thing that breaks silently."""
     _TMP[:] = [tmp]
+    mod = _util.load(_util.script("query.py"), "contract_version")
     r = _run(["-m", f"{PACKAGE}.query", "--version"])
     out = (r.stdout + r.stderr).strip()
-    assert out == "usage_query 1.0.0", out
+    assert out == f"usage_query {mod.__version__}", out
 
 
 def test_the_module_has_a_main_the_entry_point_can_call(tmp):

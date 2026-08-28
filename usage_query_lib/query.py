@@ -113,7 +113,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
@@ -142,6 +142,23 @@ KIMI_CRED = os.path.expanduser("~/.kimi-code/credentials/kimi-code.json")
 KIMI_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_OAUTH_CLIENT_ID_FALLBACK = "17e5f671-d194-4dfb-9706-5516cb48c098"
 CODEX_BIN = os.environ.get("CODEX_BIN") or shutil.which("codex") or "codex"
+
+
+class ProviderNotConfigured(RuntimeError):
+    """This machine does not have that provider: its credential source is absent.
+
+    Distinct from every other failure here, which describes a provider that IS
+    installed and could not be read. A box that never had a provider, or had it
+    uninstalled, should not be told once per query that reading it failed --
+    that is a report about a machine the operator does not have.
+    """
+
+
+def _require_configured(account, source):
+    """Raise ProviderNotConfigured unless `source` (a credential file) exists."""
+    if not os.path.exists(source):
+        raise ProviderNotConfigured(
+            f"{account} is not configured on this machine: {source} is absent")
 TIMEOUT = 5
 CODEX_RPC_TIMEOUT = 10
 # Refresh the stored Kimi access token (and persist the rotation) if it expires
@@ -363,6 +380,7 @@ def query_claude():
     transient 429). If the live fetch still fails, we fall back to the last cached
     payload however stale, tagged with '_stale_age' (seconds) so the caller can
     label it — better a known-old number than an error."""
+    _require_configured("Claude", CLAUDE_CRED)
     now = time.time()
     data, stale = None, None
     try:
@@ -576,6 +594,7 @@ def query_kimi():
     used/limit*100, the same 'how full' utilization sense as the Claude side.
     On a failed live fetch we fall back to the last cached payload (however
     stale), tagged with '_stale_age' seconds — same as the Claude side."""
+    _require_configured("Kimi", KIMI_CRED)
     now = time.time()
     data, stale = None, None
     try:
@@ -644,6 +663,10 @@ def _codex_rpc_rate_limits():
             [CODEX_BIN, "app-server", "--stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    except FileNotFoundError as exc:
+        raise ProviderNotConfigured(
+            "Codex is not configured on this machine: the codex CLI "
+            f"({CODEX_BIN}) is absent") from exc
     except OSError as exc:
         raise RuntimeError("Codex CLI/app-server is unavailable: %s" % exc) from exc
 
@@ -926,25 +949,28 @@ def main(argv=None):
     want_kimi = not (args.claude or args.codex)
     want_codex = not (args.claude or args.kimi)
 
-    results, errors = {}, {}
-    if want_claude:
+    # Asking for one provider by name makes its absence the answer to the
+    # question, so it stays an error. A default sweep asks "what is on this
+    # box", and a provider that is not on it is not a failure of anything.
+    asked_by_name = args.claude or args.kimi or args.codex
+
+    results, errors, unconfigured = {}, {}, {}
+    for account, wanted, query in (("claude", want_claude, query_claude),
+                                   ("kimi", want_kimi, query_kimi),
+                                   ("codex", want_codex, query_codex)):
+        if not wanted:
+            continue
         try:
-            results["claude"] = query_claude()
+            results[account] = query()
+        except ProviderNotConfigured as e:
+            (errors if asked_by_name else unconfigured)[account] = (
+                f"{type(e).__name__}: {e}")
         except Exception as e:
-            errors["claude"] = f"{type(e).__name__}: {e}"
-    if want_kimi:
-        try:
-            results["kimi"] = query_kimi()
-        except Exception as e:
-            errors["kimi"] = f"{type(e).__name__}: {e}"
-    if want_codex:
-        try:
-            results["codex"] = query_codex()
-        except Exception as e:
-            errors["codex"] = f"{type(e).__name__}: {e}"
+            errors[account] = f"{type(e).__name__}: {e}"
 
     if args.json:
-        json.dump({"usage": results, "errors": errors}, sys.stdout, indent=2)
+        json.dump({"usage": results, "errors": errors,
+                   "unconfigured": unconfigured}, sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         rows = []

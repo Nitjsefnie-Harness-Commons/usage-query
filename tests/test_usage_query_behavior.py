@@ -4,7 +4,7 @@ import io
 import json
 import os
 import sys
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -111,6 +111,62 @@ def test_provider_selection_flags_query_only_the_selected_account(tmp):
         _assert_provider_selection(mod, flag, selected)
 
 
+def test_an_uninstalled_provider_is_skipped_not_reported_as_an_error(tmp):
+    """A default sweep asks what is on this box; a provider that is not on it
+    is not a failure. Removing Kimi from a machine turned every query into
+    `Kimi: ERROR - FileNotFoundError ...` on stderr with exit status 1."""
+    del tmp
+    mod = _load()
+    absent = mod.ProviderNotConfigured("Kimi is not configured on this machine")
+    with mock.patch.object(mod, "query_claude",
+                           side_effect=lambda: {"five_hour": {"pct": 1}}), \
+            mock.patch.object(mod, "query_kimi", side_effect=absent), \
+            mock.patch.object(mod, "query_codex",
+                              side_effect=lambda: {"five_hour": {"pct": 2}}):
+        output, errs = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errs):
+            rc = mod.main(["--json"])
+    payload = json.loads(output.getvalue())
+    assert rc == 0
+    assert payload["errors"] == {}
+    assert set(payload["usage"]) == {"claude", "codex"}
+    assert "kimi" in payload["unconfigured"]
+    assert errs.getvalue() == ""
+
+
+def test_naming_an_uninstalled_provider_is_still_an_error(tmp):
+    """Asking for it by name makes its absence the answer to the question."""
+    del tmp
+    mod = _load()
+    absent = mod.ProviderNotConfigured("Kimi is not configured on this machine")
+    with mock.patch.object(mod, "query_kimi", side_effect=absent):
+        output, errs = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errs):
+            rc = mod.main(["--kimi", "--json"])
+    payload = json.loads(output.getvalue())
+    assert rc == 1
+    assert "kimi" in payload["errors"]
+    assert payload["unconfigured"] == {}
+
+
+def test_a_removed_provider_is_not_spoken_for_by_its_leftover_cache(tmp):
+    """The credential check runs before the cache read, so a cache written
+    while the provider was installed cannot answer for it afterwards."""
+    mod = _load()
+    cache = os.path.join(tmp, "kimi-cache.json")
+    with open(cache, "w", encoding="utf-8") as fh:
+        json.dump({"data": {"limits": []}, "fetched_at": 2 ** 31}, fh)
+    with mock.patch.object(mod, "KIMI_CACHE", cache), \
+            mock.patch.object(mod, "KIMI_CRED",
+                              os.path.join(tmp, "absent.json")):
+        try:
+            mod.query_kimi()
+        except mod.ProviderNotConfigured:
+            pass
+        else:
+            raise AssertionError("a leftover cache answered for a removed provider")
+
+
 def test_version_flag_prints_the_tool_version_without_querying(tmp):
     del tmp
     mod = _load()
@@ -120,7 +176,7 @@ def test_version_flag_prints_the_tool_version_without_querying(tmp):
             mod.main(["--version"])
         except SystemExit as exc:
             assert exc.code == 0
-    assert output.getvalue().strip() == "usage_query 1.0.0"
+    assert output.getvalue().strip() == "usage_query 1.1.0"
 
 
 def main():
