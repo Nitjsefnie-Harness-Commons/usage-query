@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone ``usage-query`` command for Claude, Kimi-Code, and Codex.
+"""Standalone ``usage-query`` command for Claude, Kimi-Code, Codex, and z.ai.
 
 This public distribution provides a direct, on-demand companion to the
 ``usage-monitor.py`` PostToolUse hook: that hook announces usage passively on
@@ -17,6 +17,11 @@ Sources (same endpoints/credentials the hook uses):
             bearer = ~/.kimi-code/credentials/kimi-code.json -> access_token
             5h window  = limits[] entry with window.duration==300 MINUTE (used/limit)
             weekly     = top-level usage block (used/limit)
+  - z.ai:   GET https://api.z.ai/api/monitor/usage/quota/limit
+            auth   = RAW key, no Bearer prefix (~/.pi/agent/auth.json -> zai.key)
+            5h window  = limits[] with unit 3 (hours) x number 5
+            weekly     = limits[] with unit 6 (weeks) x number 1
+            each window line is tagged with the peak/off-peak billing state
   - Codex:  `codex app-server` JSON-RPC account/rateLimits/read
             auth/refresh = Codex-owned (file, keyring, API key, or access token)
             windows      = every primary/secondary window in every limit bucket
@@ -82,7 +87,8 @@ Flags:
   --claude        only query Claude
   --kimi          only query Kimi
   --codex         only query Codex
-  (default)       query all three
+  --zai           only query z.ai
+  (default)       query all four
   --json          emit a JSON object instead of human-readable lines
   --quiet         suppress per-account error lines (still exits non-zero on
                   any requested-account failure)
@@ -110,10 +116,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
@@ -141,6 +147,22 @@ KIMI_CRED = os.path.expanduser("~/.kimi-code/credentials/kimi-code.json")
 # literal below is only the last-resort fallback.
 KIMI_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_OAUTH_CLIENT_ID_FALLBACK = "17e5f671-d194-4dfb-9706-5516cb48c098"
+# The z.ai key authenticates with the bare value in the Authorization header -
+# deliberately NO "Bearer" prefix (the documented form; verified live 2026-08-28).
+ZAI_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+ZAI_CRED = os.path.expanduser("~/.pi/agent/auth.json")
+# Window unit codes observed in the limits[] payload: 3 = hours, 6 = weeks. An
+# unlisted unit still surfaces (as a scoped row labelled unitNxM) rather than
+# being dropped - an unobserved code must degrade visibly, not silently.
+ZAI_UNIT_SECS = {3: 3600, 6: 604800}
+# Peak-hours billing window for the z.ai coding plan (see _zai_peak_note):
+# PUBLISHED POLICY, not an API fact - no endpoint exposes it (checked
+# 2026-08-28). Re-verify against https://docs.z.ai/devpack/usage-policy if the
+# 0.5x off-peak rate ever looks wrong.
+ZAI_TZ = timezone(timedelta(hours=8))  # China: no DST, fixed offset is exact
+ZAI_PEAK_DAYS = (0, 1, 2, 3, 4)  # Monday..Friday, datetime.weekday() (Mon=0)
+ZAI_PEAK_START_MIN = 14 * 60
+ZAI_PEAK_END_MIN = 18 * 60  # end exclusive: 18:00:00 is already off-peak
 CODEX_BIN = os.environ.get("CODEX_BIN") or shutil.which("codex") or "codex"
 
 
@@ -178,6 +200,7 @@ TEMPDIR = tempfile.gettempdir()
 CACHE = os.path.join(TEMPDIR, ".claude_usage_cache.json")
 KIMI_CACHE = os.path.join(TEMPDIR, ".claude_kimi_usage_cache.json")
 CODEX_CACHE = os.path.join(TEMPDIR, ".codex_usage_cache.json")
+ZAI_CACHE = os.path.join(TEMPDIR, ".zai_usage_cache.json")
 CACHE_TTL = 30
 
 
@@ -653,6 +676,120 @@ def query_kimi():
     return out
 
 
+def _zai_cred():
+    """The z.ai API key from the harness auth file: {"zai": {"key": ...}}."""
+    with open(ZAI_CRED, encoding="utf-8") as f:
+        auth = json.load(f)
+    entry = auth.get("zai")
+    key = entry.get("key") if isinstance(entry, dict) else entry
+    if not key:
+        raise RuntimeError("no API key under the 'zai' field of auth.json")
+    return str(key)
+
+
+def _zai_peak_note(now=None):
+    """'peak 1x' or 'off-peak 0.5x': the billing state of `now` (UTC datetime,
+    default the real clock) against the published z.ai peak window.
+
+    Computed, not queried: no z.ai payload carries a peak flag (checked against
+    the quota and model-usage monitor endpoints, 2026-08-28), so the rule the
+    window constants at the top of this module encode IS the source of truth,
+    and they carry the provenance needed to re-verify it when the policy
+    moves. End-exclusive so 18:00:00 itself reads off-peak.
+    """
+    moment = (now or datetime.now(timezone.utc)).astimezone(ZAI_TZ)
+    peak = (moment.weekday() in ZAI_PEAK_DAYS
+            and ZAI_PEAK_START_MIN <= moment.hour * 60 + moment.minute
+            < ZAI_PEAK_END_MIN)
+    return "peak 1x" if peak else "off-peak 0.5x"
+
+
+def _normalize_zai(envelope, peak_note):
+    """Normalize one fetched or cache-fallen-back quota envelope: windows keyed
+    five_hour/weekly when the unit/number pair names them, every other window
+    as a scoped row (an unobserved unit degrades visibly), plus the plan tier.
+    `peak_note` is computed once per query by the caller and stamped on every
+    window - all windows share the same billing clock."""
+    data = envelope.get("data") or {}
+    unit_names = {3: "h", 6: "w"}
+    out, scoped = {}, []
+    for it in data.get("limits") or []:
+        unit = int(it.get("unit") or 0)
+        number = int(it.get("number") or 0)
+        seconds = ZAI_UNIT_SECS.get(unit, 0) * number or None
+        reset_iso = _codex_reset_iso(
+            (float(it.get("nextResetTime") or 0) / 1000.0) or None)
+        at, dur = _reset_info(reset_iso)
+        pct = float(it.get("percentage") or 0)
+        window = {"pct": pct,
+                  "resets_at": at, "resets_in": dur,
+                  "pace_pct": _pace_pct(reset_iso, seconds),
+                  "recover_in": _recover_dur(reset_iso, seconds, pct),
+                  "peak_note": peak_note}
+        key = {5 * 3600: "five_hour", 7 * 86400: "weekly"}.get(seconds or 0)
+        if key and key not in out:
+            out[key] = window
+            continue
+        window["label"] = (f"{number}{unit_names[unit]}"
+                           if unit in unit_names and number
+                           else f"unit{unit}x{number}")
+        scoped.append(window)
+    if scoped:
+        out["_scoped"] = scoped
+    if data.get("level"):
+        out["_plan_type"] = str(data["level"])
+    if not any(name in out for name in ("five_hour", "weekly", "_scoped")):
+        raise RuntimeError("z.ai quota response contained no windows")
+    return out
+
+
+def query_zai():
+    """{'five_hour': {...}, 'weekly': {...}, '_scoped': [...], '_plan_type': str,
+    '_stale_age': int?} normalized, or raises.
+
+    `limits[]` entries carry the window in unit/number, the allowance in
+    `usage` (a confusing name - `currentValue` is what was consumed), and
+    `percentage` used, with `nextResetTime` in epoch milliseconds. Fresh cache
+    wins; on a failed live fetch the last cached payload is used however
+    stale, tagged with '_stale_age' - same as every other provider here."""
+    _require_configured("z.ai", ZAI_CRED)
+    now = time.time()
+    data, stale = None, None
+    try:
+        with open(ZAI_CACHE, encoding="utf-8") as f:
+            c = json.load(f)
+        cdata = c.get("data")
+        cage = now - float(c.get("fetched_at") or 0)
+        if cdata is not None:
+            if cage < CACHE_TTL:
+                data = cdata
+            else:
+                stale = (cdata, int(cage))
+    except Exception:
+        pass
+    age = 0
+    if data is None:
+        try:
+            fetched = _get_retry(ZAI_URL, {
+                "Authorization": _zai_cred(),
+                "Accept-Language": "en-US,en",
+                "Content-Type": "application/json",
+            })
+            if fetched.get("code") not in (None, 200):
+                raise RuntimeError(
+                    "z.ai quota API error: %s" % fetched.get("msg"))
+            data = fetched
+            _write_cache(ZAI_CACHE, data)
+        except Exception:
+            if stale is None:
+                raise
+            data, age = stale
+    out = _normalize_zai(data, _zai_peak_note())
+    if age:
+        out["_stale_age"] = age
+    return out
+
+
 def _codex_rpc_rate_limits():
     """Read Codex ChatGPT limits through the supported app-server RPC surface.
 
@@ -870,6 +1007,8 @@ def query_codex():
 
 
 _TZ_NOTE = " machine-local (already adjusted; use as-is, no tz conversion)"
+# Table account names, for the few where capitalize() reads wrong.
+_DISPLAY = {"zai": "z.ai"}
 
 
 def _table_rows(account, res):
@@ -887,6 +1026,8 @@ def _table_rows(account, res):
         w = res.get(key)
         if not isinstance(w, dict):
             continue
+        if w.get("peak_note"):
+            label += f" ({w['peak_note']})"
         pace = w.get("pace_pct")
         rec = w.get("recover_in")
         flag = ("OVER PACE" + (f" (on pace in {rec})" if rec else "")
@@ -897,11 +1038,13 @@ def _table_rows(account, res):
                      str(w["resets_in"]), flag))
         name = ""
     for sc in res.get("_scoped") or []:
+        label = sc["label"] + (f" ({sc['peak_note']})"
+                               if sc.get("peak_note") else "")
         pace = sc.get("pace_pct")
         rec = sc.get("recover_in")
         flag = ("OVER PACE" + (f" (on pace in {rec})" if rec else "")
                 if pace is not None and sc["pct"] > pace + 0.5 else "")
-        rows.append((name, sc["label"], f"{sc['pct']:.0f}%",
+        rows.append((name, label, f"{sc['pct']:.0f}%",
                      "—" if pace is None else f"{pace:.0f}%",
                      str(sc["resets_at"]).replace(_TZ_NOTE, ""),
                      str(sc["resets_in"]), flag))
@@ -931,7 +1074,8 @@ def _render_table(rows):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Query Claude, Kimi, and/or Codex rate-limit utilization.")
+        description="Query Claude, Kimi, Codex, and/or z.ai rate-limit "
+                    "utilization.")
     ap.add_argument("--version", action="version",
                     version=f"usage_query {__version__}")
     g = ap.add_mutually_exclusive_group()
@@ -941,25 +1085,29 @@ def main(argv=None):
                    help="only query Kimi usage")
     g.add_argument("--codex", action="store_true",
                    help="only query Codex usage")
+    g.add_argument("--zai", action="store_true",
+                   help="only query z.ai usage")
     ap.add_argument("--json", action="store_true",
                     help="emit a JSON object instead of human-readable lines")
     ap.add_argument("--quiet", action="store_true",
                     help="suppress per-account error lines")
     args = ap.parse_args(argv)
 
-    want_claude = not (args.kimi or args.codex)
-    want_kimi = not (args.claude or args.codex)
-    want_codex = not (args.claude or args.kimi)
+    want_claude = not (args.kimi or args.codex or args.zai)
+    want_kimi = not (args.claude or args.codex or args.zai)
+    want_codex = not (args.claude or args.kimi or args.zai)
+    want_zai = not (args.claude or args.kimi or args.codex)
 
     # Asking for one provider by name makes its absence the answer to the
     # question, so it stays an error. A default sweep asks "what is on this
     # box", and a provider that is not on it is not a failure of anything.
-    asked_by_name = args.claude or args.kimi or args.codex
+    asked_by_name = args.claude or args.kimi or args.codex or args.zai
 
     results, errors, unconfigured = {}, {}, {}
     for account, wanted, query in (("claude", want_claude, query_claude),
                                    ("kimi", want_kimi, query_kimi),
-                                   ("codex", want_codex, query_codex)):
+                                   ("codex", want_codex, query_codex),
+                                   ("zai", want_zai, query_zai)):
         if not wanted:
             continue
         try:
@@ -976,12 +1124,12 @@ def main(argv=None):
         sys.stdout.write("\n")
     else:
         rows = []
-        for account in ("claude", "kimi", "codex"):
+        for account in ("claude", "kimi", "codex", "zai"):
+            name = _DISPLAY.get(account, account.capitalize())
             if account in results:
-                rows.extend(_table_rows(account.capitalize(), results[account]))
+                rows.extend(_table_rows(name, results[account]))
             elif account in errors and not args.quiet:
-                print(f"{account.capitalize()}: ERROR — {errors[account]}",
-                      file=sys.stderr)
+                print(f"{name}: ERROR — {errors[account]}", file=sys.stderr)
         if rows:
             print(_render_table(rows))
 

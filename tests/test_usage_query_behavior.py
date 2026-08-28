@@ -94,7 +94,8 @@ def _assert_provider_selection(mod, flag, selected):
 
     with mock.patch.object(mod, "query_claude", side_effect=lambda: result("claude")), \
             mock.patch.object(mod, "query_kimi", side_effect=lambda: result("kimi")), \
-            mock.patch.object(mod, "query_codex", side_effect=lambda: result("codex")):
+            mock.patch.object(mod, "query_codex", side_effect=lambda: result("codex")), \
+            mock.patch.object(mod, "query_zai", side_effect=lambda: result("zai")):
         output = io.StringIO()
         with redirect_stdout(output):
             rc = mod.main([flag, "--json"])
@@ -107,7 +108,7 @@ def test_provider_selection_flags_query_only_the_selected_account(tmp):
     del tmp
     mod = _load()
     for flag, selected in (("--claude", "claude"), ("--kimi", "kimi"),
-                           ("--codex", "codex")):
+                           ("--codex", "codex"), ("--zai", "zai")):
         _assert_provider_selection(mod, flag, selected)
 
 
@@ -122,7 +123,8 @@ def test_an_uninstalled_provider_is_skipped_not_reported_as_an_error(tmp):
                            side_effect=lambda: {"five_hour": {"pct": 1}}), \
             mock.patch.object(mod, "query_kimi", side_effect=absent), \
             mock.patch.object(mod, "query_codex",
-                              side_effect=lambda: {"five_hour": {"pct": 2}}):
+                              side_effect=lambda: {"five_hour": {"pct": 2}}), \
+            mock.patch.object(mod, "query_zai", side_effect=absent):
         output, errs = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errs):
             rc = mod.main(["--json"])
@@ -131,6 +133,7 @@ def test_an_uninstalled_provider_is_skipped_not_reported_as_an_error(tmp):
     assert payload["errors"] == {}
     assert set(payload["usage"]) == {"claude", "codex"}
     assert "kimi" in payload["unconfigured"]
+    assert "zai" in payload["unconfigured"]
     assert errs.getvalue() == ""
 
 
@@ -165,6 +168,15 @@ def test_a_removed_provider_is_not_spoken_for_by_its_leftover_cache(tmp):
             pass
         else:
             raise AssertionError("a leftover cache answered for a removed provider")
+    with mock.patch.object(mod, "ZAI_CACHE", os.path.join(tmp, "zai-cache.json")), \
+            mock.patch.object(mod, "ZAI_CRED",
+                              os.path.join(tmp, "zai-absent.json")):
+        try:
+            mod.query_zai()
+        except mod.ProviderNotConfigured:
+            pass
+        else:
+            raise AssertionError("a leftover cache answered for a removed provider")
 
 
 def test_version_flag_prints_the_tool_version_without_querying(tmp):
@@ -176,7 +188,110 @@ def test_version_flag_prints_the_tool_version_without_querying(tmp):
             mod.main(["--version"])
         except SystemExit as exc:
             assert exc.code == 0
-    assert output.getvalue().strip() == "usage_query 1.1.0"
+    assert output.getvalue().strip() == "usage_query 1.2.0"
+
+
+def _zai_envelope():
+    """A realistic /api/monitor/usage/quota/limit payload, captured live
+    2026-08-28 from a lite-plan account: unit 3 = hours, 6 = weeks, the
+    allowance confusingly named `usage`, plus an unobserved unit-4 window so
+    the scoped-row fallback has something to fall back to."""
+    def ms(dt):
+        return int(dt.timestamp() * 1000)
+
+    return {"code": 200, "msg": "Operation successful", "success": True,
+            "data": {"level": "lite", "limits": [
+                {"type": "CREDIT_LIMIT", "unit": 3, "number": 5,
+                 "usage": 2000, "currentValue": 26, "remaining": 1973,
+                 "percentage": 1,
+                 "nextResetTime": ms(datetime(2026, 8, 28, 15, 0,
+                                              tzinfo=timezone.utc))},
+                {"type": "CREDIT_LIMIT", "unit": 6, "number": 1,
+                 "usage": 10000, "currentValue": 52, "remaining": 9948,
+                 "percentage": 2,
+                 "nextResetTime": ms(datetime(2026, 9, 1, 12, 0,
+                                              tzinfo=timezone.utc))},
+                {"type": "CREDIT_LIMIT", "unit": 4, "number": 30,
+                 "usage": 1000, "currentValue": 5, "remaining": 995,
+                 "percentage": 1,
+                 "nextResetTime": ms(datetime(2026, 8, 28, 18, 0,
+                                              tzinfo=timezone.utc))},
+            ]}}
+
+
+def test_zai_normalization_keys_windows_plan_and_scoped_extras(tmp):
+    del tmp
+    mod = _load()
+    frozen = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+    with _frozen_clock(mod, frozen):
+        out = mod._normalize_zai(_zai_envelope(), "peak 1x")
+    assert out["five_hour"]["pct"] == 1.0
+    assert out["five_hour"]["pace_pct"] == 40.0  # 3h of the 5h window left
+    assert out["five_hour"]["peak_note"] == "peak 1x"
+    assert round(out["weekly"]["pace_pct"], 1) == 42.9  # 4d of 7d elapsed
+    assert out["_plan_type"] == "lite"
+    # The unobserved unit degrades to a visibly-labelled scoped row.
+    assert [s["label"] for s in out["_scoped"]] == ["unit4x30"]
+
+
+def test_zai_peak_note_follows_the_published_window(tmp):
+    del tmp
+    mod = _load()
+    cases = [
+        (datetime(2026, 1, 5, 7, 0, tzinfo=timezone.utc), "peak 1x"),
+        (datetime(2026, 1, 5, 9, 59, tzinfo=timezone.utc), "peak 1x"),
+        (datetime(2026, 1, 5, 10, 0, tzinfo=timezone.utc), "off-peak 0.5x"),
+        (datetime(2026, 1, 5, 5, 59, tzinfo=timezone.utc), "off-peak 0.5x"),
+        (datetime(2026, 1, 10, 15, 0, tzinfo=timezone.utc), "off-peak 0.5x"),
+    ]
+    for moment, expected in cases:
+        with _frozen_clock(mod, moment):
+            assert mod._zai_peak_note() == expected, moment.isoformat()
+
+
+def test_zai_query_reads_the_harness_auth_file_and_caches(tmp):
+    mod = _load()
+    cred = os.path.join(tmp, "auth.json")
+    with open(cred, "w", encoding="utf-8") as fh:
+        json.dump({"zai": {"type": "api", "key": "k" * 49}}, fh)
+    cache = os.path.join(tmp, "zai-cache.json")
+    with mock.patch.object(mod, "ZAI_CRED", cred), \
+            mock.patch.object(mod, "ZAI_CACHE", cache), \
+            mock.patch.object(mod, "_get_retry",
+                              side_effect=lambda *a, **k: _zai_envelope()):
+        out = mod.query_zai()
+    assert out["_plan_type"] == "lite"
+    with open(cache, encoding="utf-8") as fh:
+        assert json.load(fh)["data"]["code"] == 200
+
+
+def test_zai_query_rejects_a_keyless_entry_and_an_error_envelope(tmp):
+    mod = _load()
+    cred = os.path.join(tmp, "auth.json")
+    with open(cred, "w", encoding="utf-8") as fh:
+        json.dump({"zai": {"type": "api"}}, fh)
+    with mock.patch.object(mod, "ZAI_CRED", cred):
+        try:
+            mod.query_zai()
+        except RuntimeError as exc:
+            assert "no API key" in str(exc)
+        else:
+            raise AssertionError("a keyless zai entry authenticated")
+    with open(cred, "w", encoding="utf-8") as fh:
+        json.dump({"zai": {"type": "api", "key": "k"}}, fh)
+    bad = _zai_envelope()
+    bad["code"] = 500
+    bad["msg"] = "boom"
+    with mock.patch.object(mod, "ZAI_CRED", cred), \
+            mock.patch.object(mod, "ZAI_CACHE", os.path.join(tmp, "c.json")), \
+            mock.patch.object(mod, "_get_retry",
+                              side_effect=lambda *a, **k: bad):
+        try:
+            mod.query_zai()
+        except RuntimeError as exc:
+            assert "boom" in str(exc)
+        else:
+            raise AssertionError("an error envelope was accepted")
 
 
 def main():

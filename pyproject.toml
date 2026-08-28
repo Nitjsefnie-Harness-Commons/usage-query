@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "usage-query"
 dynamic = ["version"]
-description = "Rate-limit and quota utilization across Claude Code, Kimi and Codex accounts"
+description = "Rate-limit and quota utilization across Claude Code, Kimi, Codex and z.ai accounts"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Nitjsefnie" }]
-keywords = ["claude", "codex", "kimi", "rate-limit", "quota", "usage"]
+keywords = ["claude", "codex", "kimi", "zai", "rate-limit", "quota", "usage"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
