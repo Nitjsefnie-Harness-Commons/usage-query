@@ -119,7 +119,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
@@ -157,12 +157,15 @@ ZAI_CRED = os.path.expanduser("~/.pi/agent/auth.json")
 ZAI_UNIT_SECS = {3: 3600, 6: 604800}
 # Peak-hours billing window for the z.ai coding plan (see _zai_peak_note):
 # PUBLISHED POLICY, not an API fact - no endpoint exposes it (checked
-# 2026-08-28). Re-verify against https://docs.z.ai/devpack/usage-policy if the
-# 0.5x off-peak rate ever looks wrong.
+# 2026-08-28). Re-verify against https://z.ai/blog/glm-5.3 if the 0.5x off-peak
+# rate or weekday-only window ever looks wrong.
 ZAI_TZ = timezone(timedelta(hours=8))  # China: no DST, fixed offset is exact
 ZAI_PEAK_DAYS = (0, 1, 2, 3, 4)  # Monday..Friday, datetime.weekday() (Mon=0)
 ZAI_PEAK_START_MIN = 14 * 60
 ZAI_PEAK_END_MIN = 18 * 60  # end exclusive: 18:00:00 is already off-peak
+ZAI_PEAK_HOURS = "Mon-Fri 14:00-18:00 UTC+8"
+ZAI_OFF_PEAK_HOURS = (
+    "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; all day Sat-Sun")
 CODEX_BIN = os.environ.get("CODEX_BIN") or shutil.which("codex") or "codex"
 
 
@@ -687,21 +690,61 @@ def _zai_cred():
     return str(key)
 
 
-def _zai_peak_note(now=None):
-    """'peak 1x' or 'off-peak 0.5x': the billing state of `now` (UTC datetime,
-    default the real clock) against the published z.ai peak window.
+def _zai_billing_status(now=None):
+    """Current z.ai billing state, published hours, and next transition.
 
     Computed, not queried: no z.ai payload carries a peak flag (checked against
     the quota and model-usage monitor endpoints, 2026-08-28), so the rule the
     window constants at the top of this module encode IS the source of truth,
     and they carry the provenance needed to re-verify it when the policy
-    moves. End-exclusive so 18:00:00 itself reads off-peak.
+    moves. `now` is a UTC datetime by convention; the real clock is the default.
+    End-exclusive means 18:00:00 itself is off-peak and the next peak begins on
+    the next weekday.
     """
     moment = (now or datetime.now(timezone.utc)).astimezone(ZAI_TZ)
     peak = (moment.weekday() in ZAI_PEAK_DAYS
             and ZAI_PEAK_START_MIN <= moment.hour * 60 + moment.minute
             < ZAI_PEAK_END_MIN)
-    return "peak 1x" if peak else "off-peak 0.5x"
+    if peak:
+        transition = moment.replace(hour=18, minute=0, second=0, microsecond=0)
+        next_state = "off-peak"
+    else:
+        transition = moment.replace(hour=14, minute=0, second=0, microsecond=0)
+        if (moment.weekday() not in ZAI_PEAK_DAYS
+                or transition <= moment):
+            transition += timedelta(days=1)
+            while transition.weekday() not in ZAI_PEAK_DAYS:
+                transition += timedelta(days=1)
+        next_state = "peak"
+    return {
+        "state": "peak" if peak else "off-peak",
+        "multiplier": 1.0 if peak else 0.5,
+        "peak_hours": ZAI_PEAK_HOURS,
+        "off_peak_hours": ZAI_OFF_PEAK_HOURS,
+        "next_transition": {
+            "state": next_state,
+            "at": transition.isoformat(timespec="seconds"),
+            "in": _fmt_dur((transition - moment).total_seconds()),
+        },
+    }
+
+
+def _zai_peak_note(now=None):
+    """Backward-compatible compact label for the current z.ai billing state."""
+    status = _zai_billing_status(now)
+    return f"{status['state']} {status['multiplier']:g}x"
+
+
+def _zai_billing_note(status):
+    """One human-readable line carrying the complete z.ai billing clock."""
+    transition = status["next_transition"]
+    at = datetime.fromisoformat(transition["at"])
+    return (
+        f"z.ai billing: {status['state']} {status['multiplier']:g}x now; "
+        f"peak {status['peak_hours']}; off-peak {status['off_peak_hours']}; "
+        f"next {transition['state']} starts "
+        f"{at.strftime('%Y-%m-%d %H:%M')} UTC+8 (in {transition['in']})."
+    )
 
 
 def _normalize_zai(envelope, peak_note):
@@ -745,7 +788,7 @@ def _normalize_zai(envelope, peak_note):
 
 def query_zai():
     """{'five_hour': {...}, 'weekly': {...}, '_scoped': [...], '_plan_type': str,
-    '_stale_age': int?} normalized, or raises.
+    '_billing': {...}, '_stale_age': int?} normalized, or raises.
 
     `limits[]` entries carry the window in unit/number, the allowance in
     `usage` (a confusing name - `currentValue` is what was consumed), and
@@ -784,7 +827,10 @@ def query_zai():
             if stale is None:
                 raise
             data, age = stale
-    out = _normalize_zai(data, _zai_peak_note())
+    billing = _zai_billing_status()
+    peak_note = f"{billing['state']} {billing['multiplier']:g}x"
+    out = _normalize_zai(data, peak_note)
+    out["_billing"] = billing
     if age:
         out["_stale_age"] = age
     return out
@@ -1052,9 +1098,8 @@ def _table_rows(account, res):
     return rows
 
 
-def _render_table(rows):
-    """Aligned plain-text table + the two footnotes carrying the prose that was
-    inlined per-line before (pace semantics, tz note)."""
+def _render_table(rows, provider_notes=None):
+    """Aligned table, provider notes, and shared pace/timezone footnotes."""
     head = ("account", "window", "used", "max*", "resets", "in", "")
     widths = [max(len(r[i]) for r in [head] + rows) for i in range(len(head))]
     out = []
@@ -1063,6 +1108,9 @@ def _render_table(rows):
                  else r[i].rjust(widths[i]) for i in range(len(head))]
         out.append("  ".join(cells).rstrip())
     out.append("")
+    if provider_notes:
+        out.extend(provider_notes)
+        out.append("")
     out.append("* max = utilization ceiling if burning at a constant rate; "
                "OVER PACE = above it (will exhaust before the reset); "
                "'on pace in T' = if burn stops now, the pace line catches up to "
@@ -1124,14 +1172,18 @@ def main(argv=None):
         sys.stdout.write("\n")
     else:
         rows = []
+        provider_notes = []
         for account in ("claude", "kimi", "codex", "zai"):
             name = _DISPLAY.get(account, account.capitalize())
             if account in results:
-                rows.extend(_table_rows(name, results[account]))
+                result = results[account]
+                rows.extend(_table_rows(name, result))
+                if account == "zai" and isinstance(result.get("_billing"), dict):
+                    provider_notes.append(_zai_billing_note(result["_billing"]))
             elif account in errors and not args.quiet:
                 print(f"{name}: ERROR — {errors[account]}", file=sys.stderr)
         if rows:
-            print(_render_table(rows))
+            print(_render_table(rows, provider_notes))
 
     return 1 if errors else 0
 

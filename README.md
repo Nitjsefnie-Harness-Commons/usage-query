@@ -9,9 +9,9 @@ it, and checking against it is the point: fetching "the newest release" is
 otherwise a promise about a URL, not about the artifact CI built.
 
 ```sh
-gh release download v1.1.0 --repo Nitjsefnie-Harness-Commons/usage-query
+gh release download v1.2.1 --repo Nitjsefnie-Harness-Commons/usage-query
 sha256sum -c SHA256SUMS
-pip install ./usage_query-1.1.0-py3-none-any.whl
+pip install ./usage_query-1.2.1-py3-none-any.whl
 ```
 
 The `usage-query` command queries all four providers by default, or one with
@@ -22,9 +22,11 @@ version with `--version`.
 The z.ai provider reads the API key from the harness auth file
 (`~/.pi/agent/auth.json`, `zai.key`) and authenticates with the bare key in the
 `Authorization` header — no `Bearer` prefix. Every z.ai window line carries the
-peak/off-peak billing state at query time (`peak 1x` / `off-peak 0.5x`),
-computed from the published policy window (Mon–Fri 14:00–18:00 UTC+8) because
-no z.ai endpoint exposes it; the rule and its provenance live at the top of
+peak/off-peak billing state at query time (`peak 1x` / `off-peak 0.5x`). Human
+output also names the peak and off-peak hours and the next transition; JSON
+exposes the same information once under `usage.zai._billing`. It is computed
+from the published policy window (Mon–Fri 14:00–18:00 UTC+8) because no z.ai
+endpoint exposes it; the rule and its provenance live at the top of
 `usage_query_lib/query.py` for re-verification when the policy moves.
 
 The importable implementation is `usage_query_lib.query`. It uses only the

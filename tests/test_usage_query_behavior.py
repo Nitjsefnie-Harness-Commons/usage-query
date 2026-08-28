@@ -188,7 +188,7 @@ def test_version_flag_prints_the_tool_version_without_querying(tmp):
             mod.main(["--version"])
         except SystemExit as exc:
             assert exc.code == 0
-    assert output.getvalue().strip() == "usage_query 1.2.0"
+    assert output.getvalue().strip() == "usage_query 1.2.1"
 
 
 def _zai_envelope():
@@ -249,6 +249,75 @@ def test_zai_peak_note_follows_the_published_window(tmp):
             assert mod._zai_peak_note() == expected, moment.isoformat()
 
 
+def test_zai_billing_status_names_hours_and_next_transition(tmp):
+    del tmp
+    mod = _load()
+    cases = [
+        (datetime(2026, 1, 5, 5, 0, tzinfo=timezone.utc),
+         "off-peak", 0.5, "peak", "2026-01-05T14:00:00+08:00", "1h00m"),
+        (datetime(2026, 1, 5, 6, 0, tzinfo=timezone.utc),
+         "peak", 1.0, "off-peak", "2026-01-05T18:00:00+08:00", "4h00m"),
+        (datetime(2026, 1, 5, 10, 0, tzinfo=timezone.utc),
+         "off-peak", 0.5, "peak", "2026-01-06T14:00:00+08:00", "20h00m"),
+        (datetime(2026, 1, 9, 10, 0, tzinfo=timezone.utc),
+         "off-peak", 0.5, "peak", "2026-01-12T14:00:00+08:00", "2d20h"),
+        (datetime(2026, 1, 10, 15, 0, tzinfo=timezone.utc),
+         "off-peak", 0.5, "peak", "2026-01-12T14:00:00+08:00", "1d15h"),
+    ]
+    for moment, state, multiplier, next_state, next_at, next_in in cases:
+        status = mod._zai_billing_status(moment)
+        assert status["state"] == state, moment.isoformat()
+        assert status["multiplier"] == multiplier, moment.isoformat()
+        assert status["peak_hours"] == "Mon-Fri 14:00-18:00 UTC+8"
+        assert status["off_peak_hours"] == (
+            "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; all day Sat-Sun")
+        assert status["next_transition"] == {
+            "state": next_state,
+            "at": next_at,
+            "in": next_in,
+        }, moment.isoformat()
+
+
+def test_zai_human_and_json_output_include_billing_schedule(tmp):
+    del tmp
+    mod = _load()
+    billing = {
+        "state": "off-peak",
+        "multiplier": 0.5,
+        "peak_hours": "Mon-Fri 14:00-18:00 UTC+8",
+        "off_peak_hours": (
+            "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; all day Sat-Sun"),
+        "next_transition": {
+            "state": "peak",
+            "at": "2026-01-12T14:00:00+08:00",
+            "in": "1d15h",
+        },
+    }
+    result = {
+        "five_hour": {"pct": 1.0, "pace_pct": 2.0,
+                      "recover_in": None, "resets_at": "reset",
+                      "resets_in": "1h", "peak_note": "off-peak 0.5x"},
+        "_billing": billing,
+    }
+    with mock.patch.object(mod, "query_zai", return_value=result):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            rc = mod.main(["--zai"])
+    assert rc == 0
+    line = next(line for line in output.getvalue().splitlines()
+                if line.startswith("z.ai billing:"))
+    assert "peak Mon-Fri 14:00-18:00 UTC+8" in line
+    assert "off-peak Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8" in line
+    assert "next peak starts 2026-01-12 14:00 UTC+8 (in 1d15h)" in line
+
+    with mock.patch.object(mod, "query_zai", return_value=result):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            rc = mod.main(["--zai", "--json"])
+    assert rc == 0
+    assert json.loads(output.getvalue())["usage"]["zai"]["_billing"] == billing
+
+
 def test_zai_query_reads_the_harness_auth_file_and_caches(tmp):
     mod = _load()
     cred = os.path.join(tmp, "auth.json")
@@ -261,6 +330,8 @@ def test_zai_query_reads_the_harness_auth_file_and_caches(tmp):
                               side_effect=lambda *a, **k: _zai_envelope()):
         out = mod.query_zai()
     assert out["_plan_type"] == "lite"
+    assert out["_billing"]["peak_hours"] == "Mon-Fri 14:00-18:00 UTC+8"
+    assert set(out["_billing"]["next_transition"]) == {"state", "at", "in"}
     with open(cache, encoding="utf-8") as fh:
         assert json.load(fh)["data"]["code"] == 200
 
