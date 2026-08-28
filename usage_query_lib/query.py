@@ -159,6 +159,8 @@ def _require_configured(account, source):
     if not os.path.exists(source):
         raise ProviderNotConfigured(
             f"{account} is not configured on this machine: {source} is absent")
+
+
 TIMEOUT = 5
 CODEX_RPC_TIMEOUT = 10
 # Refresh the stored Kimi access token (and persist the rotation) if it expires
