@@ -1045,9 +1045,9 @@ def _codex_window_from_payload(window):
         seconds = int(window.get("limit_window_seconds") or 0)
     except (TypeError, ValueError):
         seconds = 0
-    resets = window.get("reset_at")
+    raw_reset = window.get("reset_at")
     try:
-        resets = int(resets)
+        resets = None if raw_reset is None else int(raw_reset)
     except (TypeError, ValueError):
         resets = None
     return {"usedPercent": float(window.get("used_percent") or 0),
