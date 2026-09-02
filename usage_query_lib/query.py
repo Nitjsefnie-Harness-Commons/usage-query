@@ -18,17 +18,21 @@ Sources (same endpoints/credentials the hook uses):
             5h window  = limits[] entry with window.duration==300 MINUTE (used/limit)
             weekly     = top-level usage block (used/limit)
   - z.ai:   GET https://api.z.ai/api/monitor/usage/quota/limit
-            auth   = RAW key, no Bearer prefix (~/.pi/agent/auth.json -> zai.key)
+            auth   = RAW key, no Bearer prefix; resolved in the same order the
+                     bundle's spawn_zai launchers resolve it: $ZAI_API_KEY,
+                     ~/.config/claude-zai/api-key, the copy shipped beside those
+                     launchers, then ~/.pi/agent/auth.json -> zai.key
             5h window  = limits[] with unit 3 (hours) x number 5
             weekly     = limits[] with unit 6 (weeks) x number 1
             each window line is tagged with the peak/off-peak billing state
-  - Codex:  `codex app-server` JSON-RPC account/rateLimits/read
-            auth/refresh = Codex-owned (file, keyring, API key, or access token)
+  - Codex:  GET https://chatgpt.com/backend-api/wham/usage
+            bearer = $CODEX_HOME/auth.json -> tokens.access_token
+            header ChatGPT-Account-Id: tokens.account_id
             windows      = every primary/secondary window in every limit bucket
 
-CREDENTIAL DISCIPLINE: for BOTH the Claude and Kimi files, when the stored access
-token is stale we refresh on demand and PERSIST the rotated result, the same way
-the official clients (Claude Code / kimi-cli) do.
+CREDENTIAL DISCIPLINE: for the Claude, Kimi AND Codex files, when the stored
+access token is stale we refresh on demand and PERSIST the rotated result, the
+same way the official clients (Claude Code / kimi-cli / codex) do.
 
 The Kimi-Code refresh_token is SINGLE-USE / rotated server-side: calling the
 refresh grant invalidates the refresh_token you sent and returns a NEW one
@@ -50,10 +54,20 @@ Not refreshing here is not a safe default: the Kimi access token lives ~15 min
 (expires_in 900), so a read-only query would fail every time unless an unrelated
 kimi session happened to run in the last quarter hour.
 
-Codex credentials may live in auth.json OR the operating-system keyring and
-support several login modes, so this utility never reads or refreshes them
-itself. It starts Codex's supported app-server, whose account/rateLimits/read
-method uses the native credential manager and returns every active quota bucket.
+Codex is read the same way, and deliberately WITHOUT starting `codex app-server`.
+Booting the app-server to answer one question costs a full CLI start — marketplace
+refreshes with their own git fetches, and on Windows a console window that pops up
+in front of whoever is working — and a status line asking every 30 s paid that
+once a minute. So this reads $CODEX_HOME/auth.json (auth_mode, tokens{id_token,
+access_token, refresh_token, account_id}, last_refresh) and calls the same backend
+endpoint the app-server's account/rateLimits/read ends up calling, then maps the
+reply into that method's response shape so the cache file and the normalizer are
+unchanged. The Codex access token is a JWT whose own `exp` claim decides staleness
+(~10 days); when it is stale — or the call answers 401 — we run Codex's refresh
+grant against auth.openai.com/oauth/token with its public client id and atomically
+rewrite auth.json (temp + os.replace, permissions preserved) with the rotated
+id/access/refresh tokens and a fresh last_refresh, exactly the set codex writes
+itself. An API-key login has no subscription quota windows and says so.
 
 The Claude side works the same way and for the same reason: its OAuth access token
 (in ~/.claude/.credentials.json -> claudeAiOauth, expiresAt in ms) lasts ~8h and
@@ -102,16 +116,15 @@ they can be fed straight into local-time consumers (cron etc.) without manual
 UTC->local conversion — the same convention as the hook.
 """
 import argparse
+import base64
 import glob
 import json
 import os
-import queue
 import re
 import shutil
-import subprocess
+import stat
 import sys
 import tempfile
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -150,6 +163,17 @@ KIMI_OAUTH_CLIENT_ID_FALLBACK = "17e5f671-d194-4dfb-9706-5516cb48c098"
 # The z.ai key authenticates with the bare value in the Authorization header -
 # deliberately NO "Bearer" prefix (the documented form; verified live 2026-08-28).
 ZAI_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+# Key resolution, in the order the bundle's own launchers resolve it: the
+# environment first, then the machine-local override file, then the copy shipped
+# beside spawn_zai.sh / spawn_zai.ps1 (claude/scripts/_zai_lane.sh zai_api_key,
+# _zai_lane.ps1 Get-ZaiApiKey). Reading only the last entry below is what made a
+# machine that had written the documented override file report the lane
+# unconfigured, so the override file is not optional here.
+ZAI_ENV_VAR = "ZAI_API_KEY"
+ZAI_KEY_FILES = (os.path.expanduser("~/.config/claude-zai/api-key"),
+                 os.path.expanduser("~/.claude/scripts/zai-api-key"))
+# Lowest-priority fallback: some installs keep the key in a harness auth file
+# under a "zai" entry instead of a bare key file.
 ZAI_CRED = os.path.expanduser("~/.pi/agent/auth.json")
 # Window unit codes observed in the limits[] payload: 3 = hours, 6 = weeks. An
 # unlisted unit still surfaces (as a scoped row labelled unitNxM) rather than
@@ -166,7 +190,28 @@ ZAI_PEAK_END_MIN = 18 * 60  # end exclusive: 18:00:00 is already off-peak
 ZAI_PEAK_HOURS = "Mon-Fri 14:00-18:00 UTC+8"
 ZAI_OFF_PEAK_HOURS = (
     "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; all day Sat-Sun")
-CODEX_BIN = os.environ.get("CODEX_BIN") or shutil.which("codex") or "codex"
+# Codex's own credential file: CODEX_HOME (or ~/.codex) / auth.json. Its shape
+# was read off a live file rather than assumed - auth_mode, OPENAI_API_KEY,
+# tokens{id_token, access_token, refresh_token, account_id}, last_refresh - and
+# matches codex-rs login::AuthDotJson.
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+CODEX_AUTH = os.path.join(CODEX_HOME, "auth.json")
+# Codex's config default (codex-rs/config/defaults.toml chatgpt_base_url). The
+# path under it follows codex-rs backend-client PathStyle: a base carrying
+# /backend-api uses the /wham/... spelling, anything else /api/codex/....
+CODEX_BASE_URL = (os.environ.get("CODEX_CHATGPT_BASE_URL")
+                  or "https://chatgpt.com/backend-api")
+# Codex's OAuth refresh grant. The client_id is the PUBLIC codex client that
+# ships in every install (codex-rs login::CLIENT_ID) - not a secret.
+CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+# Refresh the stored Codex access token (and persist the rotation) if its own
+# `exp` claim is within this many seconds; the stored token lives ~10 days.
+CODEX_EXPIRY_MARGIN = 120
+CODEX_UA = f"usage-query/{__version__}"
+CODEX_NO_CHATGPT_MSG = (
+    "Codex returned no ChatGPT rate limits (API-key logins do not have "
+    "subscription quota windows)")
 
 
 class ProviderNotConfigured(RuntimeError):
@@ -187,7 +232,6 @@ def _require_configured(account, source):
 
 
 TIMEOUT = 5
-CODEX_RPC_TIMEOUT = 10
 # Refresh the stored Kimi access token (and persist the rotation) if it expires
 # within this many seconds; the stored token's own lifetime is ~15 min, so a
 # margin avoids racing its expiry mid-request.
@@ -205,6 +249,12 @@ KIMI_CACHE = os.path.join(TEMPDIR, ".claude_kimi_usage_cache.json")
 CODEX_CACHE = os.path.join(TEMPDIR, ".codex_usage_cache.json")
 ZAI_CACHE = os.path.join(TEMPDIR, ".zai_usage_cache.json")
 CACHE_TTL = 30
+# Codex gets its own, much longer TTL. A status line refreshing every 30 s and a
+# 30 s TTL expire in lockstep, so essentially every refresh missed and paid for a
+# full round trip; and Codex's shortest window is 5 hours, so a percentage that
+# moved inside 15 minutes is not a number anyone acts on. 900 s is under 5% of
+# that shortest window and turns thirty fetches per quarter-hour into one.
+CODEX_CACHE_TTL = 900
 
 
 def _fmt_dur(secs):
@@ -679,15 +729,41 @@ def query_kimi():
     return out
 
 
-def _zai_cred():
-    """The z.ai API key from the harness auth file: {"zai": {"key": ...}}."""
-    with open(ZAI_CRED, encoding="utf-8") as f:
-        auth = json.load(f)
-    entry = auth.get("zai")
+def _zai_key_from_auth_json(path):
+    """The key under the "zai" field of a harness auth file, or None when the
+    file is unreadable, is not JSON, or carries no key there."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            auth = json.load(f)
+    except (OSError, ValueError):
+        return None
+    entry = auth.get("zai") if isinstance(auth, dict) else None
     key = entry.get("key") if isinstance(entry, dict) else entry
-    if not key:
-        raise RuntimeError("no API key under the 'zai' field of auth.json")
-    return str(key)
+    return str(key).strip() or None if key else None
+
+
+def _zai_cred():
+    """The z.ai API key, resolved the way the bundle's spawn_zai launchers
+    resolve it: $ZAI_API_KEY, the machine-local override file, the copy shipped
+    beside those launchers, then a harness auth file's "zai" entry. Raises
+    ProviderNotConfigured naming every place looked at — never a key value."""
+    env = (os.environ.get(ZAI_ENV_VAR) or "").strip()
+    if env:
+        return env
+    for path in ZAI_KEY_FILES:
+        try:
+            with open(path, encoding="utf-8") as f:
+                key = f.read().strip()
+        except OSError:
+            continue
+        if key:
+            return key
+    key = _zai_key_from_auth_json(ZAI_CRED)
+    if key:
+        return key
+    looked = ", ".join(("$" + ZAI_ENV_VAR,) + tuple(ZAI_KEY_FILES) + (ZAI_CRED,))
+    raise ProviderNotConfigured(
+        f"z.ai is not configured on this machine: no API key in {looked}")
 
 
 def _zai_billing_status(now=None):
@@ -795,7 +871,7 @@ def query_zai():
     `percentage` used, with `nextResetTime` in epoch milliseconds. Fresh cache
     wins; on a failed live fetch the last cached payload is used however
     stale, tagged with '_stale_age' - same as every other provider here."""
-    _require_configured("z.ai", ZAI_CRED)
+    key = _zai_cred()
     now = time.time()
     data, stale = None, None
     try:
@@ -814,7 +890,7 @@ def query_zai():
     if data is None:
         try:
             fetched = _get_retry(ZAI_URL, {
-                "Authorization": _zai_cred(),
+                "Authorization": key,
                 "Accept-Language": "en-US,en",
                 "Content-Type": "application/json",
             })
@@ -836,98 +912,217 @@ def query_zai():
     return out
 
 
-def _codex_rpc_rate_limits():
-    """Read Codex ChatGPT limits through the supported app-server RPC surface.
+def _codex_usage_url():
+    """The backend usage URL for CODEX_BASE_URL, following codex's own routing:
+    Client::new appends /backend-api to a bare chatgpt.com host, and
+    PathStyle::from_base_url picks /wham/... for a base carrying /backend-api and
+    /api/codex/... for anything else."""
+    base = CODEX_BASE_URL.rstrip("/")
+    if (base.startswith("https://chatgpt.com")
+            or base.startswith("https://chat.openai.com")) and (
+                "/backend-api" not in base):
+        base += "/backend-api"
+    return (f"{base}/wham/usage" if "/backend-api" in base
+            else f"{base}/api/codex/usage")
 
-    Codex owns its credential lifecycle, including keyring-backed credentials
-    and OAuth refresh. Going through app-server avoids teaching this shared
-    utility the shape of auth.json or creating a second token refresher.
-    """
+
+def _jwt_expiry(token):
+    """The `exp` claim (epoch seconds) of a JWT, or None when the token is not a
+    readable JWT. The payload segment is base64-decoded, not verified: the
+    signature is the issuer's business and `exp` is the only claim needed here.
+    Nothing from the token is returned, logged or raised."""
     try:
-        proc = subprocess.Popen(
-            [CODEX_BIN, "app-server", "--stdio"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1)
-    except FileNotFoundError as exc:
-        raise ProviderNotConfigured(
-            "Codex is not configured on this machine: the codex CLI "
-            f"({CODEX_BIN}) is absent") from exc
-    except OSError as exc:
-        raise RuntimeError("Codex CLI/app-server is unavailable: %s" % exc) from exc
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(
+            payload + "=" * (-len(payload) % 4)))
+        return float(claims["exp"])
+    except Exception:
+        return None
 
-    messages = queue.Queue()
-    eof = object()
 
-    def read_stdout():
-        try:
-            for raw in proc.stdout:  # pyright: ignore[reportOptionalIterable]
-                messages.put(raw)
-        finally:
-            messages.put(eof)
+def _codex_auth():
+    """Codex's stored credentials, or ProviderNotConfigured when this machine
+    has no Codex install to read."""
+    _require_configured("Codex", CODEX_AUTH)
+    with open(CODEX_AUTH, encoding="utf-8") as f:
+        full = json.load(f)
+    if not isinstance(full, dict):
+        raise RuntimeError(f"Codex {CODEX_AUTH} is not a JSON object")
+    return full
 
-    reader = threading.Thread(target=read_stdout, daemon=True)
-    reader.start()
-    deadline = time.monotonic() + CODEX_RPC_TIMEOUT
 
-    def send(message):
-        if proc.stdin is None:
-            raise RuntimeError("Codex app-server stdin is unavailable")
-        proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
-        proc.stdin.flush()
-
-    def receive(response_id):
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError("Codex app-server rate-limit query timed out")
-            try:
-                raw = messages.get(timeout=remaining)
-            except queue.Empty as exc:
-                raise RuntimeError(
-                    "Codex app-server rate-limit query timed out") from exc
-            if raw is eof:
-                raise RuntimeError("Codex app-server exited before replying")
-            try:
-                message = json.loads(raw)
-            except (TypeError, ValueError):
-                continue
-            if message.get("id") != response_id:
-                continue
-            if message.get("error"):
-                err = message["error"]
-                detail = err.get("message") if isinstance(err, dict) else str(err)
-                raise RuntimeError("Codex app-server error: %s" % detail)
-            return message.get("result") or {}
-
+def _persist_codex_cred(full, resp):
+    """Atomically write a refreshed Codex token set back into auth.json,
+    preserving every other field and the file's own permissions. OpenAI rotates
+    the refresh_token, so the rotated one MUST land on disk or codex's next
+    refresh — ours or its own — fails; codex reads this file as its source of
+    truth, and it stamps last_refresh alongside the tokens, so we do too.
+    tempfile + os.replace, so a concurrent codex never reads a torn file."""
+    tokens = full.setdefault("tokens", {})
+    for field in ("id_token", "access_token", "refresh_token"):
+        if resp.get(field):
+            tokens[field] = resp[field]
+    full["last_refresh"] = datetime.now(timezone.utc).isoformat(
+        timespec="microseconds").replace("+00:00", "Z")
     try:
-        send({"method": "initialize", "id": 0, "params": {
-            "clientInfo": {
-                "name": "agent_harness_bundle_usage_query",
-                "title": "Agent Harness Bundle Usage Query",
-                "version": "1.0.0",
-            }}})
-        receive(0)
-        send({"method": "initialized", "params": {}})
-        send({"method": "account/rateLimits/read", "id": 1})
-        result = receive(1)
-        if not result.get("rateLimits") and not result.get("rateLimitsByLimitId"):
-            raise RuntimeError(
-                "Codex returned no ChatGPT rate limits (API-key logins do not "
-                "have subscription quota windows)")
-        return result
-    finally:
+        mode = stat.S_IMODE(os.stat(CODEX_AUTH).st_mode)
+    except OSError:
+        mode = 0o600
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CODEX_AUTH) or ".",
+                               prefix=".auth.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(full, f, indent=2)
         try:
-            if proc.stdin is not None:
-                proc.stdin.close()
+            os.chmod(tmp, mode)
         except OSError:
             pass
-        if proc.poll() is None:
-            proc.terminate()
+        os.replace(tmp, CODEX_AUTH)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return tokens.get("access_token") or ""
+
+
+def _codex_refresh(full):
+    """Run codex's refresh grant and persist the rotated set; returns the fresh
+    access token."""
+    refresh = (full.get("tokens") or {}).get("refresh_token")
+    if not refresh:
+        raise RuntimeError(
+            "Codex access token is expired and auth.json carries no "
+            "refresh_token; run `codex login` to re-authenticate")
+    body = json.dumps({"client_id": CODEX_OAUTH_CLIENT_ID,
+                       "grant_type": "refresh_token",
+                       "refresh_token": refresh}).encode("utf-8")
+    req = urllib.request.Request(
+        CODEX_OAUTH_TOKEN_URL, data=body,
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/json",
+                 "User-Agent": CODEX_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            resp = json.loads(r.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        detail = ""
         try:
-            proc.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=1)
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Codex token refresh failed (HTTP {e.code}). Codex normally "
+            "refreshes this token on its own activity — run codex once and "
+            f"retry, or `codex login` if it persists. {detail}") from e
+    if not resp.get("access_token"):
+        raise RuntimeError("Codex token refresh returned no access_token")
+    return _persist_codex_cred(full, resp)
+
+
+def _codex_access_token(full):
+    """(access token, whether it was just refreshed). The stored token is used
+    as-is while its own `exp` is still ahead of CODEX_EXPIRY_MARGIN; a stale one
+    is refreshed and persisted first. An unreadable `exp` is not a refresh
+    trigger — the request itself answers that, with the 401 retry below."""
+    access = (full.get("tokens") or {}).get("access_token") or ""
+    if not access:
+        raise RuntimeError(CODEX_NO_CHATGPT_MSG)
+    exp = _jwt_expiry(access)
+    if exp is None or exp - time.time() > CODEX_EXPIRY_MARGIN:
+        return access, False
+    return _codex_refresh(full), True
+
+
+def _codex_window_from_payload(window):
+    """One backend rate-limit window in the app-server's spelling. Minutes are
+    rounded UP from limit_window_seconds, as codex's own
+    window_minutes_from_seconds does, and a non-positive span has no duration."""
+    if not isinstance(window, dict):
+        return None
+    try:
+        seconds = int(window.get("limit_window_seconds") or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    resets = window.get("reset_at")
+    try:
+        resets = int(resets)
+    except (TypeError, ValueError):
+        resets = None
+    return {"usedPercent": float(window.get("used_percent") or 0),
+            "windowDurationMins": -(-seconds // 60) if seconds > 0 else None,
+            "resetsAt": resets}
+
+
+def _codex_snapshot(limit_id, limit_name, rate_limit, plan_type):
+    """One bucket in the app-server's RateLimitSnapshot shape, limited to the
+    fields _normalize_codex reads. The unread halves of that struct (credits,
+    individualLimit, spendControlReached, rateLimitReachedType) are deliberately
+    not synthesised: nothing here consumes them."""
+    rate_limit = rate_limit if isinstance(rate_limit, dict) else {}
+    return {
+        "limitId": limit_id,
+        "limitName": limit_name,
+        "primary": _codex_window_from_payload(rate_limit.get("primary_window")),
+        "secondary": _codex_window_from_payload(
+            rate_limit.get("secondary_window")),
+        "planType": plan_type,
+    }
+
+
+def _codex_rpc_shape(payload):
+    """The backend's usage payload in account/rateLimits/read's response shape.
+
+    Mirrors codex-rs backend-client rate_limit_snapshots_from_payload: one
+    snapshot under limit_id "codex" built from `rate_limit`, then one per
+    `additional_rate_limits` entry keyed by its metered_feature and labelled with
+    its limit_name. Keeping the RPC shape is what lets the shared cache file, the
+    normalizer and every downstream consumer stay exactly as they were.
+    """
+    plan = payload.get("plan_type")
+    default = _codex_snapshot("codex", None, payload.get("rate_limit"), plan)
+    by_id = {"codex": default}
+    for extra in (payload.get("additional_rate_limits") or []):
+        if not isinstance(extra, dict):
+            continue
+        limit_id = extra.get("metered_feature") or extra.get("limit_name")
+        if not limit_id:
+            continue
+        by_id[limit_id] = _codex_snapshot(limit_id, extra.get("limit_name"),
+                                          extra.get("rate_limit"), plan)
+    out = {"rateLimits": default, "rateLimitsByLimitId": by_id}
+    reset_credits = payload.get("rate_limit_reset_credits")
+    if isinstance(reset_credits, dict):
+        out["rateLimitResetCredits"] = {
+            "availableCount": int(reset_credits.get("available_count") or 0)}
+    return out
+
+
+def _codex_rate_limits():
+    """Codex ChatGPT limits, read straight from the backend with Codex's own
+    stored OAuth credentials — no `codex` process is started (see the module
+    docstring for why). A 401 on a token we did not just refresh is treated as
+    "stale despite its exp": refresh once, retry once, then give up.
+    """
+    full = _codex_auth()
+    token, refreshed = _codex_access_token(full)
+    url = _codex_usage_url()
+    account = (full.get("tokens") or {}).get("account_id") or ""
+    while True:
+        headers = {"Authorization": f"Bearer {token}",
+                   "User-Agent": CODEX_UA,
+                   "Accept": "application/json"}
+        if account:
+            headers["ChatGPT-Account-Id"] = account
+        try:
+            return _codex_rpc_shape(_get_retry(url, headers))
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and not refreshed:
+                token, refreshed = _codex_refresh(full), True
+                continue
+            raise RuntimeError(
+                f"Codex rate-limit request failed (HTTP {e.code})") from e
 
 
 def _codex_reset_iso(value):
@@ -1031,7 +1226,7 @@ def query_codex():
         cached_data = cached.get("data")
         age = now - float(cached.get("fetched_at") or 0)
         if cached_data is not None:
-            if age < CACHE_TTL:
+            if age < CODEX_CACHE_TTL:
                 data = cached_data
             else:
                 stale = (cached_data, int(age))
@@ -1040,7 +1235,7 @@ def query_codex():
     stale_age = 0
     if data is None:
         try:
-            data = _codex_rpc_rate_limits()
+            data = _codex_rate_limits()
             _write_cache(CODEX_CACHE, data)
         except Exception:
             if stale is None:

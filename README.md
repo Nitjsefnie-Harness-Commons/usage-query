@@ -19,8 +19,10 @@ The `usage-query` command queries all four providers by default, or one with
 `--quiet` suppresses per-account error lines. The command reports its own
 version with `--version`.
 
-The z.ai provider reads the API key from the harness auth file
-(`~/.pi/agent/auth.json`, `zai.key`) and authenticates with the bare key in the
+The z.ai provider resolves its API key the way the bundle's `spawn_zai`
+launchers do — `$ZAI_API_KEY`, then `~/.config/claude-zai/api-key`, then the
+copy shipped beside those launchers, then a harness auth file's `zai.key`
+(`~/.pi/agent/auth.json`) — and authenticates with the bare key in the
 `Authorization` header — no `Bearer` prefix. Every z.ai window line carries the
 peak/off-peak billing state at query time (`peak 1x` / `off-peak 0.5x`). Human
 output also names the peak and off-peak hours and the next transition; JSON
@@ -31,9 +33,18 @@ endpoint exposes it; the rule and its provenance live at the top of
 
 The importable implementation is `usage_query_lib.query`. It uses only the
 Python standard library and reads the provider credential files used by the
-official clients. Stale Claude and Kimi OAuth tokens are refreshed and their
-rotated credentials are atomically written back, while Codex rate limits are
-read through its supported app-server interface.
+official clients. Stale Claude, Kimi **and Codex** OAuth tokens are refreshed
+and their rotated credentials are atomically written back.
+
+Codex is read from `$CODEX_HOME/auth.json` and the ChatGPT backend directly, and
+deliberately **without starting `codex app-server`**: booting the CLI to answer
+one question costs a full start — marketplace refreshes with their own git
+fetches, and on Windows a console window in front of whoever is working — which
+a status line asking every 30 s paid roughly once a minute. Codex also keeps its
+own, much longer cache TTL (`CODEX_CACHE_TTL`, 900 s) for the same reason: the
+shared 30 s TTL expired in lockstep with a 30 s status-line refresh, so
+essentially every refresh was a miss, and a quota percentage does not move
+meaningfully inside a quarter of an hour.
 
 ## Development
 

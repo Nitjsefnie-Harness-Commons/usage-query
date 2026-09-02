@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Formatting, pace arithmetic and command-line coverage for the tool."""
+import contextlib
 import io
 import json
 import os
@@ -17,6 +18,20 @@ USAGE_QUERY = os.path.join(_util.SCRIPTS, "query.py")
 
 def _load():
     return _util.load(USAGE_QUERY, "usage_query_behavior")
+
+
+@contextlib.contextmanager
+def _zai_sources(mod, env=None, files=(), cred=""):
+    """Pin every place _zai_cred looks. Without this a suite would resolve the
+    real machine's key — the developer box that has one would pass a test the CI
+    box that has none would fail, and neither result would mean anything."""
+    with mock.patch.dict(os.environ):
+        os.environ.pop(mod.ZAI_ENV_VAR, None)
+        if env is not None:
+            os.environ[mod.ZAI_ENV_VAR] = env
+        with mock.patch.object(mod, "ZAI_KEY_FILES", tuple(files)), \
+                mock.patch.object(mod, "ZAI_CRED", cred):
+            yield
 
 
 def _frozen_clock(mod, frozen):
@@ -169,8 +184,7 @@ def test_a_removed_provider_is_not_spoken_for_by_its_leftover_cache(tmp):
         else:
             raise AssertionError("a leftover cache answered for a removed provider")
     with mock.patch.object(mod, "ZAI_CACHE", os.path.join(tmp, "zai-cache.json")), \
-            mock.patch.object(mod, "ZAI_CRED",
-                              os.path.join(tmp, "zai-absent.json")):
+            _zai_sources(mod, cred=os.path.join(tmp, "zai-absent.json")):
         try:
             mod.query_zai()
         except mod.ProviderNotConfigured:
@@ -318,13 +332,13 @@ def test_zai_human_and_json_output_include_billing_schedule(tmp):
     assert json.loads(output.getvalue())["usage"]["zai"]["_billing"] == billing
 
 
-def test_zai_query_reads_the_harness_auth_file_and_caches(tmp):
+def test_zai_query_reads_the_documented_key_file_and_caches(tmp):
     mod = _load()
-    cred = os.path.join(tmp, "auth.json")
-    with open(cred, "w", encoding="utf-8") as fh:
-        json.dump({"zai": {"type": "api", "key": "k" * 49}}, fh)
+    key_file = os.path.join(tmp, "api-key")
+    with open(key_file, "w", encoding="utf-8") as fh:
+        fh.write("k" * 49 + "\r\n")
     cache = os.path.join(tmp, "zai-cache.json")
-    with mock.patch.object(mod, "ZAI_CRED", cred), \
+    with _zai_sources(mod, files=(key_file,)), \
             mock.patch.object(mod, "ZAI_CACHE", cache), \
             mock.patch.object(mod, "_get_retry",
                               side_effect=lambda *a, **k: _zai_envelope()):
@@ -336,15 +350,59 @@ def test_zai_query_reads_the_harness_auth_file_and_caches(tmp):
         assert json.load(fh)["data"]["code"] == 200
 
 
+def test_zai_key_resolution_follows_the_spawn_launchers(tmp):
+    """$ZAI_API_KEY, then ~/.config/claude-zai/api-key, then the copy shipped
+    beside the launchers, then a harness auth file — the order spawn_zai.sh and
+    spawn_zai.ps1 use. Reading only the last of those reported a configured
+    machine as unconfigured, which is the whole reason this test exists."""
+    mod = _load()
+    override = os.path.join(tmp, "api-key")
+    shipped = os.path.join(tmp, "zai-api-key")
+    cred = os.path.join(tmp, "auth.json")
+    with open(override, "w", encoding="utf-8") as fh:
+        fh.write("from-override-file\n")
+    with open(shipped, "w", encoding="utf-8") as fh:
+        fh.write("from-shipped-copy\n")
+    with open(cred, "w", encoding="utf-8") as fh:
+        json.dump({"zai": {"type": "api", "key": "from-auth-json"}}, fh)
+
+    files = (override, shipped)
+    with _zai_sources(mod, env="from-environment", files=files, cred=cred):
+        assert mod._zai_cred() == "from-environment"
+    with _zai_sources(mod, files=files, cred=cred):
+        assert mod._zai_cred() == "from-override-file"
+    with _zai_sources(mod, files=(shipped,), cred=cred):
+        assert mod._zai_cred() == "from-shipped-copy"
+    with _zai_sources(mod, cred=cred):
+        assert mod._zai_cred() == "from-auth-json"
+
+    # An empty override file is not a key: fall through, do not authenticate
+    # with "".
+    with open(override, "w", encoding="utf-8") as fh:
+        fh.write("   \n")
+    with _zai_sources(mod, files=files, cred=cred):
+        assert mod._zai_cred() == "from-shipped-copy"
+
+    with _zai_sources(mod, files=(os.path.join(tmp, "absent"),),
+                      cred=os.path.join(tmp, "absent.json")):
+        try:
+            mod._zai_cred()
+        except mod.ProviderNotConfigured as exc:
+            assert "$ZAI_API_KEY" in str(exc)
+            assert "absent.json" in str(exc)
+        else:
+            raise AssertionError("a machine with no key resolved one")
+
+
 def test_zai_query_rejects_a_keyless_entry_and_an_error_envelope(tmp):
     mod = _load()
     cred = os.path.join(tmp, "auth.json")
     with open(cred, "w", encoding="utf-8") as fh:
         json.dump({"zai": {"type": "api"}}, fh)
-    with mock.patch.object(mod, "ZAI_CRED", cred):
+    with _zai_sources(mod, cred=cred):
         try:
             mod.query_zai()
-        except RuntimeError as exc:
+        except mod.ProviderNotConfigured as exc:
             assert "no API key" in str(exc)
         else:
             raise AssertionError("a keyless zai entry authenticated")
@@ -353,7 +411,7 @@ def test_zai_query_rejects_a_keyless_entry_and_an_error_envelope(tmp):
     bad = _zai_envelope()
     bad["code"] = 500
     bad["msg"] = "boom"
-    with mock.patch.object(mod, "ZAI_CRED", cred), \
+    with _zai_sources(mod, cred=cred), \
             mock.patch.object(mod, "ZAI_CACHE", os.path.join(tmp, "c.json")), \
             mock.patch.object(mod, "_get_retry",
                               side_effect=lambda *a, **k: bad):
