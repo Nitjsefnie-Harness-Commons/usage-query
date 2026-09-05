@@ -97,6 +97,11 @@ def test_the_distribution_version_is_the_one_setuptools_reads(tmp):
     init = (ROOT / PACKAGE / "__init__.py").read_text(encoding="utf-8")
     found = re.search(r'^__version__\s*=\s*"(\d+\.\d+\.\d+)"', init, re.MULTILINE)
     assert found, f"no SemVer __version__ in {PACKAGE}/__init__.py"
+    # Two literals, one release: setuptools reads __init__ and the CLI prints
+    # query.py's, so a bump that misses one ships a wheel whose version the
+    # installed command denies.
+    mod = _util.load(_util.script("query.py"), "contract_version_agreement")
+    assert mod.__version__ == found.group(1), (mod.__version__, found.group(1))
 
 
 def _requires_python_floor():

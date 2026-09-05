@@ -202,7 +202,9 @@ def test_version_flag_prints_the_tool_version_without_querying(tmp):
             mod.main(["--version"])
         except SystemExit as exc:
             assert exc.code == 0
-    assert output.getvalue().strip() == "usage_query 1.2.1"
+    # The number is read from the module, not pinned: a release bump has
+    # nothing to say about this test, and pinning it made every bump fail here.
+    assert output.getvalue().strip() == f"usage_query {mod.__version__}"
 
 
 def _zai_envelope():
