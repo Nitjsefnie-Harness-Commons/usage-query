@@ -9,9 +9,9 @@ it, and checking against it is the point: fetching "the newest release" is
 otherwise a promise about a URL, not about the artifact CI built.
 
 ```sh
-gh release download v1.2.1 --repo Nitjsefnie-Harness-Commons/usage-query
+gh release download v1.3.1 --repo Nitjsefnie-Harness-Commons/usage-query
 sha256sum -c SHA256SUMS
-pip install ./usage_query-1.2.1-py3-none-any.whl
+pip install ./usage_query-1.3.1-py3-none-any.whl
 ```
 
 The `usage-query` command queries all four providers by default, or one with
