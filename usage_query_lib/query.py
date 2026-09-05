@@ -912,18 +912,30 @@ def query_zai():
     return out
 
 
-def _codex_usage_url():
-    """The backend usage URL for CODEX_BASE_URL, following codex's own routing:
+def _codex_backend_url(leaf):
+    """A backend URL for CODEX_BASE_URL, following codex's own routing:
     Client::new appends /backend-api to a bare chatgpt.com host, and
     PathStyle::from_base_url picks /wham/... for a base carrying /backend-api and
-    /api/codex/... for anything else."""
+    /api/codex/... for anything else. Both styles spell every leaf the same, so
+    the routing is decided once here rather than per endpoint."""
     base = CODEX_BASE_URL.rstrip("/")
     if (base.startswith("https://chatgpt.com")
             or base.startswith("https://chat.openai.com")) and (
                 "/backend-api" not in base):
         base += "/backend-api"
-    return (f"{base}/wham/usage" if "/backend-api" in base
-            else f"{base}/api/codex/usage")
+    return (f"{base}/wham/{leaf}" if "/backend-api" in base
+            else f"{base}/api/codex/{leaf}")
+
+
+def _codex_usage_url():
+    """Where the quota windows and the banked-reset COUNT are read."""
+    return _codex_backend_url("usage")
+
+
+def _codex_reset_credits_url():
+    """Where the per-credit banked-reset detail is read (codex-rs
+    list_rate_limit_reset_credits); the usage payload carries only a count."""
+    return _codex_backend_url("rate-limit-reset-credits")
 
 
 def _jwt_expiry(token):
@@ -1116,7 +1128,9 @@ def _codex_rate_limits():
         if account:
             headers["ChatGPT-Account-Id"] = account
         try:
-            return _codex_rpc_shape(_get_retry(url, headers))
+            shape = _codex_rpc_shape(_get_retry(url, headers))
+            _codex_attach_reset_credit_detail(shape, headers)
+            return shape
         except urllib.error.HTTPError as e:
             if e.code == 401 and not refreshed:
                 token, refreshed = _codex_refresh(full), True
@@ -1125,10 +1139,53 @@ def _codex_rate_limits():
                 f"Codex rate-limit request failed (HTTP {e.code})") from e
 
 
+def _codex_attach_reset_credit_detail(shape, headers):
+    """Name the banked resets the usage payload only counted.
+
+    The count and the detail come from two different endpoints, exactly as
+    codex-rs splits get_rate_limits_for_usage from
+    list_rate_limit_reset_credits, so a note built from the usage payload alone
+    could not say WHICH credit it is telling you to spend or when it dies. The
+    second request is made only when the count says there is something to name,
+    and a failure to reach it costs the name, not the account: the windows are
+    why anyone ran this. The wire's snake_case is translated here, so the cache
+    and the normalizer see one spelling whichever route filled them.
+    """
+    summary = shape.get("rateLimitResetCredits")
+    if not isinstance(summary, dict):
+        return
+    if int(summary.get("availableCount") or 0) <= 0:
+        return
+    try:
+        detail = _get_retry(_codex_reset_credits_url(), headers)
+    except Exception:
+        return
+    rows = (detail or {}).get("credits") if isinstance(detail, dict) else None
+    if not isinstance(rows, list):
+        return
+    summary["credits"] = [{
+        "id": row.get("id"),
+        "status": row.get("status"),
+        "title": row.get("title"),
+        "expiresAt": row.get("expires_at"),
+    } for row in rows if isinstance(row, dict)]
+
+
 def _codex_reset_iso(value):
-    """App-server epoch seconds -> the ISO form used by shared reset helpers."""
+    """A backend timestamp -> the ISO form used by shared reset helpers.
+
+    Windows carry epoch seconds; a reset credit's expiry is an ISO string on
+    the wire (backend-client types spell RateLimitResetCreditDetails.expires_at
+    a String where a window's reset_at is a number), so both arrive here and an
+    ISO value is passed through rather than fed to fromtimestamp.
+    """
     if value is None:
         return None
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return value
     return datetime.fromtimestamp(float(value), timezone.utc).isoformat().replace(
         "+00:00", "Z")
 
@@ -1236,7 +1293,7 @@ def _codex_reset_credits(block):
             continue
         if credit.get("status") != "available":
             continue
-        expires = credit.get("expiresAt")
+        expires = _codex_reset_iso(credit.get("expiresAt"))
         row = {
             "id": credit.get("id"),
             "title": (credit.get("title") or "").strip() or "Full reset",
@@ -1244,10 +1301,11 @@ def _codex_reset_credits(block):
         if expires is None:
             row["expires_at"], row["expires_in"] = None, None
         else:
-            row["expires_at"], row["expires_in"] = _reset_info(
-                _codex_reset_iso(expires))
-        rows.append((float(expires) if expires is not None else float("inf"),
-                     row))
+            row["expires_at"], row["expires_in"] = _reset_info(expires)
+        # Sorted on the normalized ISO form, not the raw field: epoch seconds
+        # and ISO strings both arrive, and ordering the two spellings against
+        # each other is only meaningful once they are one spelling.
+        rows.append((expires or "9999", row))
     rows.sort(key=lambda pair: pair[0])
     return [row for _, row in rows]
 

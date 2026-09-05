@@ -211,9 +211,13 @@ def _write_codex_auth(path, exp_delta, **overrides):
 
 
 def _capture_get(seen, payload):
+    """Answer every GET with one payload, recording the FIRST call. Codex makes
+    a second request for banked-reset detail, and the first is the one these
+    tests are asking about."""
     def fake(url, headers):
-        seen["url"] = url
-        seen["headers"] = headers
+        seen.setdefault("url", url)
+        seen.setdefault("headers", headers)
+        seen.setdefault("urls", []).append(url)
         return payload
     return fake
 
@@ -340,9 +344,13 @@ def test_codex_401_on_a_token_that_looked_live_refreshes_once(tmp):
                               "refresh_token": "refresh-token-new"})
 
     def flaky(url, headers):
-        calls.append(headers["Authorization"])
-        if len(calls) == 1:
-            raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
+        # Only the usage request is the subject here; the banked-reset detail
+        # is a second GET behind it and would otherwise be counted as a retry.
+        if url.endswith("/usage"):
+            calls.append(headers["Authorization"])
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(url, 401, "Unauthorized", {},
+                                             None)
         return _wham_payload()
 
     with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
@@ -478,6 +486,100 @@ def test_codex_flag_queries_only_codex(tmp):
     assert set(json.loads(output.getvalue())["usage"]) == {"codex"}
     claude.assert_not_called()
     kimi.assert_not_called()
+
+
+def _codex_credit_detail(expires="2026-10-05T06:19:12Z"):
+    """The rate-limit-reset-credits payload, in the snake_case the endpoint
+    really returns -- including an ISO `expires_at`, where the window payload
+    carries epoch seconds."""
+    return {
+        "available_count": 1,
+        "credits": [{
+            "id": "RateLimitResetCredit_abc",
+            "reset_type": "codexRateLimits",
+            "status": "available",
+            "granted_at": "2026-09-05T06:19:12Z",
+            "expires_at": expires,
+            "title": "Full reset",
+            "description": "One free rate limit reset.",
+        }],
+    }
+
+
+def _codex_routing_get(responses):
+    """A _get_retry stand-in that answers per URL and records the call order."""
+    calls = []
+
+    def fake(url, headers):
+        del headers
+        calls.append(url)
+        if url not in responses:
+            raise AssertionError("unexpected GET: " + url)
+        answer = responses[url]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+    return fake, calls
+
+
+def test_codex_names_the_banked_resets_from_the_credit_endpoint(tmp):
+    """The usage payload carries only a COUNT of banked resets. Which credit it
+    is, and when it expires, live behind a second endpoint -- the same split
+    codex-rs makes between get_rate_limits_for_usage and
+    list_rate_limit_reset_credits -- so the count alone would leave the note
+    unable to name what it is telling you to spend."""
+    mod = _util.load(USAGE_QUERY, "usage_query_codex_credit_detail")
+    mod.CODEX_AUTH = os.path.join(tmp, "auth.json")
+    _write_codex_auth(mod.CODEX_AUTH, 86400)
+    fake, calls = _codex_routing_get({
+        "https://chatgpt.com/backend-api/wham/usage": _wham_payload(),
+        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits":
+            _codex_credit_detail(),
+    })
+    with mock.patch.object(mod, "_get_retry", side_effect=fake):
+        got = mod._codex_rate_limits()
+    assert calls == ["https://chatgpt.com/backend-api/wham/usage",
+                     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"]
+    banked = got["rateLimitResetCredits"]["credits"]
+    assert [c["id"] for c in banked] == ["RateLimitResetCredit_abc"]
+    # Stored in the app-server spelling: the wire's snake_case stops here, so
+    # the normalizer reads one shape whichever route filled the cache.
+    assert banked[0]["expiresAt"] == "2026-10-05T06:19:12Z"
+    out = mod._normalize_codex(got)
+    assert out["_reset_credits"][0]["title"] == "Full reset"
+    assert "2026-10-05" in out["_reset_credits"][0]["expires_at"]
+
+
+def test_codex_credit_detail_is_not_fetched_when_there_is_nothing_to_name(tmp):
+    mod = _util.load(USAGE_QUERY, "usage_query_codex_credit_none")
+    mod.CODEX_AUTH = os.path.join(tmp, "auth.json")
+    _write_codex_auth(mod.CODEX_AUTH, 86400)
+    payload = _wham_payload()
+    payload["rate_limit_reset_credits"] = {"available_count": 0}
+    fake, calls = _codex_routing_get({
+        "https://chatgpt.com/backend-api/wham/usage": payload})
+    with mock.patch.object(mod, "_get_retry", side_effect=fake):
+        got = mod._codex_rate_limits()
+    assert calls == ["https://chatgpt.com/backend-api/wham/usage"]
+    assert got["rateLimitResetCredits"]["availableCount"] == 0
+
+
+def test_codex_credit_detail_failure_still_reports_the_windows(tmp):
+    """The windows are why anyone ran this. A second endpoint that is down
+    costs the credit's name, not the whole account."""
+    mod = _util.load(USAGE_QUERY, "usage_query_codex_credit_down")
+    mod.CODEX_AUTH = os.path.join(tmp, "auth.json")
+    _write_codex_auth(mod.CODEX_AUTH, 86400)
+    fake, calls = _codex_routing_get({
+        "https://chatgpt.com/backend-api/wham/usage": _wham_payload(),
+        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits":
+            RuntimeError("credit endpoint is down"),
+    })
+    with mock.patch.object(mod, "_get_retry", side_effect=fake):
+        got = mod._codex_rate_limits()
+    assert len(calls) == 2
+    assert got["rateLimitResetCredits"] == {"availableCount": 1}
+    assert mod._normalize_codex(got)["_reset_credits_available"] == 1
 
 
 def test_codex_keeps_the_detail_of_every_spendable_banked_reset(tmp):
