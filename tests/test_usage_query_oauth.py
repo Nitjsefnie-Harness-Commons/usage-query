@@ -480,6 +480,48 @@ def test_codex_flag_queries_only_codex(tmp):
     kimi.assert_not_called()
 
 
+def test_codex_keeps_the_detail_of_every_spendable_banked_reset(tmp):
+    """A banked reset is redeemed BY HAND, so the row a human acts on has to
+    name which credit it is and when it dies. Only `available` credits are
+    offered -- a redeemed one cannot be spent again -- and they are ordered by
+    expiry so the most perishable is read first."""
+    del tmp
+    mod = _util.load(USAGE_QUERY, "usage_query_codex_credits")
+    now = int(time.time())
+    payload = _codex_payload(now)
+    payload["rateLimitResetCredits"] = {
+        "availableCount": 2,
+        "credits": [
+            {"id": "cred_late", "status": "available", "title": "Full reset",
+             "expiresAt": now + 30 * 86400},
+            {"id": "cred_spent", "status": "redeemed", "title": "Full reset",
+             "expiresAt": now + 86400},
+            {"id": "cred_soon", "status": "available", "title": "Half reset",
+             # Two days plus a margin: the duration is computed against a
+             # clock that has moved on since `now`, and a flat 2d would
+             # render as 1d23h on any run slow enough to cross a second.
+             "expiresAt": now + 2 * 86400 + 300},
+        ],
+    }
+    got = mod._normalize_codex(payload)
+    assert got["_reset_credits_available"] == 2
+    assert [c["id"] for c in got["_reset_credits"]] == ["cred_soon", "cred_late"]
+    assert got["_reset_credits"][0]["title"] == "Half reset"
+    assert got["_reset_credits"][0]["expires_in"] == "2d0h"
+
+
+def test_codex_survives_a_reset_credit_summary_with_no_detail(tmp):
+    """The app-server omits per-credit detail on its periodic refresh, so the
+    count alone must still normalize rather than raise."""
+    del tmp
+    mod = _util.load(USAGE_QUERY, "usage_query_codex_credits_bare")
+    payload = _codex_payload()
+    payload["rateLimitResetCredits"] = {"availableCount": 1}
+    got = mod._normalize_codex(payload)
+    assert got["_reset_credits_available"] == 1
+    assert got.get("_reset_credits") in (None, [])
+
+
 def main():
     return _util.runner(_util.collect(globals()), "usagequeryoauth_")
 

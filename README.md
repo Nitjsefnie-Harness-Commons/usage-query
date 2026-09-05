@@ -31,6 +31,15 @@ from the published policy window (Mon–Fri 14:00–18:00 UTC+8) because no z.ai
 endpoint exposes it; the rule and its provenance live at the top of
 `usage_query_lib/query.py` for re-verification when the policy moves.
 
+Codex accounts can hold **banked rate-limit resets** — a credit the account
+holder spends deliberately, unlike the scheduled reset that arrives on its own.
+Human output prints one note per account that has any: how many are available,
+each credit's title and expiry, and the app-server RPC
+(`account/rateLimitResetCredit/consume`) that spends one. JSON carries the same
+under `usage.codex._reset_credits_available` and `usage.codex._reset_credits`.
+This tool never consumes a credit — it only reports them, and it hides the note
+entirely when there is nothing to spend.
+
 The importable implementation is `usage_query_lib.query`. It uses only the
 Python standard library and reads the provider credential files used by the
 official clients. Stale Claude, Kimi **and Codex** OAuth tokens are refreshed

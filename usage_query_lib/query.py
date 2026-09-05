@@ -1211,9 +1211,73 @@ def _normalize_codex(data):
     if isinstance(reset_credits, dict):
         out["_reset_credits_available"] = int(
             reset_credits.get("availableCount") or 0)
+        detail = _codex_reset_credits(reset_credits)
+        if detail:
+            out["_reset_credits"] = detail
     if not any(key in out for key in ("five_hour", "weekly", "_scoped")):
         raise RuntimeError("Codex rate-limit response contained no windows")
     return out
+
+
+def _codex_reset_credits(block):
+    """Detail rows for the banked resets a human can spend by hand.
+
+    A banked reset is redeemed deliberately -- it is not applied for you -- so
+    the row has to name WHICH credit and how long it lasts. Only `available`
+    credits are offered (a redeemed one cannot be spent again) and they are
+    ordered by expiry, most perishable first, because that is the one worth
+    acting on. `expiresAt` is epoch seconds, the same clock as `resetsAt`; a
+    credit without one does not expire. The app-server omits the per-credit
+    detail on its periodic refresh, so an empty list is a normal answer.
+    """
+    rows = []
+    for credit in block.get("credits") or []:
+        if not isinstance(credit, dict):
+            continue
+        if credit.get("status") != "available":
+            continue
+        expires = credit.get("expiresAt")
+        row = {
+            "id": credit.get("id"),
+            "title": (credit.get("title") or "").strip() or "Full reset",
+        }
+        if expires is None:
+            row["expires_at"], row["expires_in"] = None, None
+        else:
+            row["expires_at"], row["expires_in"] = _reset_info(
+                _codex_reset_iso(expires))
+        rows.append((float(expires) if expires is not None else float("inf"),
+                     row))
+    rows.sort(key=lambda pair: pair[0])
+    return [row for _, row in rows]
+
+
+def _codex_reset_credits_note(res):
+    """One human line naming the banked resets this account can spend.
+
+    Read-only by construction: this tool reports the credits, it never calls
+    the consume RPC, so the line names that RPC instead of implying the count
+    it printed has already been acted on.
+    """
+    available = int(res.get("_reset_credits_available") or 0)
+    if available <= 0:
+        return None
+    detail = ""
+    named = res.get("_reset_credits") or []
+    if named:
+        parts = []
+        for credit in named:
+            if credit.get("expires_at"):
+                parts.append('"%s" expires %s (in %s)' % (
+                    credit["title"],
+                    str(credit["expires_at"]).replace(_TZ_NOTE, ""),
+                    credit["expires_in"]))
+            else:
+                parts.append('"%s" does not expire' % credit["title"])
+        detail = " -- " + "; ".join(parts)
+    return ("Codex banked resets: %d available%s. Spend one deliberately with "
+            "the app-server RPC account/rateLimitResetCredit/consume; "
+            "usage-query only reads them." % (available, detail))
 
 
 def query_codex():
@@ -1375,6 +1439,10 @@ def main(argv=None):
                 rows.extend(_table_rows(name, result))
                 if account == "zai" and isinstance(result.get("_billing"), dict):
                     provider_notes.append(_zai_billing_note(result["_billing"]))
+                if account == "codex":
+                    note = _codex_reset_credits_note(result)
+                    if note:
+                        provider_notes.append(note)
             elif account in errors and not args.quiet:
                 print(f"{name}: ERROR — {errors[account]}", file=sys.stderr)
         if rows:

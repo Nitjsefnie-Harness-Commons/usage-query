@@ -425,6 +425,60 @@ def test_zai_query_rejects_a_keyless_entry_and_an_error_envelope(tmp):
             raise AssertionError("an error envelope was accepted")
 
 
+def test_codex_banked_resets_are_displayed_under_the_table(tmp):
+    """A banked reset is worth nothing to a reader who never learns it exists.
+    The count and the detail were parsed but rendered nowhere, so the human
+    view is where the note has to land -- named credit, expiry, and the fact
+    that this tool only reads."""
+    del tmp
+    mod = _load()
+    codex = {
+        "five_hour": {"pct": 10.0, "pace_pct": 50.0, "recover_in": None,
+                      "resets_at": "reset", "resets_in": "1h"},
+        "_reset_credits_available": 1,
+        "_reset_credits": [{"id": "cred_1", "title": "Full reset",
+                            "expires_at": "2026-10-05 06:19 machine-local",
+                            "expires_in": "29d16h"}],
+    }
+    absent = mod.ProviderNotConfigured("not configured on this machine")
+    with mock.patch.object(mod, "query_claude", side_effect=absent), \
+            mock.patch.object(mod, "query_kimi", side_effect=absent), \
+            mock.patch.object(mod, "query_codex", return_value=codex), \
+            mock.patch.object(mod, "query_zai", side_effect=absent):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = mod.main([])
+    text = out.getvalue()
+    assert rc == 0
+    assert "Codex banked resets: 1 available" in text
+    assert "Full reset" in text
+    assert "2026-10-05 06:19" in text
+    assert "29d16h" in text
+    assert "account/rateLimitResetCredit/consume" in text
+
+
+def test_no_banked_reset_note_when_none_are_available(tmp):
+    """Nothing to spend is not news: the note is absent rather than reading
+    'none', so the table stays as quiet as it was before this existed."""
+    del tmp
+    mod = _load()
+    codex = {
+        "five_hour": {"pct": 10.0, "pace_pct": 50.0, "recover_in": None,
+                      "resets_at": "reset", "resets_in": "1h"},
+        "_reset_credits_available": 0,
+    }
+    absent = mod.ProviderNotConfigured("not configured on this machine")
+    with mock.patch.object(mod, "query_claude", side_effect=absent), \
+            mock.patch.object(mod, "query_kimi", side_effect=absent), \
+            mock.patch.object(mod, "query_codex", return_value=codex), \
+            mock.patch.object(mod, "query_zai", side_effect=absent):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = mod.main([])
+    assert rc == 0
+    assert "banked reset" not in out.getvalue()
+
+
 def main():
     return _util.runner(_util.collect(globals()), tmp_prefix="usagequerybehavior_")
 
