@@ -31,6 +31,24 @@ from the published policy window (Mon–Fri 14:00–18:00 UTC+8) because no z.ai
 endpoint exposes it; the rule and its provenance live at the top of
 `usage_query_lib/query.py` for re-verification when the policy moves.
 
+Time-limited promotions from the same page are modelled the same way, as
+frozen, commented constants beside the peak window (expired windows stay in
+the code — they are history, not config — and simply report inactive):
+
+- **All-day off-peak promotion** — 2026-09-25 00:00 through 2026-10-07 24:00
+  UTC+8 (end exclusive), every hour bills the off-peak 0.5x rate, including
+  the weekday peak window; the next-transition scan skips past would-be peaks
+  inside the promotion.
+- **GLM-5.3-Flash usage campaign** — nightly windows 23:00–09:00 UTC+8 for
+  every date from 2026-09-03 through 2026-10-07, doubling that model's
+  available quota. This is quota, not a billing rate, and the page does not
+  say whether it stacks with the off-peak promotion — so it is never folded
+  into the multiplier. It is reported as its own `campaign` entry under
+  `usage.zai._billing` (active now or not, the 2x quota multiplier, the
+  window hours, and the next start or current end), appended to the human
+  notes only while the campaign period runs, and labelled non-ZCode: through
+  ZCode the same window is zero-consumption, and this tool is not ZCode.
+
 Codex accounts can hold **banked rate-limit resets** — a credit the account
 holder spends deliberately, unlike the scheduled reset that arrives on its own.
 Human output prints one note per account that has any: how many are available,

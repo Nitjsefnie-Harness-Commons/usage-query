@@ -479,6 +479,152 @@ def test_no_banked_reset_note_when_none_are_available(tmp):
     assert "banked reset" not in out.getvalue()
 
 
+def test_zai_offpeak_promo_bills_every_hour_at_half_rate(tmp):
+    """'From September 25 to October 7, 2026, all-day usage will be charged
+    at the off-peak rate': even the weekday 14:00-18:00 window bills 0.5x
+    between 2026-09-25 00:00 and 2026-10-08 00:00 UTC+8 (end exclusive)."""
+    del tmp
+    mod = _load()
+    cases = [
+        # 15:00 UTC+8 the day before the promo: still an ordinary peak hour.
+        (datetime(2026, 9, 24, 7, 0, tzinfo=timezone.utc), "peak", 1.0),
+        # The promo's first minute swallows what would be Thursday peak.
+        (datetime(2026, 9, 25, 7, 0, tzinfo=timezone.utc), "off-peak", 0.5),
+        # The promo's last second, 2026-10-07 23:59:59 UTC+8.
+        (datetime(2026, 10, 7, 15, 59, 59, tzinfo=timezone.utc),
+         "off-peak", 0.5),
+        # The first peak after the promo, Thursday 2026-10-08 14:00 UTC+8.
+        (datetime(2026, 10, 8, 6, 0, tzinfo=timezone.utc), "peak", 1.0),
+    ]
+    for moment, state, multiplier in cases:
+        status = mod._zai_billing_status(moment)
+        assert status["state"] == state, moment.isoformat()
+        assert status["multiplier"] == multiplier, moment.isoformat()
+
+
+def test_zai_promo_suppresses_peak_in_the_next_transition(tmp):
+    """No peak may be reported inside the all-day off-peak promotion: from
+    inside it - and from the evening before it starts - the next peak is the
+    first after the window, Thursday 2026-10-08 14:00 UTC+8."""
+    del tmp
+    mod = _load()
+    cases = [
+        # Inside the promo on what would be a peak Monday afternoon.
+        (datetime(2026, 9, 28, 7, 0, tzinfo=timezone.utc),
+         "off-peak", 0.5, "2026-10-08T14:00:00+08:00", "9d23h"),
+        # The promo's final second still points past the window.
+        (datetime(2026, 10, 7, 15, 59, 59, tzinfo=timezone.utc),
+         "off-peak", 0.5, "2026-10-08T14:00:00+08:00", "14h00m"),
+        # The evening before the promo: the Friday 14:00 would-be peak is
+        # inside the window, so the next real peak is past its end.
+        (datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc),
+         "off-peak", 0.5, "2026-10-08T14:00:00+08:00", "13d20h"),
+    ]
+    for moment, state, multiplier, next_at, next_in in cases:
+        status = mod._zai_billing_status(moment)
+        assert status["state"] == state, moment.isoformat()
+        assert status["multiplier"] == multiplier, moment.isoformat()
+        assert status["next_transition"] == {
+            "state": "peak",
+            "at": next_at,
+            "in": next_in,
+        }, moment.isoformat()
+
+
+def test_zai_campaign_windows_nightly_2300_to_0900(tmp):
+    """'every day from 23:00 to 09:00 the following day ... available quota is
+    doubled': one window [D 23:00, D+1 09:00) UTC+8 per date D from
+    2026-09-03 through 2026-10-07, so the last window ends 2026-10-08 09:00.
+    The campaign is quota, not billing: it never moves the multiplier."""
+    del tmp
+    mod = _load()
+
+    def campaign(moment):
+        return mod._zai_billing_status(moment)["campaign"]
+
+    # A window is active from 23:00 of its start date to 08:59:59 of the next.
+    assert campaign(datetime(2026, 9, 3, 15, 0, tzinfo=timezone.utc)) == {
+        "name": "GLM-5.3-Flash campaign",
+        "active": True,
+        "quota_multiplier": 2,
+        "hours": "23:00-09:00 UTC+8",
+        "starts_at": None,
+        "ends_at": "2026-09-04T09:00:00+08:00",
+    }
+    active = mod._zai_billing_status(
+        datetime(2026, 9, 3, 16, 59, 59, tzinfo=timezone.utc))["campaign"]
+    assert active["active"] is True
+    assert active["ends_at"] == "2026-09-04T09:00:00+08:00"
+    assert mod._zai_billing_status(
+        datetime(2026, 10, 7, 15, 30, tzinfo=timezone.utc))["campaign"][
+            "ends_at"] == "2026-10-08T09:00:00+08:00"
+
+    # Inside the campaign period but between windows: the next start names
+    # tonight's 23:00.
+    for moment, starts in [
+        (datetime(2026, 9, 3, 14, 59, 59, tzinfo=timezone.utc),
+         "2026-09-03T23:00:00+08:00"),   # 22:59:59 on the first campaign date
+        (datetime(2026, 9, 4, 1, 0, tzinfo=timezone.utc),
+         "2026-09-04T23:00:00+08:00"),   # 09:00:00, the exclusive end
+    ]:
+        status = campaign(moment)
+        assert status["active"] is False, moment.isoformat()
+        assert status["starts_at"] == starts, moment.isoformat()
+        assert status["ends_at"] is None, moment.isoformat()
+
+    # Past the last window the campaign is simply over; before the first
+    # window it has not begun. In both, nothing may surface in any note.
+    for moment in [datetime(2026, 10, 8, 1, 0, tzinfo=timezone.utc),
+                   datetime(2026, 9, 2, 15, 30, tzinfo=timezone.utc),
+                   datetime(2026, 9, 2, 10, 0, tzinfo=timezone.utc)]:
+        quiet = campaign(moment)
+        assert quiet["active"] is False, moment.isoformat()
+        assert quiet["starts_at"] is None and quiet["ends_at"] is None, \
+            moment.isoformat()
+
+    # Quota doubling is not a billing rate: the multiplier under an active
+    # window stays whatever the peak/off-peak clock says.
+    night = mod._zai_billing_status(
+        datetime(2026, 9, 3, 16, 59, 59, tzinfo=timezone.utc))
+    assert night["campaign"]["active"] is True
+    assert night["multiplier"] == 0.5
+
+
+def test_zai_notes_append_the_campaign_only_inside_its_period(tmp):
+    del tmp
+    mod = _load()
+    # Active window: the compact label and the full billing line both carry
+    # the doubling, with the current window's end.
+    with _frozen_clock(mod, datetime(2026, 9, 3, 16, 30,
+                                     tzinfo=timezone.utc)):
+        assert mod._zai_peak_note() == (
+            "off-peak 0.5x"
+            " · GLM-5.3-Flash campaign 2x quota until 09:00 UTC+8")
+        billing = mod._zai_billing_status()
+        note = mod._zai_billing_note(billing)
+    assert "GLM-5.3-Flash campaign 2x quota until 09:00 UTC+8." in note
+
+    # Inside the period, outside a window: the next start is tonight.
+    with _frozen_clock(mod, datetime(2026, 9, 4, 1, 0, tzinfo=timezone.utc)):
+        assert mod._zai_peak_note() == (
+            "off-peak 0.5x"
+            " · GLM-5.3-Flash campaign 2x quota from 23:00 UTC+8")
+
+    # Outside the campaign period both notes are exactly what earlier
+    # versions printed - byte-identical, promotion machinery invisible.
+    with _frozen_clock(mod, datetime(2026, 10, 12, 7, 0,
+                                     tzinfo=timezone.utc)):
+        assert mod._zai_peak_note() == "peak 1x"
+        assert mod._zai_billing_note(mod._zai_billing_status()) == (
+            "z.ai billing: peak 1x now; peak Mon-Fri 14:00-18:00 UTC+8; "
+            "off-peak Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; "
+            "all day Sat-Sun; next off-peak starts 2026-10-12 18:00 UTC+8 "
+            "(in 3h00m).")
+    # The same holds before the campaign ever began.
+    with _frozen_clock(mod, datetime(2026, 1, 5, 7, 0, tzinfo=timezone.utc)):
+        assert mod._zai_peak_note() == "peak 1x"
+
+
 def main():
     return _util.runner(_util.collect(globals()), tmp_prefix="usagequerybehavior_")
 
