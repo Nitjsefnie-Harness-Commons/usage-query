@@ -199,6 +199,7 @@ ZAI_OFF_PEAK_HOURS = (
 #   the off-peak rate."
 ZAI_OFFPEAK_PROMO_START = datetime(2026, 9, 25, 0, 0, tzinfo=ZAI_TZ)
 ZAI_OFFPEAK_PROMO_END = datetime(2026, 10, 8, 0, 0, tzinfo=ZAI_TZ)
+ZAI_OFFPEAK_PROMO_NAME = "all-day off-peak promotion"
 #   "During the campaign period, every day from 23:00 to 09:00 the following
 #   day, usage of GLM-5.3-Flash through GLM Coding Plan ... via other
 #   supported Agents: available quota is doubled based on your plan's
@@ -214,7 +215,13 @@ ZAI_CAMPAIGN_FIRST_NIGHT = date(2026, 9, 3)
 ZAI_CAMPAIGN_LAST_NIGHT = date(2026, 10, 7)
 ZAI_CAMPAIGN_START_MIN = 23 * 60
 ZAI_CAMPAIGN_END_MIN = 9 * 60  # exclusive: 09:00:00 is past the window
-ZAI_CAMPAIGN_HOURS = "23:00-09:00 UTC+8"
+# The note texts, derived so they cannot drift from the minute constants.
+ZAI_CAMPAIGN_START_HHMM = (
+    f"{ZAI_CAMPAIGN_START_MIN // 60:02d}:{ZAI_CAMPAIGN_START_MIN % 60:02d}")
+ZAI_CAMPAIGN_END_HHMM = (
+    f"{ZAI_CAMPAIGN_END_MIN // 60:02d}:{ZAI_CAMPAIGN_END_MIN % 60:02d}")
+ZAI_CAMPAIGN_HOURS = (f"{ZAI_CAMPAIGN_START_HHMM}-{ZAI_CAMPAIGN_END_HHMM}"
+                      " UTC+8")
 ZAI_CAMPAIGN_QUOTA_MULTIPLIER = 2
 # Codex's own credential file: CODEX_HOME (or ~/.codex) / auth.json. Its shape
 # was read off a live file rather than assumed - auth_mode, OPENAI_API_KEY,
@@ -809,7 +816,10 @@ def _zai_campaign_status(moment):
         start = datetime.combine(night, datetime.min.time(),
                                  tzinfo=ZAI_TZ).replace(
                                      hour=ZAI_CAMPAIGN_START_MIN // 60)
-        return start, start + timedelta(hours=10)  # 23:00 -> next 09:00
+        # [D 23:00, D+1 09:00): the tail to midnight plus the end minute.
+        length = timedelta(minutes=(24 * 60 - ZAI_CAMPAIGN_START_MIN)
+                           + ZAI_CAMPAIGN_END_MIN)
+        return start, start + length
 
     if minute_of_day < ZAI_CAMPAIGN_END_MIN:
         night = moment.date() - timedelta(days=1)
@@ -828,8 +838,6 @@ def _zai_campaign_status(moment):
                 "ends_at": end.isoformat(timespec="seconds")}
     upcoming = moment.date()
     if minute_of_day >= ZAI_CAMPAIGN_START_MIN:
-        upcoming += timedelta(days=1)
-    while upcoming < ZAI_CAMPAIGN_FIRST_NIGHT:
         upcoming += timedelta(days=1)
     if upcoming > ZAI_CAMPAIGN_LAST_NIGHT or moment.date() < \
             ZAI_CAMPAIGN_FIRST_NIGHT:
@@ -850,9 +858,24 @@ def _zai_campaign_status(moment):
             "ends_at": None}
 
 
+def _zai_campaign_clause(campaign):
+    """The one campaign clause both human notes append: 'GLM-5.3-Flash
+    campaign 2x quota until 09:00 UTC+8' while a window is live, the
+    from-form inside the period between windows, '' outside the period.
+    Callers supply their own separator (' · ' for the compact label,
+    '; ' for the billing line)."""
+    if campaign.get("active"):
+        return (f"{ZAI_CAMPAIGN_NAME} {campaign['quota_multiplier']:g}x quota"
+                f" until {ZAI_CAMPAIGN_END_HHMM} UTC+8")
+    if campaign.get("starts_at"):
+        return (f"{ZAI_CAMPAIGN_NAME} {campaign['quota_multiplier']:g}x quota"
+                f" from {ZAI_CAMPAIGN_START_HHMM} UTC+8")
+    return ""
+
+
 def _zai_billing_status(now=None):
     """Current z.ai billing state, published hours, next transition, and the
-    GLM-5.3-Flash campaign entry.
+    promotion and campaign entries.
 
     Computed, not queried: no z.ai payload carries a peak flag (checked against
     the quota and model-usage monitor endpoints, 2026-08-28), so the rule the
@@ -862,7 +885,9 @@ def _zai_billing_status(now=None):
     End-exclusive means 18:00:00 itself is off-peak and the next peak begins on
     the next weekday. The all-day off-peak promotion suppresses peak entirely
     while it runs - including in the next-transition scan, which must never
-    report a would-be peak the promotion bills at 0.5x.
+    report a would-be peak the promotion bills at 0.5x - and reports itself in
+    the `promotion` entry (present year-round, `active` or not) so the notes
+    can say when it is in force and when it ends.
     """
     moment = (now or datetime.now(timezone.utc)).astimezone(ZAI_TZ)
     promo = ZAI_OFFPEAK_PROMO_START <= moment < ZAI_OFFPEAK_PROMO_END
@@ -897,23 +922,25 @@ def _zai_billing_status(now=None):
             "at": transition.isoformat(timespec="seconds"),
             "in": _fmt_dur((transition - moment).total_seconds()),
         },
+        "promotion": {
+            "name": ZAI_OFFPEAK_PROMO_NAME,
+            "active": promo,
+            "ends_at": ZAI_OFFPEAK_PROMO_END.isoformat(timespec="seconds"),
+        },
         "campaign": _zai_campaign_status(moment),
     }
 
 
 def _zai_peak_note(now=None):
-    """Compact label for the current z.ai billing state, with the campaign
-    clause appended while the campaign period runs. Outside it the label is
-    unchanged from before the campaign existed."""
+    """The per-window label: compact billing state, with the campaign clause
+    appended while the campaign period runs. Outside both promotions the
+    label is exactly what earlier versions printed - 'peak 1x' /
+    'off-peak 0.5x'."""
     status = _zai_billing_status(now)
     note = f"{status['state']} {status['multiplier']:g}x"
-    campaign = status["campaign"]
-    if campaign["active"]:
-        note += (f" · {ZAI_CAMPAIGN_NAME} "
-                 f"{campaign['quota_multiplier']:g}x quota until 09:00 UTC+8")
-    elif campaign["starts_at"]:
-        note += (f" · {ZAI_CAMPAIGN_NAME} "
-                 f"{campaign['quota_multiplier']:g}x quota from 23:00 UTC+8")
+    clause = _zai_campaign_clause(status["campaign"])
+    if clause:
+        note += f" · {clause}"
     return note
 
 
@@ -927,15 +954,16 @@ def _zai_billing_note(status):
         f"next {transition['state']} starts "
         f"{at.strftime('%Y-%m-%d %H:%M')} UTC+8 (in {transition['in']})"
     )
-    # A status dict from before the campaign existed (or a caller-built one)
-    # simply carries no clause: .get, not [], keeps the old shape renderable.
-    campaign = status.get("campaign") or {}
-    if campaign.get("active"):
-        note += (f"; {ZAI_CAMPAIGN_NAME} "
-                 f"{campaign['quota_multiplier']:g}x quota until 09:00 UTC+8")
-    elif campaign.get("starts_at"):
-        note += (f"; {ZAI_CAMPAIGN_NAME} "
-                 f"{campaign['quota_multiplier']:g}x quota from 23:00 UTC+8")
+    # A status dict from before the promotions existed (or a caller-built
+    # one) simply carries no clause: .get, not [], keeps the old shape
+    # renderable.
+    promotion = status.get("promotion") or {}
+    if promotion.get("active"):
+        note += (f"; {ZAI_OFFPEAK_PROMO_NAME} until "
+                 f"{ZAI_OFFPEAK_PROMO_END.strftime('%Y-%m-%d %H:%M')} UTC+8")
+    clause = _zai_campaign_clause(status.get("campaign") or {})
+    if clause:
+        note += f"; {clause}"
     return note + "."
 
 
@@ -1020,7 +1048,7 @@ def query_zai():
                 raise
             data, age = stale
     billing = _zai_billing_status()
-    peak_note = f"{billing['state']} {billing['multiplier']:g}x"
+    peak_note = _zai_peak_note()
     out = _normalize_zai(data, peak_note)
     out["_billing"] = billing
     if age:

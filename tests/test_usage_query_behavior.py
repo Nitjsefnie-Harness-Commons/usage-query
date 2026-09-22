@@ -625,6 +625,110 @@ def test_zai_notes_append_the_campaign_only_inside_its_period(tmp):
         assert mod._zai_peak_note() == "peak 1x"
 
 
+def test_zai_billing_note_names_the_promotion_while_in_force(tmp):
+    """The all-day off-peak promotion is announced while it runs - with its
+    end - and never outside it: outside the promotion the billing line is
+    byte-identical to what 1.3.1 printed."""
+    del tmp
+    mod = _load()
+    # 2026-09-28 15:00 UTC+8: inside the promotion, inside the campaign
+    # period between nightly windows, next real peak past the promotion.
+    moment = datetime(2026, 9, 28, 7, 0, tzinfo=timezone.utc)
+    status = mod._zai_billing_status(moment)
+    assert status["promotion"] == {
+        "name": "all-day off-peak promotion",
+        "active": True,
+        "ends_at": "2026-10-08T00:00:00+08:00",
+    }
+    assert mod._zai_billing_note(status) == (
+        "z.ai billing: off-peak 0.5x now; "
+        "peak Mon-Fri 14:00-18:00 UTC+8; "
+        "off-peak Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; "
+        "all day Sat-Sun; "
+        "next peak starts 2026-10-08 14:00 UTC+8 (in 9d23h); "
+        "all-day off-peak promotion until 2026-10-08 00:00 UTC+8; "
+        "GLM-5.3-Flash campaign 2x quota from 23:00 UTC+8.")
+
+    # The promotion entry exists - inactive - outside the window too.
+    outside = mod._zai_billing_status(
+        datetime(2026, 10, 12, 7, 0, tzinfo=timezone.utc))
+    assert outside["promotion"] == {
+        "name": "all-day off-peak promotion",
+        "active": False,
+        "ends_at": "2026-10-08T00:00:00+08:00",
+    }
+    with _frozen_clock(mod, datetime(2026, 10, 12, 7, 0,
+                                     tzinfo=timezone.utc)):
+        assert mod._zai_billing_note(mod._zai_billing_status()) == (
+            "z.ai billing: peak 1x now; peak Mon-Fri 14:00-18:00 UTC+8; "
+            "off-peak Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; "
+            "all day Sat-Sun; next off-peak starts 2026-10-12 18:00 UTC+8 "
+            "(in 3h00m).")
+
+
+def test_zai_billing_line_carries_the_campaign_from_form_in_full(tmp):
+    """Inside the campaign period between windows, outside the promotion:
+    the billing line ends with the from-form clause, spelled out whole."""
+    del tmp
+    mod = _load()
+    # 2026-09-04 09:00 UTC+8, a Friday: the window just ended, tonight's
+    # starts at 23:00, and the promotion has not begun.
+    status = mod._zai_billing_status(
+        datetime(2026, 9, 4, 1, 0, tzinfo=timezone.utc))
+    assert status["promotion"]["active"] is False
+    assert mod._zai_billing_note(status) == (
+        "z.ai billing: off-peak 0.5x now; "
+        "peak Mon-Fri 14:00-18:00 UTC+8; "
+        "off-peak Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; "
+        "all day Sat-Sun; "
+        "next peak starts 2026-09-04 14:00 UTC+8 (in 5h00m); "
+        "GLM-5.3-Flash campaign 2x quota from 23:00 UTC+8.")
+
+
+def test_zai_query_labels_windows_with_the_campaign_clause(tmp):
+    """The tested label format is the printed one: query_zai stamps
+    _zai_peak_note's output on every window, so the campaign clause reaches
+    the human table and the JSON during a campaign night - and, outside both
+    promotions, the label is exactly the bare billing state it always was."""
+    mod = _load()
+    key_file = os.path.join(tmp, "api-key")
+    with open(key_file, "w", encoding="utf-8") as fh:
+        fh.write("k" * 49 + "\n")
+    label = ("off-peak 0.5x"
+             " · GLM-5.3-Flash campaign 2x quota until 09:00 UTC+8")
+    frozen = datetime(2026, 9, 3, 16, 30, tzinfo=timezone.utc)  # 00:30+8
+    with _zai_sources(mod, files=(key_file,)), \
+            mock.patch.object(mod, "ZAI_CACHE",
+                              os.path.join(tmp, "zai-cache.json")), \
+            mock.patch.object(mod, "_get_retry",
+                              side_effect=lambda *a, **k: _zai_envelope()), \
+            _frozen_clock(mod, frozen):
+        windows = mod.query_zai()
+        human = io.StringIO()
+        with redirect_stdout(human):
+            assert mod.main(["--zai"]) == 0
+        js = io.StringIO()
+        with redirect_stdout(js):
+            assert mod.main(["--zai", "--json"]) == 0
+    assert windows["five_hour"]["peak_note"] == label
+    assert windows["weekly"]["peak_note"] == label
+    assert label in human.getvalue()
+    payload = json.loads(js.getvalue())
+    assert payload["usage"]["zai"]["five_hour"]["peak_note"] == label
+    assert payload["usage"]["zai"]["_billing"]["campaign"]["active"] is True
+
+    # Outside both promotions the same path prints the bare state.
+    bare = datetime(2026, 10, 12, 7, 0, tzinfo=timezone.utc)
+    with _zai_sources(mod, files=(key_file,)), \
+            mock.patch.object(mod, "ZAI_CACHE",
+                              os.path.join(tmp, "zai-cache2.json")), \
+            mock.patch.object(mod, "_get_retry",
+                              side_effect=lambda *a, **k: _zai_envelope()), \
+            _frozen_clock(mod, bare):
+        windows = mod.query_zai()
+    assert windows["five_hour"]["peak_note"] == "peak 1x"
+
+
 def main():
     return _util.runner(_util.collect(globals()), tmp_prefix="usagequerybehavior_")
 
