@@ -729,6 +729,65 @@ def test_zai_query_labels_windows_with_the_campaign_clause(tmp):
     assert windows["five_hour"]["peak_note"] == "peak 1x"
 
 
+def test_zai_campaign_window_honours_a_start_minute_off_the_hour(tmp):
+    """The window start is the night's local midnight plus the start MINUTE:
+    building it with .replace(hour=START_MIN // 60) silently drops
+    START_MIN % 60, so a 23:30 start would open at 23:00, end at 08:30, and
+    disagree with the minute-of-day comparison that selects the night."""
+    del tmp
+    mod = _load()
+
+    def campaign(moment):
+        return mod._zai_billing_status(moment)["campaign"]
+
+    # 23:45 UTC+8 on a campaign night: inside a window that began 23:30 and
+    # ends at the unchanged end minute, 09:00, the next morning.
+    with mock.patch.object(mod, "ZAI_CAMPAIGN_START_MIN", 23 * 60 + 30):
+        active = campaign(datetime(2026, 9, 21, 23, 45, tzinfo=mod.ZAI_TZ))
+    assert active["active"] is True
+    assert active["ends_at"] == "2026-09-22T09:00:00+08:00"
+
+    # 23:15 on that same night: before the shifted start, so not live - and
+    # the upcoming window names tonight's 23:30, not 23:00.
+    with mock.patch.object(mod, "ZAI_CAMPAIGN_START_MIN", 23 * 60 + 30):
+        between = campaign(datetime(2026, 9, 21, 23, 15, tzinfo=mod.ZAI_TZ))
+    assert between["active"] is False
+    assert between["starts_at"] == "2026-09-21T23:30:00+08:00"
+    assert between["ends_at"] is None
+
+
+def test_zai_query_reads_the_clock_once_for_billing_and_label(tmp):
+    """query_zai reads the wall clock once and hands that same instant to
+    _zai_billing_status and _zai_peak_note: read separately, an instant that
+    straddles a window boundary would put the result's _billing entry and the
+    peak_note stamped on every window into different windows."""
+    mod = _load()
+    key_file = os.path.join(tmp, "api-key")
+    with open(key_file, "w", encoding="utf-8") as fh:
+        fh.write("k" * 49 + "\n")
+    seen = {}
+
+    def billing(now=None):
+        seen["billing"] = now
+        return {"state": "peak", "multiplier": 1.0}
+
+    def note(now=None):
+        seen["note"] = now
+        return "peak 1x"
+
+    with _zai_sources(mod, files=(key_file,)), \
+            mock.patch.object(mod, "ZAI_CACHE",
+                              os.path.join(tmp, "zai-cache.json")), \
+            mock.patch.object(mod, "_get_retry",
+                              side_effect=lambda *a, **k: _zai_envelope()), \
+            mock.patch.object(mod, "_zai_billing_status", billing), \
+            mock.patch.object(mod, "_zai_peak_note", note):
+        mod.query_zai()
+    assert seen["billing"] is not None
+    assert seen["note"] is not None
+    assert seen["billing"] == seen["note"]
+
+
 def main():
     return _util.runner(_util.collect(globals()), tmp_prefix="usagequerybehavior_")
 

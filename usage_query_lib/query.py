@@ -132,7 +132,7 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
@@ -813,9 +813,8 @@ def _zai_campaign_status(moment):
     minute_of_day = moment.hour * 60 + moment.minute
 
     def window(night):
-        start = datetime.combine(night, datetime.min.time(),
-                                 tzinfo=ZAI_TZ).replace(
-                                     hour=ZAI_CAMPAIGN_START_MIN // 60)
+        start = (datetime.combine(night, datetime.min.time(), tzinfo=ZAI_TZ)
+                 + timedelta(minutes=ZAI_CAMPAIGN_START_MIN))
         # [D 23:00, D+1 09:00): the tail to midnight plus the end minute.
         length = timedelta(minutes=(24 * 60 - ZAI_CAMPAIGN_START_MIN)
                            + ZAI_CAMPAIGN_END_MIN)
@@ -1047,8 +1046,12 @@ def query_zai():
             if stale is None:
                 raise
             data, age = stale
-    billing = _zai_billing_status()
-    peak_note = _zai_peak_note()
+    # One clock read feeds both: fetched separately, an instant straddling a
+    # window boundary would put the _billing entry and the peak_note stamped
+    # on every window into different windows.
+    billing_now = datetime.now(timezone.utc)
+    billing = _zai_billing_status(billing_now)
+    peak_note = _zai_peak_note(billing_now)
     out = _normalize_zai(data, peak_note)
     out["_billing"] = billing
     if age:
