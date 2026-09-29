@@ -5,8 +5,9 @@ import io
 import json
 import os
 import sys
+import time
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -43,6 +44,23 @@ def _frozen_clock(mod, frozen):
             return frozen.astimezone(tz)
 
     return mock.patch.object(mod, "datetime", FrozenDateTime)
+
+
+def _campaign_local(night):
+    """The campaign window opening on `night` in machine-local HH:MM-HH:MM,
+    computed independently of the module: CI runs in whatever zone the
+    runner has, so the expectation follows the machine like the output."""
+    utc8 = timezone(timedelta(hours=8))
+    start = datetime(night.year, night.month, night.day, 23, 0, tzinfo=utc8)
+    end = start + timedelta(hours=10)
+    return (start.astimezone().strftime("%H:%M") + "-"
+            + end.astimezone().strftime("%H:%M"))
+
+
+def _campaign_clause(night, state):
+    return ("GLM-5.3-Flash 2x quota nightly 23:00-09:00 UTC+8 "
+            f"({_campaign_local(night)} local) until 2026-10-08 09:00 UTC+8, "
+            + state)
 
 
 def test_pace_arithmetic_marks_over_pace_and_recovery_time(tmp):
@@ -546,12 +564,17 @@ def test_zai_campaign_windows_nightly_2300_to_0900(tmp):
 
     # A window is active from 23:00 of its start date to 08:59:59 of the next.
     assert campaign(datetime(2026, 9, 3, 15, 0, tzinfo=timezone.utc)) == {
-        "name": "GLM-5.3-Flash campaign",
+        "name": "GLM-5.3-Flash nightly 2x quota",
+        "model": "GLM-5.3-Flash",
         "active": True,
         "quota_multiplier": 2,
         "hours": "23:00-09:00 UTC+8",
+        "hours_local": _campaign_local(date(2026, 9, 3)),
         "starts_at": None,
+        "starts_in": None,
         "ends_at": "2026-09-04T09:00:00+08:00",
+        "ends_in": "10h00m",
+        "offer_ends_at": "2026-10-08T09:00:00+08:00",
     }
     active = mod._zai_billing_status(
         datetime(2026, 9, 3, 16, 59, 59, tzinfo=timezone.utc))["campaign"]
@@ -573,6 +596,9 @@ def test_zai_campaign_windows_nightly_2300_to_0900(tmp):
         assert status["active"] is False, moment.isoformat()
         assert status["starts_at"] == starts, moment.isoformat()
         assert status["ends_at"] is None, moment.isoformat()
+        assert status["ends_in"] is None, moment.isoformat()
+    assert campaign(datetime(2026, 9, 4, 1, 0, tzinfo=timezone.utc))[
+        "starts_in"] == "14h00m"
 
     # Past the last window the campaign is simply over; before the first
     # window it has not begun. In both, nothing may surface in any note.
@@ -583,6 +609,9 @@ def test_zai_campaign_windows_nightly_2300_to_0900(tmp):
         assert quiet["active"] is False, moment.isoformat()
         assert quiet["starts_at"] is None and quiet["ends_at"] is None, \
             moment.isoformat()
+        assert quiet["starts_in"] is None and quiet["ends_in"] is None, \
+            moment.isoformat()
+        assert quiet["offer_ends_at"] == "2026-10-08T09:00:00+08:00"
 
     # Quota doubling is not a billing rate: the multiplier under an active
     # window stays whatever the peak/off-peak clock says.
@@ -599,18 +628,31 @@ def test_zai_notes_append_the_campaign_only_inside_its_period(tmp):
     # the doubling, with the current window's end.
     with _frozen_clock(mod, datetime(2026, 9, 3, 16, 30,
                                      tzinfo=timezone.utc)):
-        assert mod._zai_peak_note() == (
-            "off-peak 0.5x"
-            " · GLM-5.3-Flash campaign 2x quota until 09:00 UTC+8")
+        active = _campaign_clause(date(2026, 9, 3),
+                                  "active now, window ends in 8h30m")
+        assert mod._zai_peak_note() == "off-peak 0.5x · " + active
         billing = mod._zai_billing_status()
         note = mod._zai_billing_note(billing)
-    assert "GLM-5.3-Flash campaign 2x quota until 09:00 UTC+8." in note
+    assert note.endswith("; " + active + ".")
 
-    # Inside the period, outside a window: the next start is tonight.
+    # Inside the period, outside a window: when the next one starts.
     with _frozen_clock(mod, datetime(2026, 9, 4, 1, 0, tzinfo=timezone.utc)):
         assert mod._zai_peak_note() == (
-            "off-peak 0.5x"
-            " · GLM-5.3-Flash campaign 2x quota from 23:00 UTC+8")
+            "off-peak 0.5x · "
+            + _campaign_clause(date(2026, 9, 4), "next window in 14h00m"))
+
+    # The last window's final minute still reads as live...
+    with _frozen_clock(mod, datetime(2026, 10, 8, 0, 59,
+                                     tzinfo=timezone.utc)):
+        assert mod._zai_peak_note() == (
+            "off-peak 0.5x · "
+            + _campaign_clause(date(2026, 10, 7),
+                               "active now, window ends in 1m"))
+    # ...and the instant it closes the offer is over: no clause at all.
+    with _frozen_clock(mod, datetime(2026, 10, 8, 1, 0, tzinfo=timezone.utc)):
+        assert mod._zai_peak_note() == "off-peak 0.5x"
+        assert "GLM-5.3-Flash" not in mod._zai_billing_note(
+            mod._zai_billing_status())
 
     # Outside the campaign period both notes are exactly what earlier
     # versions printed - byte-identical, promotion machinery invisible.
@@ -649,7 +691,7 @@ def test_zai_billing_note_names_the_promotion_while_in_force(tmp):
         "all day Sat-Sun; "
         "next peak starts 2026-10-08 14:00 UTC+8 (in 9d23h); "
         "all-day off-peak promotion until 2026-10-08 00:00 UTC+8; "
-        "GLM-5.3-Flash campaign 2x quota from 23:00 UTC+8.")
+        + _campaign_clause(date(2026, 9, 28), "next window in 8h00m") + ".")
 
     # The promotion entry exists - inactive - outside the window too.
     outside = mod._zai_billing_status(
@@ -668,9 +710,9 @@ def test_zai_billing_note_names_the_promotion_while_in_force(tmp):
             "(in 3h00m).")
 
 
-def test_zai_billing_line_carries_the_campaign_from_form_in_full(tmp):
+def test_zai_billing_line_carries_the_campaign_next_window_form_in_full(tmp):
     """Inside the campaign period between windows, outside the promotion:
-    the billing line ends with the from-form clause, spelled out whole."""
+    the billing line ends with the next-window clause, spelled out whole."""
     del tmp
     mod = _load()
     # 2026-09-04 09:00 UTC+8, a Friday: the window just ended, tonight's
@@ -684,7 +726,29 @@ def test_zai_billing_line_carries_the_campaign_from_form_in_full(tmp):
         "off-peak Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; "
         "all day Sat-Sun; "
         "next peak starts 2026-09-04 14:00 UTC+8 (in 5h00m); "
-        "GLM-5.3-Flash campaign 2x quota from 23:00 UTC+8.")
+        + _campaign_clause(date(2026, 9, 4), "next window in 14h00m") + ".")
+
+
+def test_zai_campaign_clause_names_the_window_in_machine_local_time(tmp):
+    """The same window, in a known zone: 23:00-09:00 UTC+8 is 17:00-03:00 in
+    Central European Summer Time. Pinned with TZ so the literal is checked,
+    not only a value the test computed the way the code does."""
+    del tmp
+    if not hasattr(time, "tzset"):
+        _util.skip("time.tzset is POSIX-only")
+    mod = _load()
+    try:
+        with mock.patch.dict(os.environ, {"TZ": "Europe/Prague"}):
+            time.tzset()
+            status = mod._zai_billing_status(
+                datetime(2026, 9, 29, 7, 0, tzinfo=timezone.utc))
+            clause = mod._zai_campaign_clause(status["campaign"])
+    finally:
+        time.tzset()
+    assert status["campaign"]["hours_local"] == "17:00-03:00"
+    assert clause == (
+        "GLM-5.3-Flash 2x quota nightly 23:00-09:00 UTC+8 (17:00-03:00 local)"
+        " until 2026-10-08 09:00 UTC+8, next window in 8h00m")
 
 
 def test_zai_query_labels_windows_with_the_campaign_clause(tmp):
@@ -696,8 +760,9 @@ def test_zai_query_labels_windows_with_the_campaign_clause(tmp):
     key_file = os.path.join(tmp, "api-key")
     with open(key_file, "w", encoding="utf-8") as fh:
         fh.write("k" * 49 + "\n")
-    label = ("off-peak 0.5x"
-             " · GLM-5.3-Flash campaign 2x quota until 09:00 UTC+8")
+    label = ("off-peak 0.5x · "
+             + _campaign_clause(date(2026, 9, 3),
+                                "active now, window ends in 8h30m"))
     frozen = datetime(2026, 9, 3, 16, 30, tzinfo=timezone.utc)  # 00:30+8
     with _zai_sources(mod, files=(key_file,)), \
             mock.patch.object(mod, "ZAI_CACHE",

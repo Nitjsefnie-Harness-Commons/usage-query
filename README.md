@@ -45,9 +45,14 @@ the code — they are history, not config — and simply report inactive):
   say whether it stacks with the off-peak promotion — so it is never folded
   into the multiplier. It is reported as its own `campaign` entry under
   `usage.zai._billing` (active now or not, the 2x quota multiplier, the
-  window hours, and the next start or current end), appended to the human
-  notes only while the campaign period runs, and labelled non-ZCode: through
-  ZCode the same window is zero-consumption, and this tool is not ZCode.
+  window hours in UTC+8 and machine-local, the current window's end or the
+  next one's start with the time left, and when the offer ends), and while
+  the campaign period runs both human notes carry one clause such as
+  `GLM-5.3-Flash 2x quota nightly 23:00-09:00 UTC+8 (17:00-03:00 local)
+  until 2026-10-08 09:00 UTC+8, next window in 8h00m` — or `active now,
+  window ends in …` inside a window. Outside the period nothing is printed.
+  Through ZCode the same window is zero-consumption; this tool is not ZCode,
+  so it reports the doubling.
 
 z.ai accounts can hold **weekly quota resets** too. Beside the quota, the z.ai
 query reads `GET /api/biz/customer-package-reset/list?targetType=PERSONAL`

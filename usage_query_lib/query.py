@@ -220,7 +220,7 @@ ZAI_OFFPEAK_PROMO_NAME = "all-day off-peak promotion"
 #   Whether the campaign stacks with the off-peak promotion above is not
 #   published, so it is never folded into the billing multiplier - it is
 #   reported as its own `campaign` entry instead.
-ZAI_CAMPAIGN_NAME = "GLM-5.3-Flash campaign"
+ZAI_CAMPAIGN_MODEL = "GLM-5.3-Flash"
 ZAI_CAMPAIGN_FIRST_NIGHT = date(2026, 9, 3)
 ZAI_CAMPAIGN_LAST_NIGHT = date(2026, 10, 7)
 ZAI_CAMPAIGN_START_MIN = 23 * 60
@@ -233,6 +233,8 @@ ZAI_CAMPAIGN_END_HHMM = (
 ZAI_CAMPAIGN_HOURS = (f"{ZAI_CAMPAIGN_START_HHMM}-{ZAI_CAMPAIGN_END_HHMM}"
                       " UTC+8")
 ZAI_CAMPAIGN_QUOTA_MULTIPLIER = 2
+ZAI_CAMPAIGN_NAME = (f"{ZAI_CAMPAIGN_MODEL} nightly "
+                     f"{ZAI_CAMPAIGN_QUOTA_MULTIPLIER}x quota")
 # Codex's own credential file: CODEX_HOME (or ~/.codex) / auth.json. Its shape
 # was read off a live file rather than assumed - auth_mode, OPENAI_API_KEY,
 # tokens{id_token, access_token, refresh_token, account_id}, last_refresh - and
@@ -810,6 +812,16 @@ def _zai_cred():
         f"z.ai is not configured on this machine: no API key in {looked}")
 
 
+def _zai_campaign_window(night):
+    """[night 23:00, night+1 09:00) UTC+8 - the window opening on `night`."""
+    start = (datetime.combine(night, datetime.min.time(), tzinfo=ZAI_TZ)
+             + timedelta(minutes=ZAI_CAMPAIGN_START_MIN))
+    # The tail to midnight plus the end minute.
+    length = timedelta(minutes=(24 * 60 - ZAI_CAMPAIGN_START_MIN)
+                       + ZAI_CAMPAIGN_END_MIN)
+    return start, start + length
+
+
 def _zai_campaign_status(moment):
     """The GLM-5.3-Flash nightly campaign state at `moment` (already ZAI_TZ).
 
@@ -817,19 +829,33 @@ def _zai_campaign_status(moment):
     ZAI_CAMPAIGN_FIRST_NIGHT through ZAI_CAMPAIGN_LAST_NIGHT. While a window
     is live the doubling is quota, not billing rate: the caller keeps the
     peak/off-peak multiplier untouched and reports this dict as its own
-    `campaign` entry. Inside the period but outside a live window, `starts_at`
-    names the next one; before the period or once the last window has ended,
-    both stamps are None and nothing surfaces in any note.
+    `campaign` entry. While live, `ends_at`/`ends_in` name the current
+    window's end; inside the period but outside a live window,
+    `starts_at`/`starts_in` name the next one; before the period or once the
+    last window has ended, all four are None and nothing surfaces in any
+    note. `hours_local` is the window in machine-local time, taken from the
+    window in question (the current or next one, else the nearest end of the
+    period) so a DST change is honoured; `offer_ends_at` is when the last
+    window closes.
     """
     minute_of_day = moment.hour * 60 + moment.minute
+    offer_end = _zai_campaign_window(ZAI_CAMPAIGN_LAST_NIGHT)[1]
 
-    def window(night):
-        start = (datetime.combine(night, datetime.min.time(), tzinfo=ZAI_TZ)
-                 + timedelta(minutes=ZAI_CAMPAIGN_START_MIN))
-        # [D 23:00, D+1 09:00): the tail to midnight plus the end minute.
-        length = timedelta(minutes=(24 * 60 - ZAI_CAMPAIGN_START_MIN)
-                           + ZAI_CAMPAIGN_END_MIN)
-        return start, start + length
+    def entry(active, night, starts=None, ends=None):
+        start, end = _zai_campaign_window(night)
+        return {"name": ZAI_CAMPAIGN_NAME,
+                "model": ZAI_CAMPAIGN_MODEL,
+                "active": active,
+                "quota_multiplier": ZAI_CAMPAIGN_QUOTA_MULTIPLIER,
+                "hours": ZAI_CAMPAIGN_HOURS,
+                "hours_local": (start.astimezone().strftime("%H:%M") + "-"
+                                + end.astimezone().strftime("%H:%M")),
+                "starts_at": starts and starts.isoformat(timespec="seconds"),
+                "starts_in": starts and _fmt_dur((starts - moment)
+                                                 .total_seconds()),
+                "ends_at": ends and ends.isoformat(timespec="seconds"),
+                "ends_in": ends and _fmt_dur((ends - moment).total_seconds()),
+                "offer_ends_at": offer_end.isoformat(timespec="seconds")}
 
     if minute_of_day < ZAI_CAMPAIGN_END_MIN:
         night = moment.date() - timedelta(days=1)
@@ -839,48 +865,47 @@ def _zai_campaign_status(moment):
         night = None
     if night is not None and ZAI_CAMPAIGN_FIRST_NIGHT <= night \
             <= ZAI_CAMPAIGN_LAST_NIGHT:
-        start, end = window(night)
-        return {"name": ZAI_CAMPAIGN_NAME,
-                "active": True,
-                "quota_multiplier": ZAI_CAMPAIGN_QUOTA_MULTIPLIER,
-                "hours": ZAI_CAMPAIGN_HOURS,
-                "starts_at": None,
-                "ends_at": end.isoformat(timespec="seconds")}
+        return entry(True, night, ends=_zai_campaign_window(night)[1])
     upcoming = moment.date()
     if minute_of_day >= ZAI_CAMPAIGN_START_MIN:
         upcoming += timedelta(days=1)
-    if upcoming > ZAI_CAMPAIGN_LAST_NIGHT or moment.date() < \
-            ZAI_CAMPAIGN_FIRST_NIGHT:
-        # Past the last window, or before the first: the campaign is simply
-        # not running, and must not surface in any note.
-        return {"name": ZAI_CAMPAIGN_NAME,
-                "active": False,
-                "quota_multiplier": ZAI_CAMPAIGN_QUOTA_MULTIPLIER,
-                "hours": ZAI_CAMPAIGN_HOURS,
-                "starts_at": None,
-                "ends_at": None}
-    start, _ = window(upcoming)
-    return {"name": ZAI_CAMPAIGN_NAME,
-            "active": False,
-            "quota_multiplier": ZAI_CAMPAIGN_QUOTA_MULTIPLIER,
-            "hours": ZAI_CAMPAIGN_HOURS,
-            "starts_at": start.isoformat(timespec="seconds"),
-            "ends_at": None}
+    if upcoming > ZAI_CAMPAIGN_LAST_NIGHT:
+        # Past the last window: the campaign is over, and must not surface
+        # in any note.
+        return entry(False, ZAI_CAMPAIGN_LAST_NIGHT)
+    if moment.date() < ZAI_CAMPAIGN_FIRST_NIGHT:
+        # Before the first window: not running yet, equally silent.
+        return entry(False, ZAI_CAMPAIGN_FIRST_NIGHT)
+    return entry(False, upcoming,
+                 starts=_zai_campaign_window(upcoming)[0])
 
 
 def _zai_campaign_clause(campaign):
-    """The one campaign clause both human notes append: 'GLM-5.3-Flash
-    campaign 2x quota until 09:00 UTC+8' while a window is live, the
-    from-form inside the period between windows, '' outside the period.
-    Callers supply their own separator (' · ' for the compact label,
-    '; ' for the billing line)."""
+    """The one campaign clause both human notes append, '' outside the
+    period. It says what the offer is (the model's quota multiplied inside a
+    nightly window), the whole window in UTC+8 and machine-local time, when
+    the offer ends, and then either that a window is live and when it ends or
+    when the next one starts - e.g. 'GLM-5.3-Flash 2x quota nightly
+    23:00-09:00 UTC+8 (17:00-03:00 local) until 2026-10-08 09:00 UTC+8, next
+    window in 7h00m'. Callers supply their own separator (' · ' for the
+    compact label, '; ' for the billing line), so the clause itself only
+    uses commas."""
     if campaign.get("active"):
-        return (f"{ZAI_CAMPAIGN_NAME} {campaign['quota_multiplier']:g}x quota"
-                f" until {ZAI_CAMPAIGN_END_HHMM} UTC+8")
-    if campaign.get("starts_at"):
-        return (f"{ZAI_CAMPAIGN_NAME} {campaign['quota_multiplier']:g}x quota"
-                f" from {ZAI_CAMPAIGN_START_HHMM} UTC+8")
-    return ""
+        state = f"active now, window ends in {campaign.get('ends_in')}"
+    elif campaign.get("starts_at"):
+        state = f"next window in {campaign.get('starts_in')}"
+    else:
+        return ""
+    clause = (f"{campaign.get('model') or ZAI_CAMPAIGN_MODEL} "
+              f"{campaign['quota_multiplier']:g}x quota nightly "
+              f"{campaign.get('hours') or ZAI_CAMPAIGN_HOURS}")
+    if campaign.get("hours_local"):
+        clause += f" ({campaign['hours_local']} local)"
+    if campaign.get("offer_ends_at"):
+        offer_end = datetime.fromisoformat(campaign["offer_ends_at"])
+        clause += (f" until {offer_end.astimezone(ZAI_TZ).strftime('%Y-%m-%d %H:%M')}"
+                   " UTC+8")
+    return f"{clause}, {state}"
 
 
 def _zai_billing_status(now=None):
