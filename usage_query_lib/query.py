@@ -881,15 +881,14 @@ def _zai_campaign_status(moment):
 
 
 def _zai_campaign_clause(campaign):
-    """The one campaign clause both human notes append, '' outside the
-    period. It says what the offer is (the model's quota multiplied inside a
+    """The full campaign clause, said once on the billing line ('' outside
+    the period; the window rows carry _zai_campaign_label's short form). It says what the offer is (the model's quota multiplied inside a
     nightly window), the whole window in UTC+8 and machine-local time, when
     the offer ends, and then either that a window is live and when it ends or
     when the next one starts - e.g. 'GLM-5.3-Flash 2x quota nightly
     23:00-09:00 UTC+8 (17:00-03:00 local) until 2026-10-08 09:00 UTC+8, next
-    window in 7h00m'. Callers supply their own separator (' · ' for the
-    compact label, '; ' for the billing line), so the clause itself only
-    uses commas."""
+    window in 7h00m'. The billing line joins its parts with '; ', so the
+    clause itself only uses commas."""
     if campaign.get("active"):
         state = f"active now, window ends in {campaign.get('ends_in')}"
     elif campaign.get("starts_at"):
@@ -906,6 +905,21 @@ def _zai_campaign_clause(campaign):
         clause += (f" until {offer_end.astimezone(ZAI_TZ).strftime('%Y-%m-%d %H:%M')}"
                    " UTC+8")
     return f"{clause}, {state}"
+
+
+def _zai_campaign_label(campaign):
+    """The short campaign form stamped on every window row, '' outside the
+    period. The rows share one column width with every provider's rows, so
+    the full clause is said once, on the billing line, and a row carries only
+    what changes: 'GLM-5.3-Flash 2x active, ends in 8h30m' or
+    'GLM-5.3-Flash 2x starts in 5h45m'."""
+    prefix = (f"{campaign.get('model') or ZAI_CAMPAIGN_MODEL} "
+              f"{campaign.get('quota_multiplier', 0):g}x")
+    if campaign.get("active"):
+        return f"{prefix} active, ends in {campaign.get('ends_in')}"
+    if campaign.get("starts_at"):
+        return f"{prefix} starts in {campaign.get('starts_in')}"
+    return ""
 
 
 def _zai_billing_status(now=None):
@@ -967,13 +981,13 @@ def _zai_billing_status(now=None):
 
 
 def _zai_peak_note(now=None):
-    """The per-window label: compact billing state, with the campaign clause
-    appended while the campaign period runs. Outside both promotions the
+    """The per-window label: compact billing state, with the short campaign
+    form appended while the campaign period runs. Outside both promotions the
     label is exactly what earlier versions printed - 'peak 1x' /
     'off-peak 0.5x'."""
     status = _zai_billing_status(now)
     note = f"{status['state']} {status['multiplier']:g}x"
-    clause = _zai_campaign_clause(status["campaign"])
+    clause = _zai_campaign_label(status["campaign"])
     if clause:
         note += f" · {clause}"
     return note
@@ -1128,8 +1142,8 @@ def _zai_weekly_resets(key, live=True):
     corrupt cache) yields None so the quota rows print exactly as they would
     without it. A payload is validated before it is cached, so a bad answer
     never replaces a good cached list. `live=False` answers from the cache
-    only - the caller passes it when the quota fetch just failed, because a
-    second call to an unreachable API would only add a timeout."""
+    only - the caller passes it unless the quota was just fetched live, so
+    the list never adds a network call to a run that made none."""
     def fetch():
         envelope = _get_retry(ZAI_RESETS_URL, _zai_headers(key))
         _normalize_zai_weekly_resets(envelope)
@@ -1175,9 +1189,13 @@ def query_zai():
     stale, tagged with '_stale_age' - same as every other provider here.
     '_weekly_resets' is absent when the reset list could not be read."""
     key = _zai_cred()
+    fetched_live = []
 
     def fetch():
-        return _zai_checked(_get_retry(ZAI_URL, _zai_headers(key)), "quota")
+        envelope = _zai_checked(_get_retry(ZAI_URL, _zai_headers(key)),
+                                "quota")
+        fetched_live.append(True)
+        return envelope
 
     data, age = _cached_fetch(ZAI_CACHE, fetch)
     # One clock read feeds both: fetched separately, an instant straddling a
@@ -1188,7 +1206,12 @@ def query_zai():
     peak_note = _zai_peak_note(billing_now)
     out = _normalize_zai(data, peak_note)
     out["_billing"] = billing
-    resets = _zai_weekly_resets(key, live=not age)
+    # The reset list goes to the network only when the quota just did. A
+    # run the quota cache answered made no call before the list existed and
+    # still makes none; a run whose quota fetch failed does not try a second
+    # call to the same unreachable API. Both share CACHE_TTL, so a live
+    # quota fetch is exactly when the list's cache is due too.
+    resets = _zai_weekly_resets(key, live=bool(fetched_live))
     if resets is not None:
         out["_weekly_resets"] = resets
     if age:
@@ -1679,14 +1702,15 @@ def _table_rows(account, res):
         rec = w.get("recover_in")
         flag = ("OVER PACE" + (f" (on pace in {rec})" if rec else "")
                 if pace is not None and w["pct"] > pace + 0.5 else "")
-        resets = (_zai_weekly_resets_note(res.get("_weekly_resets"))
-                  if key == "weekly" else None)
-        if resets:
-            flag = f"{flag} · {resets}" if flag else resets
+        # Its own trailing column, not joined into the flag: the flag column
+        # is right-justified across every provider's rows, so a long note in
+        # it would push every other row's OVER PACE out to the note's width.
+        note = (_zai_weekly_resets_note(res.get("_weekly_resets"))
+                if key == "weekly" else None)
         rows.append((name, label, f"{w['pct']:.0f}%",
                      "—" if pace is None else f"{pace:.0f}%",
                      str(w["resets_at"]).replace(_TZ_NOTE, ""),
-                     str(w["resets_in"]), flag))
+                     str(w["resets_in"]), flag, note or ""))
         name = ""
     for sc in res.get("_scoped") or []:
         label = sc["label"] + (f" ({sc['peak_note']})"
@@ -1698,18 +1722,18 @@ def _table_rows(account, res):
         rows.append((name, label, f"{sc['pct']:.0f}%",
                      "—" if pace is None else f"{pace:.0f}%",
                      str(sc["resets_at"]).replace(_TZ_NOTE, ""),
-                     str(sc["resets_in"]), flag))
+                     str(sc["resets_in"]), flag, ""))
         name = ""
     return rows
 
 
 def _render_table(rows, provider_notes=None):
     """Aligned table, provider notes, and shared pace/timezone footnotes."""
-    head = ("account", "window", "used", "max*", "resets", "in", "")
+    head = ("account", "window", "used", "max*", "resets", "in", "", "")
     widths = [max(len(r[i]) for r in [head] + rows) for i in range(len(head))]
     out = []
     for r in [head] + rows:
-        cells = [r[i].ljust(widths[i]) if i in (0, 1, 4)
+        cells = [r[i].ljust(widths[i]) if i in (0, 1, 4, 7)
                  else r[i].rjust(widths[i]) for i in range(len(head))]
         out.append("  ".join(cells).rstrip())
     out.append("")

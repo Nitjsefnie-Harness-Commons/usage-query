@@ -46,21 +46,27 @@ the code — they are history, not config — and simply report inactive):
   into the multiplier. It is reported as its own `campaign` entry under
   `usage.zai._billing` (active now or not, the 2x quota multiplier, the
   window hours in UTC+8 and machine-local, the current window's end or the
-  next one's start with the time left, and when the offer ends), and while
-  the campaign period runs both human notes carry one clause such as
+  next one's start with the time left, and when the offer ends). While the
+  campaign period runs, the billing line carries the full clause once, e.g.
   `GLM-5.3-Flash 2x quota nightly 23:00-09:00 UTC+8 (17:00-03:00 local)
-  until 2026-10-08 09:00 UTC+8, next window in 8h00m` — or `active now,
-  window ends in …` inside a window. Outside the period nothing is printed.
+  until 2026-10-08 09:00 UTC+8, next window in 8h00m` (or `active now,
+  window ends in …` inside a window), and each window row carries only the
+  short form `GLM-5.3-Flash 2x starts in 8h00m` / `GLM-5.3-Flash 2x active,
+  ends in 8h30m` — the rows share one column width with every provider's,
+  so a long label would widen the whole table. Outside the period nothing
+  is printed.
   Through ZCode the same window is zero-consumption; this tool is not ZCode,
   so it reports the doubling.
 
 z.ai accounts can hold **weekly quota resets** too. Beside the quota, the z.ai
 query reads `GET /api/biz/customer-package-reset/list?targetType=PERSONAL`
 with the same key and headers, cached in its own file with the same TTL and
-stale fallback. The z.ai `7d` row ends with how many weekly resets are
-available and when the earliest of them expires, machine-local like every
-other reset time — e.g. `4 weekly resets available (earliest expires
-2026-10-28 18:13, in 29d1h)`. JSON carries it as `usage.zai._weekly_resets`
+stale fallback. It is fetched only alongside a live quota fetch, so a run
+the quota cache answers makes no network call at all. The z.ai `7d` row ends
+with how many weekly resets are available and when the earliest of them
+expires, machine-local like every other reset time — e.g. `4 weekly resets
+available (earliest expires 2026-10-28 17:13, in 29d6h)` for an expiry of
+2026-10-29 00:13:36 UTC+8 seen from Europe/Prague. JSON carries it as `usage.zai._weekly_resets`
 (`available`, `earliest_expires_at`, `earliest_expires_in`, plus `stale_age`
 when served from an old cache). Zero available prints nothing on the row but
 stays `available: 0` in JSON; if the list cannot be read at all, the key is

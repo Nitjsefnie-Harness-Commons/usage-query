@@ -310,9 +310,105 @@ def test_the_resets_annotation_follows_an_over_pace_flag(tmp):
                                                   + mod._TZ_NOTE,
                            "earliest_expires_in": "52d"},
     })
-    assert rows[0][6] == ("OVER PACE (on pace in 2d) · 2 weekly resets "
-                          "available (earliest expires 2026-10-20 02:00, "
-                          "in 52d)")
+    # Its own trailing column, not joined into the flag: the flag column is
+    # right-justified across every provider's rows, so a long note there
+    # would push every other row's OVER PACE out to its width.
+    assert rows[0][6] == "OVER PACE (on pace in 2d)"
+    assert rows[0][7] == ("2 weekly resets available (earliest expires "
+                          "2026-10-20 02:00, in 52d)")
+
+
+def test_three_runs_on_a_fresh_quota_cache_ask_for_the_list_once(tmp):
+    """The list is fetched only alongside a live quota fetch. A run answered
+    from the quota cache used to make no network call, and must not start
+    making one - least of all to an endpoint that hangs for the timeout."""
+    mod = _load()
+    urls = []
+    for _ in range(3):
+        _, endpoints = _query(mod, tmp, TimeoutError("timed out"))
+        urls.extend(endpoints.urls())
+    assert urls == [mod.ZAI_URL, mod.ZAI_RESETS_URL], urls
+
+    # With the quota cache already fresh, no run touches the network.
+    sub = os.path.join(tmp, "warm")
+    os.makedirs(sub)
+    with open(os.path.join(sub, "quota.json"), "w", encoding="utf-8") as fh:
+        json.dump({"fetched_at": time.time(), "data": _zai_envelope()}, fh)
+    urls = []
+    for _ in range(3):
+        _, endpoints = _query(mod, sub, TimeoutError("timed out"))
+        urls.extend(endpoints.urls())
+    assert urls == [], urls
+
+
+# origin/main's campaign labels (1.4.1), the widest the window column has
+# been; the short form must never exceed them.
+ORIGIN_CAMPAIGN_LABELS = (
+    "off-peak 0.5x · GLM-5.3-Flash campaign 2x quota until 09:00 UTC+8",
+    "off-peak 0.5x · GLM-5.3-Flash campaign 2x quota from 23:00 UTC+8",
+)
+
+
+def _claude_rows(mod):
+    return mod._table_rows("Claude", {
+        "five_hour": {"pct": 80.0, "pace_pct": 40.0, "recover_in": "1h00m",
+                      "resets_at": "2026-09-29 14:00", "resets_in": "2h"},
+        "weekly": {"pct": 10.0, "pace_pct": 50.0, "recover_in": None,
+                   "resets_at": "2026-10-02 09:00", "resets_in": "3d"},
+    })
+
+
+def _zai_result(mod, with_resets):
+    note = mod._zai_peak_note()
+    result = {
+        "five_hour": {"pct": 5.0, "pace_pct": 50.0, "recover_in": None,
+                      "resets_at": "2026-09-29 14:16", "resets_in": "3h01m",
+                      "peak_note": note},
+        "weekly": {"pct": 90.0, "pace_pct": 10.0, "recover_in": "16h37m",
+                   "resets_at": "2026-10-05 18:15", "resets_in": "6d7h",
+                   "peak_note": note},
+    }
+    if with_resets:
+        result["_weekly_resets"] = {
+            "available": 4,
+            "earliest_expires_at": "2026-10-28 17:13" + mod._TZ_NOTE,
+            "earliest_expires_in": "29d6h"}
+    return result
+
+
+def _other_lines(mod, zai):
+    claude = _claude_rows(mod)
+    lines = mod._render_table(claude + mod._table_rows("z.ai", zai)) \
+        .splitlines()
+    return lines[1:1 + len(claude)]
+
+
+def test_other_providers_rows_keep_their_width(tmp):
+    """z.ai's annotations share the table with every other provider, so they
+    must not widen anyone else's rows. Outside the campaign the other rows are
+    byte-identical with or without the resets note; during it they are never
+    wider than under origin/main's campaign label."""
+    del tmp
+    mod = _load()
+    with _frozen_clock(mod, datetime(2026, 10, 12, 7, 0, tzinfo=timezone.utc)):
+        bare = _other_lines(mod, _zai_result(mod, with_resets=False))
+        noted = _other_lines(mod, _zai_result(mod, with_resets=True))
+    assert noted == bare, (noted, bare)
+
+    for moment in (datetime(2026, 9, 29, 16, 30, tzinfo=timezone.utc),
+                   datetime(2026, 9, 29, 7, 0, tzinfo=timezone.utc),
+                   datetime(2026, 9, 29, 5, 0, tzinfo=timezone.utc)):
+        with _frozen_clock(mod, moment):
+            new = _other_lines(mod, _zai_result(mod, with_resets=True))
+            for label in ORIGIN_CAMPAIGN_LABELS:
+                origin = _zai_result(mod, with_resets=False)
+                for window in ("five_hour", "weekly"):
+                    origin[window]["peak_note"] = label
+                old = _other_lines(mod, origin)
+                for new_line, old_line in zip(new, old):
+                    assert new_line.split() == old_line.split(), moment
+                    assert len(new_line) <= len(old_line), (
+                        moment, new_line, old_line)
 
 
 def main():

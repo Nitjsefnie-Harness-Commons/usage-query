@@ -628,26 +628,30 @@ def test_zai_notes_append_the_campaign_only_inside_its_period(tmp):
     # the doubling, with the current window's end.
     with _frozen_clock(mod, datetime(2026, 9, 3, 16, 30,
                                      tzinfo=timezone.utc)):
-        active = _campaign_clause(date(2026, 9, 3),
-                                  "active now, window ends in 8h30m")
-        assert mod._zai_peak_note() == "off-peak 0.5x · " + active
+        # The window label carries the short form; the full clause is
+        # said once, on the billing line.
+        assert mod._zai_peak_note() == (
+            "off-peak 0.5x · GLM-5.3-Flash 2x active, ends in 8h30m")
         billing = mod._zai_billing_status()
         note = mod._zai_billing_note(billing)
-    assert note.endswith("; " + active + ".")
+    assert note.endswith("; " + _campaign_clause(
+        date(2026, 9, 3), "active now, window ends in 8h30m") + ".")
 
     # Inside the period, outside a window: when the next one starts.
     with _frozen_clock(mod, datetime(2026, 9, 4, 1, 0, tzinfo=timezone.utc)):
         assert mod._zai_peak_note() == (
-            "off-peak 0.5x · "
-            + _campaign_clause(date(2026, 9, 4), "next window in 14h00m"))
+            "off-peak 0.5x · GLM-5.3-Flash 2x starts in 14h00m")
+        assert mod._zai_billing_note(mod._zai_billing_status()).endswith(
+            _campaign_clause(date(2026, 9, 4), "next window in 14h00m") + ".")
 
     # The last window's final minute still reads as live...
     with _frozen_clock(mod, datetime(2026, 10, 8, 0, 59,
                                      tzinfo=timezone.utc)):
         assert mod._zai_peak_note() == (
-            "off-peak 0.5x · "
-            + _campaign_clause(date(2026, 10, 7),
-                               "active now, window ends in 1m"))
+            "off-peak 0.5x · GLM-5.3-Flash 2x active, ends in 1m")
+        assert mod._zai_billing_note(mod._zai_billing_status()).endswith(
+            _campaign_clause(date(2026, 10, 7),
+                             "active now, window ends in 1m") + ".")
     # ...and the instant it closes the offer is over: no clause at all.
     with _frozen_clock(mod, datetime(2026, 10, 8, 1, 0, tzinfo=timezone.utc)):
         assert mod._zai_peak_note() == "off-peak 0.5x"
@@ -760,9 +764,7 @@ def test_zai_query_labels_windows_with_the_campaign_clause(tmp):
     key_file = os.path.join(tmp, "api-key")
     with open(key_file, "w", encoding="utf-8") as fh:
         fh.write("k" * 49 + "\n")
-    label = ("off-peak 0.5x · "
-             + _campaign_clause(date(2026, 9, 3),
-                                "active now, window ends in 8h30m"))
+    label = "off-peak 0.5x · GLM-5.3-Flash 2x active, ends in 8h30m"
     frozen = datetime(2026, 9, 3, 16, 30, tzinfo=timezone.utc)  # 00:30+8
     with _zai_sources(mod, files=(key_file,)), \
             mock.patch.object(mod, "ZAI_CACHE",
