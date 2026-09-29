@@ -25,6 +25,10 @@ Sources (same endpoints/credentials the hook uses):
             5h window  = limits[] with unit 3 (hours) x number 5
             weekly     = limits[] with unit 6 (weeks) x number 1
             each window line is tagged with the peak/off-peak billing state
+            weekly resets = GET https://api.z.ai/api/biz/customer-package-reset/list
+                     ?targetType=PERSONAL, same key and headers: data.weekResets[]
+                     entries with available == true, counted, earliest
+                     expireTime (a UTC+8 wall-clock string) shown on the 7d row
   - Codex:  GET https://chatgpt.com/backend-api/wham/usage
             bearer = $CODEX_HOME/auth.json -> tokens.access_token
             header ChatGPT-Account-Id: tokens.account_id
@@ -163,6 +167,12 @@ KIMI_OAUTH_CLIENT_ID_FALLBACK = "17e5f671-d194-4dfb-9706-5516cb48c098"
 # The z.ai key authenticates with the bare value in the Authorization header -
 # deliberately NO "Bearer" prefix (the documented form; verified live 2026-08-28).
 ZAI_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+# The account's banked quota resets. Only weekResets is read: fiveHourResets
+# sits beside it in the same payload and is deliberately not reported.
+ZAI_RESETS_URL = ("https://api.z.ai/api/biz/customer-package-reset/list"
+                  "?targetType=PERSONAL")
+# The reset list's timestamps are wall-clock strings in ZAI_TZ, no offset.
+ZAI_WALL_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Key resolution, in the order the bundle's own launchers resolve it: the
 # environment first, then the machine-local override file, then the copy shipped
 # beside spawn_zai.sh / spawn_zai.ps1 (claude/scripts/_zai_lane.sh zai_api_key,
@@ -281,6 +291,7 @@ CACHE = os.path.join(TEMPDIR, ".claude_usage_cache.json")
 KIMI_CACHE = os.path.join(TEMPDIR, ".claude_kimi_usage_cache.json")
 CODEX_CACHE = os.path.join(TEMPDIR, ".codex_usage_cache.json")
 ZAI_CACHE = os.path.join(TEMPDIR, ".zai_usage_cache.json")
+ZAI_RESETS_CACHE = os.path.join(TEMPDIR, ".zai_resets_cache.json")
 CACHE_TTL = 30
 # Codex gets its own, much longer TTL. A status line refreshing every 30 s and a
 # 30 s TTL expire in lockstep, so essentially every refresh missed and paid for a
@@ -1005,47 +1016,145 @@ def _normalize_zai(envelope, peak_note):
     return out
 
 
-def query_zai():
-    """{'five_hour': {...}, 'weekly': {...}, '_scoped': [...], '_plan_type': str,
-    '_billing': {...}, '_stale_age': int?} normalized, or raises.
-
-    `limits[]` entries carry the window in unit/number, the allowance in
-    `usage` (a confusing name - `currentValue` is what was consumed), and
-    `percentage` used, with `nextResetTime` in epoch milliseconds. Fresh cache
-    wins; on a failed live fetch the last cached payload is used however
-    stale, tagged with '_stale_age' - same as every other provider here."""
-    key = _zai_cred()
+def _cached_fetch(path, fetch, live=True):
+    """(payload, stale_age) through a box-wide cache file: a payload younger
+    than CACHE_TTL answers without a fetch; otherwise `fetch()` runs (only when
+    `live`) and its result is cached; if it raises - or `live` is False - the
+    last cached payload answers however stale, with its age in seconds (0 when
+    fresh). Raises the fetch's error, or LookupError when not `live`, if there
+    is nothing cached at all."""
     now = time.time()
-    data, stale = None, None
+    stale = None
     try:
-        with open(ZAI_CACHE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             c = json.load(f)
         cdata = c.get("data")
         cage = now - float(c.get("fetched_at") or 0)
         if cdata is not None:
             if cage < CACHE_TTL:
-                data = cdata
-            else:
-                stale = (cdata, int(cage))
+                return cdata, 0
+            stale = (cdata, int(cage))
     except Exception:
         pass
-    age = 0
-    if data is None:
+    try:
+        if not live:
+            raise LookupError(f"no cached payload in {path}")
+        data = fetch()
+        _write_cache(path, data)
+        return data, 0
+    except Exception:
+        if stale is None:
+            raise
+        return stale
+
+
+def _zai_headers(key):
+    return {"Authorization": key,
+            "Accept-Language": "en-US,en",
+            "Content-Type": "application/json"}
+
+
+def _zai_checked(envelope, what):
+    """`envelope` when it is a success envelope; raises naming `what` when the
+    API answered with an error code (HTTP 200 carrying code != 200)."""
+    if not isinstance(envelope, dict):
+        raise RuntimeError(f"z.ai {what} API returned no JSON object")
+    if envelope.get("code") not in (None, 200):
+        raise RuntimeError(
+            "z.ai %s API error: %s" % (what, envelope.get("msg")))
+    return envelope
+
+
+def _normalize_zai_weekly_resets(envelope):
+    """{'available': int, 'earliest_expires_at': str|None,
+    'earliest_expires_in': str|None} from a reset-list envelope, or raises
+    when the envelope is an error or carries no weekResets list.
+
+    Only entries whose `available` is literally true count - a spent reset
+    stays listed with false. Among those, the earliest `expireTime` (a UTC+8
+    wall-clock string) is rendered machine-local like every reset time here;
+    an entry whose expiry does not parse still counts, it just cannot be the
+    earliest."""
+    data = _zai_checked(envelope, "reset list").get("data")
+    week = data.get("weekResets") if isinstance(data, dict) else None
+    if not isinstance(week, list):
+        raise RuntimeError("z.ai reset list carried no weekResets list")
+    available = [e for e in week
+                 if isinstance(e, dict) and e.get("available") is True]
+    expiries = []
+    for entry in available:
         try:
-            fetched = _get_retry(ZAI_URL, {
-                "Authorization": key,
-                "Accept-Language": "en-US,en",
-                "Content-Type": "application/json",
-            })
-            if fetched.get("code") not in (None, 200):
-                raise RuntimeError(
-                    "z.ai quota API error: %s" % fetched.get("msg"))
-            data = fetched
-            _write_cache(ZAI_CACHE, data)
-        except Exception:
-            if stale is None:
-                raise
-            data, age = stale
+            expiries.append(datetime.strptime(
+                str(entry.get("expireTime")), ZAI_WALL_FORMAT
+            ).replace(tzinfo=ZAI_TZ))
+        except ValueError:
+            continue
+    at = dur = None
+    if expiries:
+        at, dur = _reset_info(min(expiries).isoformat())
+    return {"available": len(available),
+            "earliest_expires_at": at, "earliest_expires_in": dur}
+
+
+def _zai_weekly_resets(key, live=True):
+    """The normalized weekly-reset block, or None when it cannot be had.
+
+    Optional by construction: every failure (HTTP, error code, shape, a
+    corrupt cache) yields None so the quota rows print exactly as they would
+    without it. A payload is validated before it is cached, so a bad answer
+    never replaces a good cached list. `live=False` answers from the cache
+    only - the caller passes it when the quota fetch just failed, because a
+    second call to an unreachable API would only add a timeout."""
+    def fetch():
+        envelope = _get_retry(ZAI_RESETS_URL, _zai_headers(key))
+        _normalize_zai_weekly_resets(envelope)
+        return envelope
+
+    try:
+        envelope, age = _cached_fetch(ZAI_RESETS_CACHE, fetch, live)
+        block = _normalize_zai_weekly_resets(envelope)
+    except Exception:
+        return None
+    if age:
+        block["stale_age"] = age
+    return block
+
+
+def _zai_weekly_resets_note(block):
+    """The 7d-row annotation naming the spendable weekly resets, or None when
+    there are none (nothing to spend is not news, as for Codex's banked
+    resets) or the list could not be read."""
+    if not isinstance(block, dict) or int(block.get("available") or 0) <= 0:
+        return None
+    count = int(block["available"])
+    note = f"{count} weekly reset{'' if count == 1 else 's'} available"
+    detail = []
+    if block.get("earliest_expires_at"):
+        detail.append("earliest expires %s, in %s" % (
+            str(block["earliest_expires_at"]).replace(_TZ_NOTE, ""),
+            block.get("earliest_expires_in")))
+    if block.get("stale_age"):
+        detail.append(f"cached {block['stale_age']}s")
+    return note + (f" ({'; '.join(detail)})" if detail else "")
+
+
+def query_zai():
+    """{'five_hour': {...}, 'weekly': {...}, '_scoped': [...], '_plan_type': str,
+    '_billing': {...}, '_weekly_resets': {...}?, '_stale_age': int?}
+    normalized, or raises.
+
+    `limits[]` entries carry the window in unit/number, the allowance in
+    `usage` (a confusing name - `currentValue` is what was consumed), and
+    `percentage` used, with `nextResetTime` in epoch milliseconds. Fresh cache
+    wins; on a failed live fetch the last cached payload is used however
+    stale, tagged with '_stale_age' - same as every other provider here.
+    '_weekly_resets' is absent when the reset list could not be read."""
+    key = _zai_cred()
+
+    def fetch():
+        return _zai_checked(_get_retry(ZAI_URL, _zai_headers(key)), "quota")
+
+    data, age = _cached_fetch(ZAI_CACHE, fetch)
     # One clock read feeds both: fetched separately, an instant straddling a
     # window boundary would put the _billing entry and the peak_note stamped
     # on every window into different windows.
@@ -1054,6 +1163,9 @@ def query_zai():
     peak_note = _zai_peak_note(billing_now)
     out = _normalize_zai(data, peak_note)
     out["_billing"] = billing
+    resets = _zai_weekly_resets(key, live=not age)
+    if resets is not None:
+        out["_weekly_resets"] = resets
     if age:
         out["_stale_age"] = age
     return out
@@ -1542,6 +1654,10 @@ def _table_rows(account, res):
         rec = w.get("recover_in")
         flag = ("OVER PACE" + (f" (on pace in {rec})" if rec else "")
                 if pace is not None and w["pct"] > pace + 0.5 else "")
+        resets = (_zai_weekly_resets_note(res.get("_weekly_resets"))
+                  if key == "weekly" else None)
+        if resets:
+            flag = f"{flag} · {resets}" if flag else resets
         rows.append((name, label, f"{w['pct']:.0f}%",
                      "—" if pace is None else f"{pace:.0f}%",
                      str(w["resets_at"]).replace(_TZ_NOTE, ""),

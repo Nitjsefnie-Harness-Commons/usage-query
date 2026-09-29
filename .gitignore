@@ -58,6 +58,7 @@
 !/tests/test_package_contract.py
 !/tests/test_usage_query_behavior.py
 !/tests/test_usage_query_oauth.py
+!/tests/test_zai_weekly_resets.py
 
 # ─── usage_query_lib ───
 !/usage_query_lib/

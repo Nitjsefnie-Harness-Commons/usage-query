@@ -49,6 +49,19 @@ the code — they are history, not config — and simply report inactive):
   notes only while the campaign period runs, and labelled non-ZCode: through
   ZCode the same window is zero-consumption, and this tool is not ZCode.
 
+z.ai accounts can hold **weekly quota resets** too. Beside the quota, the z.ai
+query reads `GET /api/biz/customer-package-reset/list?targetType=PERSONAL`
+with the same key and headers, cached in its own file with the same TTL and
+stale fallback. The z.ai `7d` row ends with how many weekly resets are
+available and when the earliest of them expires, machine-local like every
+other reset time — e.g. `4 weekly resets available (earliest expires
+2026-10-28 18:13, in 29d1h)`. JSON carries it as `usage.zai._weekly_resets`
+(`available`, `earliest_expires_at`, `earliest_expires_in`, plus `stale_age`
+when served from an old cache). Zero available prints nothing on the row but
+stays `available: 0` in JSON; if the list cannot be read at all, the key is
+absent and the quota rows print exactly as they would without it. Five-hour
+resets from the same payload are not reported.
+
 Codex accounts can hold **banked rate-limit resets** — a credit the account
 holder spends deliberately, unlike the scheduled reset that arrives on its own.
 Human output prints one note per account that has any: how many are available,

@@ -342,6 +342,8 @@ def test_zai_query_reads_the_documented_key_file_and_caches(tmp):
     cache = os.path.join(tmp, "zai-cache.json")
     with _zai_sources(mod, files=(key_file,)), \
             mock.patch.object(mod, "ZAI_CACHE", cache), \
+            mock.patch.object(mod, "ZAI_RESETS_CACHE",
+                              os.path.join(tmp, "zai-resets.json")), \
             mock.patch.object(mod, "_get_retry",
                               side_effect=lambda *a, **k: _zai_envelope()):
         out = mod.query_zai()
@@ -700,6 +702,8 @@ def test_zai_query_labels_windows_with_the_campaign_clause(tmp):
     with _zai_sources(mod, files=(key_file,)), \
             mock.patch.object(mod, "ZAI_CACHE",
                               os.path.join(tmp, "zai-cache.json")), \
+            mock.patch.object(mod, "ZAI_RESETS_CACHE",
+                              os.path.join(tmp, "zai-resets.json")), \
             mock.patch.object(mod, "_get_retry",
                               side_effect=lambda *a, **k: _zai_envelope()), \
             _frozen_clock(mod, frozen):
@@ -722,6 +726,8 @@ def test_zai_query_labels_windows_with_the_campaign_clause(tmp):
     with _zai_sources(mod, files=(key_file,)), \
             mock.patch.object(mod, "ZAI_CACHE",
                               os.path.join(tmp, "zai-cache2.json")), \
+            mock.patch.object(mod, "ZAI_RESETS_CACHE",
+                              os.path.join(tmp, "zai-resets2.json")), \
             mock.patch.object(mod, "_get_retry",
                               side_effect=lambda *a, **k: _zai_envelope()), \
             _frozen_clock(mod, bare):
@@ -778,6 +784,8 @@ def test_zai_query_reads_the_clock_once_for_billing_and_label(tmp):
     with _zai_sources(mod, files=(key_file,)), \
             mock.patch.object(mod, "ZAI_CACHE",
                               os.path.join(tmp, "zai-cache.json")), \
+            mock.patch.object(mod, "ZAI_RESETS_CACHE",
+                              os.path.join(tmp, "zai-resets.json")), \
             mock.patch.object(mod, "_get_retry",
                               side_effect=lambda *a, **k: _zai_envelope()), \
             mock.patch.object(mod, "_zai_billing_status", billing), \
