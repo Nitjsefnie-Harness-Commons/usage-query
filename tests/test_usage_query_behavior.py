@@ -447,9 +447,8 @@ def test_zai_query_rejects_a_keyless_entry_and_an_error_envelope(tmp):
 
 def test_codex_banked_resets_are_displayed_under_the_table(tmp):
     """A banked reset is worth nothing to a reader who never learns it exists.
-    The count and the detail were parsed but rendered nowhere, so the human
-    view is where the note has to land -- named credit, expiry, and the fact
-    that this tool only reads."""
+    The annotation rides the account's first row -- the same trailing column
+    z.ai's weekly resets use -- and the footer names where one is spent."""
     del tmp
     mod = _load()
     codex = {
@@ -457,7 +456,7 @@ def test_codex_banked_resets_are_displayed_under_the_table(tmp):
                       "resets_at": "reset", "resets_in": "1h"},
         "_reset_credits_available": 1,
         "_reset_credits": [{"id": "cred_1", "title": "Full reset",
-                            "expires_at": "2026-10-05 06:19 machine-local",
+                            "expires_at": "2026-10-05 06:19" + mod._TZ_NOTE,
                             "expires_in": "29d16h"}],
     }
     absent = mod.ProviderNotConfigured("not configured on this machine")
@@ -470,10 +469,13 @@ def test_codex_banked_resets_are_displayed_under_the_table(tmp):
             rc = mod.main([])
     text = out.getvalue()
     assert rc == 0
-    assert "Codex banked resets: 1 available" in text
-    assert "Full reset" in text
-    assert "2026-10-05 06:19" in text
-    assert "29d16h" in text
+    first = next(line for line in text.splitlines()
+                 if line.startswith("Codex"))
+    assert first.endswith(
+        "1 banked reset available (earliest expires 2026-10-05 06:19, "
+        "in 29d16h)"), text
+    # The old per-provider footer is gone; the spend hint is all that remains.
+    assert "Codex banked resets:" not in text
     assert "account/rateLimitResetCredit/consume" in text
 
 

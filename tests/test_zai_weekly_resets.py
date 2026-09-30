@@ -137,7 +137,7 @@ def test_the_7d_row_names_the_available_weekly_resets(tmp):
     text, _ = _query(mod, tmp, resets, argv=["--zai"])
     line = _weekly_line(text)
     assert line.endswith(
-        "2 weekly resets available (earliest expires "
+        "2 banked resets available (earliest expires "
         f"{_local('2026-10-20 08:00:00')}, in 52d12h)"), line
     # Weekly only: an available five-hour reset is never counted or named.
     assert text.count("available") == 1, text
@@ -147,7 +147,7 @@ def test_one_available_weekly_reset_reads_in_the_singular(tmp):
     mod = _load()
     resets = _reset_envelope([_entry(2, "2026-10-29 00:13:36")])
     text, _ = _query(mod, tmp, resets, argv=["--zai"])
-    assert "1 weekly reset available (earliest expires" in _weekly_line(text)
+    assert "1 banked reset available (earliest expires" in _weekly_line(text)
 
 
 def test_json_carries_the_weekly_reset_count_and_earliest_expiry(tmp):
@@ -188,6 +188,7 @@ def test_zero_available_is_reported_in_json_and_omitted_from_the_table(tmp):
     assert out["_weekly_resets"] == {"available": 0,
                                      "earliest_expires_at": None,
                                      "earliest_expires_in": None}
+    assert "banked_resets" not in out
     text, _ = _query(mod, tmp, resets, argv=["--zai"])
     assert "reset" not in _weekly_line(text)
     assert "available" not in text
@@ -314,7 +315,7 @@ def test_the_resets_annotation_follows_an_over_pace_flag(tmp):
     # right-justified across every provider's rows, so a long note there
     # would push every other row's OVER PACE out to its width.
     assert rows[0][6] == "OVER PACE (on pace in 2d)"
-    assert rows[0][7] == ("2 weekly resets available (earliest expires "
+    assert rows[0][7] == ("2 banked resets available (earliest expires "
                           "2026-10-20 02:00, in 52d)")
 
 

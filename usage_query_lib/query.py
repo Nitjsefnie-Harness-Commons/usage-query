@@ -136,7 +136,7 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
@@ -1159,27 +1159,57 @@ def _zai_weekly_resets(key, live=True):
     return block
 
 
-def _zai_weekly_resets_note(block):
-    """The 7d-row annotation naming the spendable weekly resets, or None when
-    there are none (nothing to spend is not news, as for Codex's banked
-    resets) or the list could not be read."""
-    if not isinstance(block, dict) or int(block.get("available") or 0) <= 0:
+def _banked_resets_note(count, earliest_at=None, earliest_in=None,
+                        no_expiry=False, stale_age=None):
+    """The row annotation naming spendable banked resets, in one shape for
+    every provider: `N banked reset(s) available (…)`, with the earliest
+    expiry when one is known, `(does not expire)` when the credits are known
+    never to expire, and `; cached Ns` when the block was answered from an
+    old cache. None when there are none -- nothing to spend is not news."""
+    count = int(count or 0)
+    if count <= 0:
         return None
-    count = int(block["available"])
-    note = f"{count} weekly reset{'' if count == 1 else 's'} available"
+    note = f"{count} banked reset{'' if count == 1 else 's'} available"
     detail = []
-    if block.get("earliest_expires_at"):
+    if earliest_at:
         detail.append("earliest expires %s, in %s" % (
-            str(block["earliest_expires_at"]).replace(_TZ_NOTE, ""),
-            block.get("earliest_expires_in")))
-    if block.get("stale_age"):
-        detail.append(f"cached {block['stale_age']}s")
+            str(earliest_at).replace(_TZ_NOTE, ""), earliest_in))
+    elif no_expiry:
+        detail.append("does not expire")
+    if stale_age:
+        detail.append(f"cached {stale_age}s")
     return note + (f" ({'; '.join(detail)})" if detail else "")
+
+
+def _banked_resets_public(count, earliest_at=None, earliest_in=None,
+                          windows=()):
+    """The public `banked_resets` JSON object, or None when there are none.
+
+    Sits beside the private keys the shape started with (_weekly_resets,
+    _reset_credits_available/_reset_credits), which stay untouched for the
+    tools already reading them; `windows` names the result keys the reset
+    restores."""
+    count = int(count or 0)
+    if count <= 0:
+        return None
+    return {"available": count, "earliest_expires_at": earliest_at,
+            "earliest_expires_in": earliest_in, "windows": list(windows)}
+
+
+def _zai_banked_row_note(res):
+    """The 7d-row annotation for z.ai's spendable weekly resets, or None."""
+    block = res.get("_weekly_resets")
+    if not isinstance(block, dict):
+        return None
+    return _banked_resets_note(
+        block.get("available"), block.get("earliest_expires_at"),
+        block.get("earliest_expires_in"), stale_age=block.get("stale_age"))
 
 
 def query_zai():
     """{'five_hour': {...}, 'weekly': {...}, '_scoped': [...], '_plan_type': str,
-    '_billing': {...}, '_weekly_resets': {...}?, '_stale_age': int?}
+    '_billing': {...}, '_weekly_resets': {...}?, 'banked_resets': {...}?,
+    '_stale_age': int?}
     normalized, or raises.
 
     `limits[]` entries carry the window in unit/number, the allowance in
@@ -1214,6 +1244,11 @@ def query_zai():
     resets = _zai_weekly_resets(key, live=bool(fetched_live))
     if resets is not None:
         out["_weekly_resets"] = resets
+        banked = _banked_resets_public(
+            resets.get("available"), resets.get("earliest_expires_at"),
+            resets.get("earliest_expires_in"), ("weekly",))
+        if banked:
+            out["banked_resets"] = banked
     if age:
         out["_stale_age"] = age
     return out
@@ -1573,11 +1608,19 @@ def _normalize_codex(data):
         out["_plan_type"] = plan
     reset_credits = data.get("rateLimitResetCredits")
     if isinstance(reset_credits, dict):
-        out["_reset_credits_available"] = int(
-            reset_credits.get("availableCount") or 0)
+        available = int(reset_credits.get("availableCount") or 0)
+        out["_reset_credits_available"] = available
         detail = _codex_reset_credits(reset_credits)
         if detail:
             out["_reset_credits"] = detail
+        expiring = [c for c in detail or [] if c.get("expires_at")]
+        banked = _banked_resets_public(
+            available,
+            expiring[0]["expires_at"] if expiring else None,
+            expiring[0]["expires_in"] if expiring else None,
+            tuple(k for k in ("five_hour", "weekly") if k in out))
+        if banked:
+            out["banked_resets"] = banked
     if not any(key in out for key in ("five_hour", "weekly", "_scoped")):
         raise RuntimeError("Codex rate-limit response contained no windows")
     return out
@@ -1617,32 +1660,40 @@ def _codex_reset_credits(block):
     return [row for _, row in rows]
 
 
-def _codex_reset_credits_note(res):
-    """One human line naming the banked resets this account can spend.
+def _codex_banked_row_note(res):
+    """The row annotation for Codex's banked resets, or None.
 
-    Read-only by construction: this tool reports the credits, it never calls
-    the consume RPC, so the line names that RPC instead of implying the count
-    it printed has already been acted on.
-    """
-    available = int(res.get("_reset_credits_available") or 0)
-    if available <= 0:
+    A "Full reset" restores every window, so the note rides the account's
+    first whole-account row -- the one carrying the account name. The
+    earliest expiry names the credit about to die first (the detail rows are
+    ordered most perishable first); the app-server omits the per-credit
+    detail on its periodic refresh, and a count with no detail reads without
+    a parenthetical rather than claim an expiry it was never told."""
+    if int(res.get("_reset_credits_available") or 0) <= 0:
         return None
-    detail = ""
-    named = res.get("_reset_credits") or []
-    if named:
-        parts = []
-        for credit in named:
-            if credit.get("expires_at"):
-                parts.append('"%s" expires %s (in %s)' % (
-                    credit["title"],
-                    str(credit["expires_at"]).replace(_TZ_NOTE, ""),
-                    credit["expires_in"]))
-            else:
-                parts.append('"%s" does not expire' % credit["title"])
-        detail = " -- " + "; ".join(parts)
-    return ("Codex banked resets: %d available%s. Spend one deliberately with "
-            "the app-server RPC account/rateLimitResetCredit/consume; "
-            "usage-query only reads them." % (available, detail))
+    named = [c for c in res.get("_reset_credits") or []
+             if isinstance(c, dict) and c.get("expires_at")]
+    earliest = named[0] if named else None
+    return _banked_resets_note(
+        res.get("_reset_credits_available"),
+        earliest and earliest.get("expires_at"),
+        earliest and earliest.get("expires_in"),
+        no_expiry=bool(res.get("_reset_credits")) and not named)
+
+
+# Where a banked reset is spent, per provider -- the per-provider part of the
+# one footer hint shape. Codex's route is the app-server RPC the credits are
+# managed through; the z.ai API this tool calls (customer-package-reset/list)
+# only lists them, so spending happens in the console.
+_CODEX_SPEND_ROUTE = "the app-server RPC account/rateLimitResetCredit/consume"
+_ZAI_SPEND_ROUTE = "through the z.ai console"
+
+
+def _banked_spend_note(name, route):
+    """The one footer line saying this tool only reads banked resets, in one
+    shape for every provider; the route names where a credit is spent."""
+    return (f"{name} banked resets are only read here; "
+            f"spend one deliberately: {route}")
 
 
 def query_codex():
@@ -1691,6 +1742,15 @@ def _table_rows(account, res):
     scoped weekly) so they read consistently."""
     stale = res.get("_stale_age")
     name = account + (f" (cached {stale}s)" if stale else "")
+    # The banked-resets annotation is one shape for every provider; only its
+    # placement differs. z.ai's weekly reset restores the weekly window, so it
+    # rides the 7d row; a Codex Full reset restores every window, so it rides
+    # the first whole-account row -- the one carrying the account name. Its
+    # own trailing column, not joined into the flag: the flag column is
+    # right-justified across every provider's rows, so a long note in it
+    # would push every other row's OVER PACE out to the note's width.
+    weekly_note = _zai_banked_row_note(res)
+    first_note = _codex_banked_row_note(res)
     rows = []
     for label, key in (("5h", "five_hour"), ("7d", "weekly")):
         w = res.get(key)
@@ -1702,11 +1762,9 @@ def _table_rows(account, res):
         rec = w.get("recover_in")
         flag = ("OVER PACE" + (f" (on pace in {rec})" if rec else "")
                 if pace is not None and w["pct"] > pace + 0.5 else "")
-        # Its own trailing column, not joined into the flag: the flag column
-        # is right-justified across every provider's rows, so a long note in
-        # it would push every other row's OVER PACE out to the note's width.
-        note = (_zai_weekly_resets_note(res.get("_weekly_resets"))
-                if key == "weekly" else None)
+        note = weekly_note if key == "weekly" else None
+        if note is None and first_note is not None:
+            note, first_note = first_note, None
         rows.append((name, label, f"{w['pct']:.0f}%",
                      "—" if pace is None else f"{pace:.0f}%",
                      str(w["resets_at"]).replace(_TZ_NOTE, ""),
@@ -1809,10 +1867,18 @@ def main(argv=None):
                 rows.extend(_table_rows(name, result))
                 if account == "zai" and isinstance(result.get("_billing"), dict):
                     provider_notes.append(_zai_billing_note(result["_billing"]))
-                if account == "codex":
-                    note = _codex_reset_credits_note(result)
-                    if note:
-                        provider_notes.append(note)
+                # One footer hint per provider that has any banked resets,
+                # in one shape; only the route differs.
+                if account == "codex" and int(
+                        result.get("_reset_credits_available") or 0) > 0:
+                    provider_notes.append(
+                        _banked_spend_note(name, _CODEX_SPEND_ROUTE))
+                if account == "zai":
+                    resets = result.get("_weekly_resets")
+                    if isinstance(resets, dict) and int(
+                            resets.get("available") or 0) > 0:
+                        provider_notes.append(
+                            _banked_spend_note(name, _ZAI_SPEND_ROUTE))
             elif account in errors and not args.quiet:
                 print(f"{name}: ERROR — {errors[account]}", file=sys.stderr)
         if rows:

@@ -55,6 +55,7 @@
 # ─── tests ───
 !/tests/
 !/tests/_util.py
+!/tests/test_banked_resets_display.py
 !/tests/test_package_contract.py
 !/tests/test_usage_query_behavior.py
 !/tests/test_usage_query_oauth.py

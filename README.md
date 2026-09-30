@@ -9,9 +9,9 @@ it, and checking against it is the point: fetching "the newest release" is
 otherwise a promise about a URL, not about the artifact CI built.
 
 ```sh
-gh release download v1.5.0 --repo Nitjsefnie-Harness-Commons/usage-query
+gh release download v1.6.0 --repo Nitjsefnie-Harness-Commons/usage-query
 sha256sum -c SHA256SUMS
-pip install ./usage_query-1.5.0-py3-none-any.whl
+pip install ./usage_query-1.6.0-py3-none-any.whl
 ```
 
 The `usage-query` command queries all four providers by default, or one with
@@ -63,24 +63,30 @@ query reads `GET /api/biz/customer-package-reset/list?targetType=PERSONAL`
 with the same key and headers, cached in its own file with the same TTL and
 stale fallback. It is fetched only alongside a live quota fetch, so a run
 the quota cache answers makes no network call at all. The z.ai `7d` row ends
-with how many weekly resets are available and when the earliest of them
-expires, machine-local like every other reset time — e.g. `4 weekly resets
-available (earliest expires 2026-10-28 17:13, in 29d6h)` for an expiry of
-2026-10-29 00:13:36 UTC+8 seen from Europe/Prague. JSON carries it as `usage.zai._weekly_resets`
-(`available`, `earliest_expires_at`, `earliest_expires_in`, plus `stale_age`
-when served from an old cache). Zero available prints nothing on the row but
-stays `available: 0` in JSON; if the list cannot be read at all, the key is
-absent and the quota rows print exactly as they would without it. Five-hour
-resets from the same payload are not reported.
+with the shared banked-resets annotation — how many weekly resets are
+available and when the earliest of them expires, machine-local like every
+other reset time — e.g. `4 banked resets available (earliest expires
+2026-10-28 17:13, in 29d6h)` for an expiry of 2026-10-29 00:13:36 UTC+8 seen
+from Europe/Prague; a stale list appends `; cached Ns`. JSON carries the
+private `usage.zai._weekly_resets` (`available`, `earliest_expires_at`,
+`earliest_expires_in`, plus `stale_age` when served from an old cache) with
+the public `usage.zai.banked_resets` beside it. Zero available prints
+nothing on the row but stays `available: 0` in the private block; if the
+list cannot be read at all, both keys are absent and the quota rows print
+exactly as they would without it. Five-hour resets from the same payload are
+not reported.
 
 Codex accounts can hold **banked rate-limit resets** — a credit the account
 holder spends deliberately, unlike the scheduled reset that arrives on its own.
-Human output prints one note per account that has any: how many are available,
-each credit's title and expiry, and the app-server RPC
-(`account/rateLimitResetCredit/consume`) that spends one. JSON carries the same
-under `usage.codex._reset_credits_available` and `usage.codex._reset_credits`.
-This tool never consumes a credit — it only reports them, and it hides the note
-entirely when there is nothing to spend.
+It renders in the same three shapes as z.ai's weekly resets: the same trailing
+annotation on the account's first whole-account row (a "Full reset" restores
+every window, and the annotation is worded identically to z.ai's), the same
+footer hint naming where one is spent (for Codex, the app-server RPC
+`account/rateLimitResetCredit/consume`), and the public
+`usage.codex.banked_resets` in JSON beside the private
+`_reset_credits_available` and `_reset_credits`. This tool never consumes a
+credit — it only reports them, and it stays silent entirely when there is
+nothing to spend.
 
 The importable implementation is `usage_query_lib.query`. It uses only the
 Python standard library and reads the provider credential files used by the
