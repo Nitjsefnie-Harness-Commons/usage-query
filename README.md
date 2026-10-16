@@ -9,9 +9,9 @@ it, and checking against it is the point: fetching "the newest release" is
 otherwise a promise about a URL, not about the artifact CI built.
 
 ```sh
-gh release download v1.6.0 --repo Nitjsefnie-Harness-Commons/usage-query
+gh release download v1.7.0 --repo Nitjsefnie-Harness-Commons/usage-query
 sha256sum -c SHA256SUMS
-pip install ./usage_query-1.6.0-py3-none-any.whl
+pip install ./usage_query-1.7.0-py3-none-any.whl
 ```
 
 The `usage-query` command queries all four providers by default, or one with
@@ -87,6 +87,17 @@ footer hint naming where one is spent (for Codex, the app-server RPC
 `_reset_credits_available` and `_reset_credits`. This tool never consumes a
 credit — it only reports them, and it stays silent entirely when there is
 nothing to spend.
+
+A Codex plan window at 100% is not an exhausted account when it holds a
+**credit balance**: the backend keeps serving from the balance until it runs
+out, the overage limit is reached, or spend control stops it. When the usage
+payload carries a `credits` block, a spent window reads `SPENT (credits
+serving)` instead of `OVER PACE` (or `SPENT` when the credits cannot be used), a
+footer line names the balance and the backend's approximate message counts, and
+JSON carries `usage.codex.credits` with `balance`, `has_credits`, `unlimited`,
+`overage_limit_reached`, `spend_control_reached`, the approximate message
+ranges and `usable`. An account whose payload has no `credits` block prints
+exactly as before.
 
 The importable implementation is `usage_query_lib.query`. It uses only the
 Python standard library and reads the provider credential files used by the
