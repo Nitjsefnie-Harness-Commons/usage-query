@@ -5,13 +5,9 @@ account whose window is at 100% can still be served from its credit balance,
 so a reading that reports only the window tells a dispatcher the lane is dead
 while Codex keeps answering.
 """
-import io
 import json
 import os
 import sys
-from contextlib import redirect_stdout
-from unittest import mock
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _util  # noqa: E402
 from test_banked_resets_display import _main_text  # noqa: E402
@@ -26,11 +22,11 @@ _CREDITS = {"has_credits": True, "unlimited": False,
             "approx_cloud_messages": [2495, 15595]}
 
 
-def _spent_payload(**credits):
+def _spent_payload(**overrides):
     payload = _wham_payload()
     payload["rate_limit"].update(allowed=False, limit_reached=True)
     payload["rate_limit"]["primary_window"]["used_percent"] = 100
-    payload["credits"] = dict(_CREDITS, **credits)
+    payload["credits"] = dict(_CREDITS, **overrides)
     payload["spend_control"] = {"reached": False, "individual_limit": None}
     return payload
 
@@ -96,9 +92,9 @@ def test_json_reports_the_balance(tmp):
     mod = _util.load(USAGE_QUERY, "usage_query_credits_json")
     data = json.loads(_main_text(mod, codex=_result(mod, _spent_payload()),
                                  argv=("--json",)))
-    credits = data["usage"]["codex"]["credits"]
-    assert credits["balance"] == 62378.5917775
-    assert credits["usable"] is True
+    block = data["usage"]["codex"]["credits"]
+    assert block["balance"] == 62378.5917775
+    assert block["usable"] is True
 
 
 def _codex_rows(text):
