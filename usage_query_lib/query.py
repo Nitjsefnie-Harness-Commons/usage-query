@@ -136,7 +136,7 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
@@ -1411,9 +1411,9 @@ def _codex_window_from_payload(window):
 
 def _codex_snapshot(limit_id, limit_name, rate_limit, plan_type):
     """One bucket in the app-server's RateLimitSnapshot shape, limited to the
-    fields _normalize_codex reads. The unread halves of that struct (credits,
-    individualLimit, spendControlReached, rateLimitReachedType) are deliberately
-    not synthesised: nothing here consumes them."""
+    fields _normalize_codex reads. The account-level halves of that struct
+    (credits, spend control) are carried once, beside the snapshots, by
+    _codex_rpc_shape; individualLimit and rateLimitReachedType stay unread."""
     rate_limit = rate_limit if isinstance(rate_limit, dict) else {}
     return {
         "limitId": limit_id,
@@ -1446,6 +1446,20 @@ def _codex_rpc_shape(payload):
         by_id[limit_id] = _codex_snapshot(limit_id, extra.get("limit_name"),
                                           extra.get("rate_limit"), plan)
     out = {"rateLimits": default, "rateLimitsByLimitId": by_id}
+    credit_block = payload.get("credits")
+    if isinstance(credit_block, dict):
+        out["credits"] = {
+            "hasCredits": bool(credit_block.get("has_credits")),
+            "unlimited": bool(credit_block.get("unlimited")),
+            "overageLimitReached": bool(
+                credit_block.get("overage_limit_reached")),
+            "balance": credit_block.get("balance"),
+            "approxLocalMessages": credit_block.get("approx_local_messages"),
+            "approxCloudMessages": credit_block.get("approx_cloud_messages"),
+        }
+    spend = payload.get("spend_control")
+    if isinstance(spend, dict):
+        out["spendControlReached"] = bool(spend.get("reached"))
     reset_credits = payload.get("rate_limit_reset_credits")
     if isinstance(reset_credits, dict):
         out["rateLimitResetCredits"] = {
@@ -1621,9 +1635,75 @@ def _normalize_codex(data):
             tuple(k for k in ("five_hour", "weekly") if k in out))
         if banked:
             out["banked_resets"] = banked
+    credit_info = _codex_credits(data)
+    if credit_info:
+        out["credits"] = credit_info
     if not any(key in out for key in ("five_hour", "weekly", "_scoped")):
         raise RuntimeError("Codex rate-limit response contained no windows")
     return out
+
+
+def _codex_credits(data):
+    """The account's credit balance, or None when the payload carries none.
+
+    A spent plan window is not an exhausted lane: the backend keeps serving
+    from the credit balance until the balance, the overage limit or the spend
+    control runs out. `usable` is that conjunction, so a reader can tell a
+    window at 100% that still answers from one that does not."""
+    block = data.get("credits")
+    if not isinstance(block, dict):
+        return None
+    raw_balance = block.get("balance")
+    try:
+        balance = None if raw_balance is None else float(raw_balance)
+    except (TypeError, ValueError):
+        balance = None
+    spend_reached = bool(data.get("spendControlReached"))
+    has = bool(block.get("hasCredits"))
+    unlimited = bool(block.get("unlimited"))
+    overage = bool(block.get("overageLimitReached"))
+    return {
+        "has_credits": has,
+        "unlimited": unlimited,
+        "overage_limit_reached": overage,
+        "spend_control_reached": spend_reached,
+        "balance": balance,
+        "approx_local_messages": block.get("approxLocalMessages"),
+        "approx_cloud_messages": block.get("approxCloudMessages"),
+        "usable": (has or unlimited) and not overage and not spend_reached,
+    }
+
+
+def _span(pair):
+    """`[lo, hi]` as `lo-hi`, or None when the backend gave no pair."""
+    if isinstance(pair, list) and len(pair) == 2:
+        return f"{pair[0]}-{pair[1]}"
+    return None
+
+
+def _codex_credits_note(info):
+    """The footer line naming the credit balance and whether it serves."""
+    parts = []
+    if info.get("unlimited"):
+        parts.append("unlimited")
+    elif info.get("balance") is not None:
+        parts.append(f"balance {info['balance']:.0f}")
+    local = _span(info.get("approx_local_messages"))
+    cloud = _span(info.get("approx_cloud_messages"))
+    approx = " / ".join(x for x in (local and f"~{local} local",
+                                    cloud and f"~{cloud} cloud") if x)
+    head = " ".join(parts) + (f" ({approx} messages)" if approx else "")
+    if info.get("usable"):
+        tail = "usable past a spent window"
+    else:
+        why = [why for flag, why in (
+            (not (info.get("has_credits") or info.get("unlimited")),
+             "no credits"),
+            (info.get("overage_limit_reached"), "overage limit reached"),
+            (info.get("spend_control_reached"), "spend control reached"))
+            if flag]
+        tail = "not usable: " + ", ".join(why)
+    return f"Codex credits: {head}; {tail}" if head else f"Codex credits: {tail}"
 
 
 def _codex_reset_credits(block):
@@ -1751,6 +1831,8 @@ def _table_rows(account, res):
     # would push every other row's OVER PACE out to the note's width.
     weekly_note = _zai_banked_row_note(res)
     first_note = _codex_banked_row_note(res)
+    credit_info = (res.get("credits")
+                   if isinstance(res.get("credits"), dict) else None)
     rows = []
     for label, key in (("5h", "five_hour"), ("7d", "weekly")):
         w = res.get(key)
@@ -1762,6 +1844,11 @@ def _table_rows(account, res):
         rec = w.get("recover_in")
         flag = ("OVER PACE" + (f" (on pace in {rec})" if rec else "")
                 if pace is not None and w["pct"] > pace + 0.5 else "")
+        # A spent window on an account that reports credits says which way it
+        # went: still served from the balance, or actually stopped.
+        if credit_info is not None and w["pct"] >= 100:
+            flag = ("SPENT (credits serving)" if credit_info["usable"]
+                    else "SPENT")
         note = weekly_note if key == "weekly" else None
         if note is None and first_note is not None:
             note, first_note = first_note, None
@@ -1869,6 +1956,9 @@ def main(argv=None):
                     provider_notes.append(_zai_billing_note(result["_billing"]))
                 # One footer hint per provider that has any banked resets,
                 # in one shape; only the route differs.
+                if account == "codex" and isinstance(
+                        result.get("credits"), dict):
+                    provider_notes.append(_codex_credits_note(result["credits"]))
                 if account == "codex" and int(
                         result.get("_reset_credits_available") or 0) > 0:
                     provider_notes.append(
