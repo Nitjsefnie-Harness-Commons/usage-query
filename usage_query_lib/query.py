@@ -426,22 +426,28 @@ def _get_retry(url, headers):
     raise last  # unreachable: loop always returns or raises
 
 
-def _claude_account_name(cred_path):
-    """Resolve the marker's live account or the selected stash's name."""
-    if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
-        return os.path.splitext(os.path.basename(cred_path))[0]
-    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+def _claude_live_marker(directory):
+    """Read a safe live marker independently of stash existence."""
     marker = os.path.join(directory, "live")
     if not os.path.isfile(marker):
         return None
     try:
         with open(marker, encoding="utf-8") as stream:
             name = stream.read().strip()
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     if name in ("", ".", "..", "state") or "/" in name or "\\" in name:
         return None
-    return name if os.path.isfile(os.path.join(directory, name + ".json")) else None
+    return name
+
+
+def _claude_account_name(cred_path):
+    """Resolve an installed account for the credential snapshot."""
+    if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
+        return os.path.splitext(os.path.basename(cred_path))[0]
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    name = _claude_live_marker(directory)
+    return name if name and os.path.isfile(os.path.join(directory, name + ".json")) else None
 
 
 @contextmanager
@@ -537,8 +543,9 @@ def _persist_claude_cred(full, resp, cred_path, account_name, errors):
         return oa["accessToken"]
 
     def write_current():
-        live = _claude_account_name(CLAUDE_CRED)
-        destination = (CLAUDE_CRED if account_name is None or account_name == live
+        live = _claude_live_marker(directory)
+        unidentified_live = live is None and os.path.abspath(cred_path) == os.path.abspath(CLAUDE_CRED)
+        destination = (CLAUDE_CRED if account_name is None or account_name == live or unidentified_live
                        else os.path.join(directory, account_name + ".json"))
         _write_claude_cred(full, destination)
 

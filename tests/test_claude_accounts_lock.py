@@ -142,6 +142,19 @@ def test_inactive_becomes_live_during_refresh_writes_live_file(tmp):
         assert http.calls == [("refresh", "beta-token-refresh"), ("usage", "Bearer new-access")]
 
 
+def test_inactive_becomes_live_without_stash_uses_live_file(tmp):
+    def swap_and_remove_stash(accounts):
+        swap(accounts, "beta")
+        (accounts / "beta.json").unlink()
+
+    with refreshing(tmp, "beta", swap_and_remove_stash) as (mod, accounts, _):
+        errors = {}
+        got = query(mod, accounts, "beta", errors)
+        assert errors == {} and got["five_hour"]["pct"] == 25
+        assert_new_pair(Path(mod.CLAUDE_CRED))
+        assert not (accounts / "beta.json").exists(), "live pair was written to a recreated stash"
+
+
 def test_live_swapped_out_during_refresh_writes_original_accounts_stash(tmp):
     with refreshing(tmp, change=lambda accounts: swap(accounts, "beta")) as (mod, accounts, http):
         beta = (accounts / "beta.json").read_bytes()
@@ -154,6 +167,51 @@ def test_live_swapped_out_during_refresh_writes_original_accounts_stash(tmp):
         assert (accounts / "live").read_text(encoding="utf-8").strip() == "beta"
         assert not (accounts / ".lock").exists()
         assert http.calls == [("refresh", "live-token-refresh"), ("usage", "Bearer new-access")]
+
+
+def test_live_stash_removed_during_refresh_still_updates_live_file(tmp):
+    with refreshing(tmp, change=lambda accounts: (accounts / "alpha.json").unlink()) as (mod, accounts, _):
+        errors = {}
+        got = query(mod, accounts, "alpha", errors)
+        assert errors == {} and got["five_hour"]["pct"] == 25
+        assert_new_pair(Path(mod.CLAUDE_CRED))
+        assert not (accounts / "alpha.json").exists(), "live rotation was redirected to a recreated stash"
+
+
+def test_live_marker_lost_during_refresh_still_updates_live_file(tmp):
+    for index, marker in enumerate((None, "", "../escape", b"\xff")):
+        home = Path(tmp) / f"case{index}"
+        home.mkdir()
+
+        def lose_marker(accounts, value=marker):
+            if value is None:
+                (accounts / "live").unlink()
+            elif isinstance(value, bytes):
+                (accounts / "live").write_bytes(value)
+            else:
+                (accounts / "live").write_text(value + "\n", encoding="utf-8")
+
+        with refreshing(str(home), change=lose_marker) as (mod, accounts, _):
+            stash = (accounts / "alpha.json").read_bytes()
+            errors = {}
+            got = query(mod, accounts, "alpha", errors)
+            assert errors == {} and got["five_hour"]["pct"] == 25
+            assert_new_pair(Path(mod.CLAUDE_CRED))
+            assert (accounts / "alpha.json").read_bytes() == stash
+
+
+def test_swapped_in_account_without_stash_is_not_overwritten(tmp):
+    def swap_and_remove_stash(accounts):
+        swap(accounts, "beta")
+        (accounts / "beta.json").unlink()
+
+    with refreshing(tmp, change=swap_and_remove_stash) as (mod, accounts, _):
+        beta = (accounts / "beta.json").read_bytes()
+        errors = {}
+        got = query(mod, accounts, "alpha", errors)
+        assert errors == {} and got["five_hour"]["pct"] == 25
+        assert Path(mod.CLAUDE_CRED).read_bytes() == beta, "missing stash invalidated the current live marker"
+        assert_new_pair(accounts / "alpha.json")
 
 
 def test_swap_between_marker_and_credential_read_cannot_misidentify_pair(tmp):
@@ -371,12 +429,14 @@ def test_no_accounts_directory_refreshes_without_creating_lock(tmp):
 
 
 def test_unidentified_starting_live_account_persists_live_pair(tmp):
-    for index, marker in enumerate((None, "", "absent", "../escape")):
+    for index, marker in enumerate((None, "", "absent", "../escape", b"\xff")):
         home = Path(tmp) / f"case{index}"
         home.mkdir()
         with refreshing(str(home)) as (mod, accounts, _):
             if marker is None:
                 (accounts / "live").unlink()
+            elif isinstance(marker, bytes):
+                (accounts / "live").write_bytes(marker)
             else:
                 (accounts / "live").write_text(marker + "\n", encoding="utf-8")
             stashes = {p.name: p.read_bytes() for p in accounts.glob("*.json")}
