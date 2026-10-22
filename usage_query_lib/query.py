@@ -439,7 +439,7 @@ def _claude_account_name(cred_path):
             name = stream.read().strip()
     except OSError:
         return None
-    if name in ("", ".", "..") or "/" in name or "\\" in name:
+    if name in ("", ".", "..", "state") or "/" in name or "\\" in name:
         return None
     return name if os.path.isfile(os.path.join(directory, name + ".json")) else None
 
@@ -473,30 +473,33 @@ def _claude_accounts_lock(directory):
         os.remove(path)
 
 
-def _claude_credential_snapshot(cred_path, errors):
+class _ClaudeSwapPending(RuntimeError):
+    """A stash reading is paused while the switcher has pending state."""
+
+
+def _claude_credential_snapshot(cred_path):
     """Bind identity and credentials under a brief lock before any HTTP."""
     directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
     if not os.path.isdir(directory):
         with open(cred_path, encoding="utf-8") as stream:
-            return json.load(stream), None, True
-    try:
-        with _claude_accounts_lock(directory):
-            account_name = _claude_account_name(cred_path)
-            source = cred_path
-            if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
-                with open(os.path.join(directory, "live"), encoding="utf-8") as stream:
-                    live = stream.read().strip()
-                if account_name == live:
-                    source = CLAUDE_CRED
-            with open(source, encoding="utf-8") as stream:
-                return json.load(stream), account_name, True
-    except TimeoutError as exc:
+            return json.load(stream), None
+    with _claude_accounts_lock(directory):
         account_name = _claude_account_name(cred_path)
-        if errors is not None:
-            key = f"claude:{account_name}" if account_name else "claude_accounts"
-            errors[key] = str(exc)
-        with open(cred_path, encoding="utf-8") as stream:
-            return json.load(stream), None, False
+        source = cred_path
+        if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
+            try:
+                with open(os.path.join(directory, "state.json"), encoding="utf-8") as stream:
+                    state = json.load(stream)
+            except FileNotFoundError:
+                state = {}
+            if "pending" in state:
+                raise _ClaudeSwapPending("Claude stash reading paused while an account swap is pending")
+            with open(os.path.join(directory, "live"), encoding="utf-8") as stream:
+                live = stream.read().strip()
+            if account_name == live:
+                source = CLAUDE_CRED
+        with open(source, encoding="utf-8") as stream:
+            return json.load(stream), account_name
 
 
 def _write_claude_cred(full, cred_path):
@@ -520,7 +523,7 @@ def _write_claude_cred(full, cred_path):
 
 
 def _persist_claude_cred(full, resp, cred_path, account_name, errors):
-    """Persist a rotation to the account's current location under the lock."""
+    """Save every rotation, falling back to an unlocked write on timeout."""
     oa = full["claudeAiOauth"]
     if resp.get("access_token"):
         oa["accessToken"] = resp["access_token"]
@@ -532,26 +535,27 @@ def _persist_claude_cred(full, resp, cred_path, account_name, errors):
     if not os.path.isdir(directory):
         _write_claude_cred(full, cred_path)
         return oa["accessToken"]
-    if account_name is None:
-        if errors is not None:
-            errors["claude_accounts"] = "Claude starting account is unknown; refreshed pair not persisted"
-        return oa["accessToken"]
+
+    def write_current():
+        live = _claude_account_name(CLAUDE_CRED)
+        destination = (CLAUDE_CRED if account_name is None or account_name == live
+                       else os.path.join(directory, account_name + ".json"))
+        _write_claude_cred(full, destination)
+
     try:
         with _claude_accounts_lock(directory):
-            with open(os.path.join(directory, "live"), encoding="utf-8") as stream:
-                live = stream.read().strip()
-            destination = (CLAUDE_CRED if account_name == live
-                           else os.path.join(directory, account_name + ".json"))
-            _write_claude_cred(full, destination)
+            write_current()
     except TimeoutError as exc:
         if errors is not None:
-            errors[f"claude:{account_name}"] = str(exc)
+            key = f"claude:{account_name}" if account_name else "claude_accounts"
+            errors[key] = str(exc)
+        write_current()
     return oa["accessToken"]
 
 
 def _claude_access_token(cred_path, errors):
-    """Use a consistent snapshot, refreshing and persisting when allowed."""
-    full, account_name, may_persist = _claude_credential_snapshot(cred_path, errors)
+    """Use a consistent snapshot and persist every refreshed token pair."""
+    full, account_name = _claude_credential_snapshot(cred_path)
     oa = full.get("claudeAiOauth") or {}
     access = oa.get("accessToken") or ""
     expires_at = float(oa.get("expiresAt") or 0) / 1000.0  # stored in ms
@@ -583,8 +587,6 @@ def _claude_access_token(cred_path, errors):
             f"Claude token refresh failed (HTTP {e.code}). The harness normally "
             "refreshes this token on its own activity — send Claude a message and "
             f"retry, or re-login if it persists. {detail}") from e
-    if not may_persist:
-        return resp.get("access_token") or access
     return _persist_claude_cred(full, resp, cred_path, account_name, errors)
 
 
@@ -613,17 +615,23 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
         pass
     age = 0
     if data is None:
-        token = _claude_access_token(cred_path, errors)
         try:
-            data = _get_retry(CLAUDE_URL, {
-                "Authorization": f"Bearer {token}",
-                "anthropic-beta": "oauth-2025-04-20",
-            })
-            _write_cache(cache_path, data)
-        except Exception:
+            token = _claude_access_token(cred_path, errors)
+        except _ClaudeSwapPending:
             if stale is None:
                 raise
             data, age = stale
+        else:
+            try:
+                data = _get_retry(CLAUDE_URL, {
+                    "Authorization": f"Bearer {token}",
+                    "anthropic-beta": "oauth-2025-04-20",
+                })
+                _write_cache(cache_path, data)
+            except Exception:
+                if stale is None:
+                    raise
+                data, age = stale
     out = {}
     for key, src in (("five_hour", "five_hour"), ("weekly", "seven_day")):
         block = data[src]
@@ -676,7 +684,8 @@ def query_claude_accounts(live_result, errors):
         return None
     stashes = {os.path.splitext(name)[0]: os.path.join(directory, name)
                for name in sorted(os.listdir(directory))
-               if name.endswith(".json") and os.path.isfile(os.path.join(directory, name))}
+               if name != "state.json" and name.endswith(".json")
+               and os.path.isfile(os.path.join(directory, name))}
     if not stashes:
         return None
     try:

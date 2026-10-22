@@ -48,10 +48,18 @@ without holding the accounts lock. Persistence takes `accounts/.lock`, re-reads
 `live`, and writes to `.credentials.json` if the account is now live, or its
 stash otherwise. The query also takes a brief lock to read the account name
 and credentials together before HTTP. Lock acquisition retries for up to 30 seconds and reclaims a lock
-whose modification time is older than 30 seconds. A lock timeout leaves both
-credential locations untouched, records an account error, and still uses the
-refreshed access token for this reading. Without an accounts directory, live
-credential refresh keeps its existing behavior.
+whose modification time is older than 30 seconds. A snapshot-lock timeout stops
+the query before a refresh grant. If the persistence lock times out after a
+refresh, the command re-reads the marker without the lock, atomically writes the
+rotated pair to the current destination anyway, and records an account error.
+An unidentified live account's refreshed pair goes to `.credentials.json`.
+Without an accounts directory, live credential refresh keeps its existing
+behavior.
+
+While `accounts/state.json` has a `pending` key, stash queries use their last
+cached readings, even when stale, or report an account error if none exists.
+They make no refresh or usage request during that pending swap. Live queries
+continue normally. `state.json` is switcher metadata and is not an account.
 
 Their readings have separate five-minute caches
 beside the stashes (`.<name>.usage-cache`); the live account keeps its existing

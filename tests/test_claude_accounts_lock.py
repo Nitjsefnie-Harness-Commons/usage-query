@@ -199,17 +199,30 @@ def test_swap_between_marker_and_credential_read_cannot_misidentify_pair(tmp):
 def held_by_process(lock):
     source = (
         "import os, sys, time\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, sys.argv[2])\n"
+        "from test_claude_accounts_lock import replace_bytes\n"
         "path = sys.argv[1]\n"
         "fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)\n"
         "with os.fdopen(fd, 'w') as stream:\n"
         "    stream.write(f'{os.getpid()} {time.time()}\\n')\n"
         "try:\n"
         "    print('locked', flush=True)\n"
-        "    sys.stdin.readline()\n"
+        "    command = sys.stdin.readline().strip()\n"
+        "    if command.startswith('swap '):\n"
+        "        accounts = Path(path).parent\n"
+        "        name = command.split()[1]\n"
+        "        live = accounts.parent / '.credentials.json'\n"
+        "        old = (accounts / 'live').read_text(encoding='utf-8').strip()\n"
+        "        replace_bytes(accounts / (old + '.json'), live.read_bytes())\n"
+        "        replace_bytes(live, (accounts / (name + '.json')).read_bytes())\n"
+        "        replace_bytes(accounts / 'live', (name + '\\n').encode())\n"
+        "        print('swapped', flush=True)\n"
+        "        sys.stdin.readline()\n"
         "finally:\n"
         "    os.remove(path)\n"
     )
-    with subprocess.Popen([sys.executable, "-c", source, str(lock)],
+    with subprocess.Popen([sys.executable, "-c", source, str(lock), str(Path(__file__).resolve().parent)],
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True) as child:
         try:
@@ -220,7 +233,7 @@ def held_by_process(lock):
             assert child.returncode == 0, err
 
 
-def test_lock_deadline_keeps_pair_in_memory_records_error_and_writes_nothing(tmp):
+def test_snapshot_lock_deadline_does_not_refresh(tmp):
     with refreshing(tmp, allow_held=True) as (mod, accounts, http):
         live = Path(mod.CLAUDE_CRED).read_bytes()
         stashes = {p.name: p.read_bytes() for p in accounts.glob("*.json")}
@@ -237,20 +250,18 @@ def test_lock_deadline_keeps_pair_in_memory_records_error_and_writes_nothing(tmp
                     mock.patch.object(mod.time, "sleep", side_effect=sleep):
                 rc, raw, _ = run(mod, "--json")
             got = json.loads(raw)
-            assert rc == 1 and "claude:alpha" in got["errors"], raw
-            assert "lock" in got["errors"]["claude:alpha"].lower()
-            assert got["usage"]["claude"]["five_hour"]["pct"] == 25
-            assert got["claude_accounts"]["alpha"]["five_hour"]["pct"] == 25
+            assert rc == 1 and "claude" in got["errors"], raw
+            assert "lock" in got["errors"]["claude"].lower()
+            assert "claude" not in got["usage"]
             assert clock[0] >= 30 and sleeps, "lock contention never waited to the deadline"
             assert child.poll() is None and (accounts / ".lock").exists()
-            assert Path(mod.CLAUDE_CRED).read_bytes() == live, "lock timeout rewrote live credentials"
+            assert Path(mod.CLAUDE_CRED).read_bytes() == live, "snapshot timeout changed credentials"
             assert {p.name: p.read_bytes() for p in accounts.glob("*.json")} == stashes
             assert not list(accounts.glob("*.tmp"))
-        assert http.calls == [("refresh", "live-token-refresh"), ("usage", "Bearer new-access"),
-                              ("usage", "Bearer beta-token")]
+        assert http.calls == [], "snapshot timeout spent a refresh token"
 
 
-def test_lock_taken_during_refresh_times_out_without_persisting(tmp):
+def test_persist_lock_timeout_saves_refreshed_pair_without_lock(tmp):
     with ExitStack() as holders:
         children = []
 
@@ -258,7 +269,7 @@ def test_lock_taken_during_refresh_times_out_without_persisting(tmp):
             children.append(holders.enter_context(held_by_process(accounts / ".lock")))
 
         with refreshing(tmp, change=hold, allow_held=True) as (mod, accounts, http):
-            old = Path(mod.CLAUDE_CRED).read_bytes()
+            stash = (accounts / "alpha.json").read_bytes()
             clock = [0.0]
 
             def sleep(seconds):
@@ -274,8 +285,42 @@ def test_lock_taken_during_refresh_times_out_without_persisting(tmp):
             assert "lock" in errors["claude:alpha"].lower()
             assert clock[0] >= 30
             assert children[0].poll() is None
-            assert Path(mod.CLAUDE_CRED).read_bytes() == old, "persist-time lock timeout wrote credentials"
+            assert_new_pair(Path(mod.CLAUDE_CRED))
+            assert (accounts / "alpha.json").read_bytes() == stash
             assert http.calls == [("refresh", "live-token-refresh"), ("usage", "Bearer new-access")]
+
+
+def test_persist_lock_timeout_rereads_marker_and_saves_original_account(tmp):
+    with ExitStack() as holders:
+        children = []
+
+        def hold_after_swap(accounts):
+            children.append(holders.enter_context(held_by_process(accounts / ".lock")))
+
+        with refreshing(tmp, change=hold_after_swap, allow_held=True) as (mod, accounts, _):
+            beta = (accounts / "beta.json").read_bytes()
+            clock = [0.0]
+            swapped = []
+
+            def sleep(seconds):
+                assert 0 < seconds <= 0.1
+                if not swapped:
+                    children[0].stdin.write("swap beta\n")
+                    children[0].stdin.flush()
+                    assert children[0].stdout.readline().strip() == "swapped"
+                    swapped.append(True)
+                clock[0] += seconds
+
+            errors = {}
+            with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
+                    mock.patch.object(mod.time, "sleep", side_effect=sleep):
+                got = query(mod, accounts, "alpha", errors)
+            assert got["five_hour"]["pct"] == 25
+            assert set(errors) == {"claude:alpha"}
+            assert clock[0] >= 30 and children[0].poll() is None and swapped
+            assert_new_pair(accounts / "alpha.json")
+            assert Path(mod.CLAUDE_CRED).read_bytes() == beta, "timeout fallback overwrote the new live account"
+            assert (accounts / "live").read_text(encoding="utf-8").strip() == "beta"
 
 
 def test_stale_lock_is_removed_and_refresh_persists(tmp):
@@ -325,23 +370,30 @@ def test_no_accounts_directory_refreshes_without_creating_lock(tmp):
         assert locks == [] and not accounts.exists(), "legacy refresh created an accounts lock"
 
 
-def test_unidentified_starting_live_account_does_not_persist(tmp):
-    for marker in (None, "absent", "../escape"):
-        home = Path(tmp) / str(marker).replace("/", "_")
+def test_unidentified_starting_live_account_persists_live_pair(tmp):
+    for index, marker in enumerate((None, "", "absent", "../escape")):
+        home = Path(tmp) / f"case{index}"
         home.mkdir()
         with refreshing(str(home)) as (mod, accounts, _):
             if marker is None:
                 (accounts / "live").unlink()
             else:
                 (accounts / "live").write_text(marker + "\n", encoding="utf-8")
-            live = Path(mod.CLAUDE_CRED).read_bytes()
             stashes = {p.name: p.read_bytes() for p in accounts.glob("*.json")}
+            real_replace = os.replace
+
+            def replace(src, dst, live_path=Path(mod.CLAUDE_CRED), directory=accounts, replace_fn=real_replace):
+                if Path(dst) == live_path:
+                    assert (directory / ".lock").exists(), "unidentified live write was not locked"
+                    assert Path(src).parent == Path(dst).parent
+                return replace_fn(src, dst)
+
             errors = {}
-            got = query(mod, accounts, "alpha", errors)
+            with mock.patch.object(mod.os, "replace", side_effect=replace):
+                got = query(mod, accounts, "alpha", errors)
             assert got["five_hour"]["pct"] == 25
-            assert set(errors) == {"claude_accounts"}
-            assert "not persisted" in errors["claude_accounts"]
-            assert Path(mod.CLAUDE_CRED).read_bytes() == live
+            assert errors == {}, errors
+            assert_new_pair(Path(mod.CLAUDE_CRED))
             assert {p.name: p.read_bytes() for p in accounts.glob("*.json")} == stashes
             assert not (accounts / ".lock").exists()
 
