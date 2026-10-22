@@ -375,8 +375,8 @@ def test_live_entry_carries_only_public_windows(tmp):
                 "_scoped": [{"label": "7d:scoped", **window}], "_stale_age": 60}
         original_query = mod.query_claude
 
-        def query(*args):
-            return original_query(*args) if args else live
+        def query(*args, **kwargs):
+            return original_query(*args, **kwargs) if args else live
 
         with mock.patch.object(mod, "query_claude", side_effect=query):
             rc, raw, _ = run(mod, "--json")

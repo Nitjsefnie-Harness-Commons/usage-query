@@ -46,7 +46,7 @@ def _main_text(mod, codex=None, zai=None, argv=()):
     absent = mod.ProviderNotConfigured("not configured on this machine")
 
     def pinned(value):
-        def call():
+        def call(**_kwargs):
             if value is None:
                 raise absent
             return value

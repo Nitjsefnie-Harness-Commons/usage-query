@@ -125,7 +125,7 @@ def _assert_provider_selection(mod, flag, selected):
         calls[name] = calls.get(name, 0) + 1
         return {"five_hour": {"pct": 1}}
 
-    with mock.patch.object(mod, "query_claude", side_effect=lambda: result("claude")), \
+    with mock.patch.object(mod, "query_claude", side_effect=lambda **_kwargs: result("claude")), \
             mock.patch.object(mod, "query_kimi", side_effect=lambda: result("kimi")), \
             mock.patch.object(mod, "query_codex", side_effect=lambda: result("codex")), \
             mock.patch.object(mod, "query_zai", side_effect=lambda: result("zai")):
@@ -153,7 +153,7 @@ def test_an_uninstalled_provider_is_skipped_not_reported_as_an_error(tmp):
     mod = _load()
     absent = mod.ProviderNotConfigured("Kimi is not configured on this machine")
     with mock.patch.object(mod, "query_claude",
-                           side_effect=lambda: {"five_hour": {"pct": 1}}), \
+                           side_effect=lambda **_kwargs: {"five_hour": {"pct": 1}}), \
             mock.patch.object(mod, "query_kimi", side_effect=absent), \
             mock.patch.object(mod, "query_codex",
                               side_effect=lambda: {"five_hour": {"pct": 2}}), \

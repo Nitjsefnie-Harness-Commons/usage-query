@@ -134,6 +134,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
 
@@ -425,16 +426,55 @@ def _get_retry(url, headers):
     raise last  # unreachable: loop always returns or raises
 
 
-def _persist_claude_cred(full, resp, cred_path=None):
-    """Atomically persist rotated Claude tokens to the selected file at 0600."""
-    cred_path = cred_path or CLAUDE_CRED
-    oa = full["claudeAiOauth"]
-    if resp.get("access_token"):
-        oa["accessToken"] = resp["access_token"]
-    if resp.get("refresh_token"):
-        oa["refreshToken"] = resp["refresh_token"]
-    if resp.get("expires_in") is not None:
-        oa["expiresAt"] = int((time.time() + float(resp["expires_in"])) * 1000)
+def _claude_account_name(cred_path):
+    """Identify a query's account before reading its credentials or cache."""
+    if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
+        return os.path.splitext(os.path.basename(cred_path))[0]
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    marker = os.path.join(directory, "live")
+    if not os.path.isfile(marker):
+        return None
+    try:
+        with open(marker, encoding="utf-8") as stream:
+            name = stream.read().strip()
+    except OSError:
+        return None
+    if name in ("", ".", "..") or "/" in name or "\\" in name:
+        return None
+    return name if os.path.isfile(os.path.join(directory, name + ".json")) else None
+
+
+@contextmanager
+def _claude_accounts_lock(directory):
+    """Take the shared accounts lock, reclaiming a stale file once."""
+    path = os.path.join(directory, ".lock")
+    deadline = time.monotonic() + 30
+    removed_stale = False
+    while time.monotonic() < deadline:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            break
+        except FileExistsError:
+            try:
+                if not removed_stale and time.time() - os.stat(path).st_mtime > 30:
+                    os.remove(path)
+                    removed_stale = True
+                    continue
+            except FileNotFoundError:
+                continue
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    else:
+        raise TimeoutError("Claude accounts lock was not acquired within 30 s; refreshed pair not persisted")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(f"{os.getpid()} {time.time()}\n")
+        yield
+    finally:
+        os.remove(path)
+
+
+def _write_claude_cred(full, cred_path):
+    """Replace a Claude credential file atomically at mode 0600."""
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cred_path),
                                prefix=".credentials.", suffix=".tmp")
     try:
@@ -451,12 +491,40 @@ def _persist_claude_cred(full, resp, cred_path=None):
                 os.remove(tmp)
             except OSError:
                 pass
+
+
+def _persist_claude_cred(full, resp, cred_path, account_name, errors):
+    """Persist a rotation to the account's current location under the lock."""
+    oa = full["claudeAiOauth"]
+    if resp.get("access_token"):
+        oa["accessToken"] = resp["access_token"]
+    if resp.get("refresh_token"):
+        oa["refreshToken"] = resp["refresh_token"]
+    if resp.get("expires_in") is not None:
+        oa["expiresAt"] = int((time.time() + float(resp["expires_in"])) * 1000)
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    if not os.path.isdir(directory):
+        _write_claude_cred(full, cred_path)
+        return oa["accessToken"]
+    if account_name is None:
+        if errors is not None:
+            errors["claude_accounts"] = "Claude starting account is unknown; refreshed pair not persisted"
+        return oa["accessToken"]
+    try:
+        with _claude_accounts_lock(directory):
+            with open(os.path.join(directory, "live"), encoding="utf-8") as stream:
+                live = stream.read().strip()
+            destination = (CLAUDE_CRED if account_name == live
+                           else os.path.join(directory, account_name + ".json"))
+            _write_claude_cred(full, destination)
+    except TimeoutError as exc:
+        if errors is not None:
+            errors[f"claude:{account_name}"] = str(exc)
     return oa["accessToken"]
 
 
-def _claude_access_token(cred_path=None):
+def _claude_access_token(cred_path, account_name, errors):
     """Read a usable token, refreshing and persisting to the selected file."""
-    cred_path = cred_path or CLAUDE_CRED
     with open(cred_path, encoding="utf-8") as f:
         full = json.load(f)
     oa = full.get("claudeAiOauth") or {}
@@ -490,16 +558,17 @@ def _claude_access_token(cred_path=None):
             f"Claude token refresh failed (HTTP {e.code}). The harness normally "
             "refreshes this token on its own activity — send Claude a message and "
             f"retry, or re-login if it persists. {detail}") from e
-    return _persist_claude_cred(full, resp, cred_path)
+    return _persist_claude_cred(full, resp, cred_path, account_name, errors)
 
 
-def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL):
+def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=None):
     """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?} normalized, or
     raises. A fresh cache is used as-is; otherwise we fetch live (retrying a
     transient 429). If the live fetch still fails, we fall back to the last cached
     payload however stale, tagged with '_stale_age' (seconds) so the caller can
     label it — better a known-old number than an error."""
     cred_path = cred_path or CLAUDE_CRED
+    account_name = _claude_account_name(cred_path)
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
     now = time.time()
@@ -518,7 +587,7 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL):
         pass
     age = 0
     if data is None:
-        token = _claude_access_token(cred_path)
+        token = _claude_access_token(cred_path, account_name, errors)
         try:
             data = _get_retry(CLAUDE_URL, {
                 "Authorization": f"Bearer {token}",
@@ -596,7 +665,7 @@ def query_claude_accounts(live_result, errors):
         try:
             reading = live_result if name == live else query_claude(
                 path, os.path.join(directory, f".{name}.usage-cache"),
-                CLAUDE_ACCOUNT_CACHE_TTL)
+                CLAUDE_ACCOUNT_CACHE_TTL, errors=errors)
             if reading is not None:
                 accounts[name] = {"live": name == live,
                                   "five_hour": reading["five_hour"],
@@ -1968,7 +2037,7 @@ def main(argv=None):
     asked_by_name = args.claude or args.kimi or args.codex or args.zai
 
     results, errors, unconfigured = {}, {}, {}
-    for account, wanted, query in (("claude", want_claude, query_claude),
+    for account, wanted, query in (("claude", want_claude, lambda: query_claude(errors=errors)),
                                    ("kimi", want_kimi, query_kimi),
                                    ("codex", want_codex, query_codex),
                                    ("zai", want_zai, query_zai)):

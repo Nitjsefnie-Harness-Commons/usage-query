@@ -43,7 +43,17 @@ adds a top-level `claude_accounts` object. For example:
 
 The live entry reuses `usage.claude`'s window readings. Inactive accounts use
 their stash's token, refreshing stale credentials atomically into that same
-stash with mode `0600`. Their readings have separate five-minute caches
+account's current credential file with mode `0600`. Refresh HTTP requests run
+without holding the accounts lock. Persistence takes `accounts/.lock`, re-reads
+`live`, and writes to `.credentials.json` if the account is now live, or its
+stash otherwise. The live query captures its account name before reading its
+credentials. Lock acquisition retries for up to 30 seconds and reclaims a lock
+whose modification time is older than 30 seconds. A lock timeout leaves both
+credential locations untouched, records an account error, and still uses the
+refreshed access token for this reading. Without an accounts directory, live
+credential refresh keeps its existing behavior.
+
+Their readings have separate five-minute caches
 beside the stashes (`.<name>.usage-cache`); the live account keeps its existing
 cache. A failed account is omitted and named under `errors` as
 `claude:<name>`, while the others still report. Text output keeps the live
