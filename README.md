@@ -46,8 +46,8 @@ their stash's token, refreshing stale credentials atomically into that same
 account's current credential file with mode `0600`. Refresh HTTP requests run
 without holding the accounts lock. Persistence takes `accounts/.lock`, re-reads
 `live`, and writes to `.credentials.json` if the account is now live, or its
-stash otherwise. The live query captures its account name before reading its
-credentials. Lock acquisition retries for up to 30 seconds and reclaims a lock
+stash otherwise. The query also takes a brief lock to read the account name
+and credentials together before HTTP. Lock acquisition retries for up to 30 seconds and reclaims a lock
 whose modification time is older than 30 seconds. A lock timeout leaves both
 credential locations untouched, records an account error, and still uses the
 refreshed access token for this reading. Without an accounts directory, live

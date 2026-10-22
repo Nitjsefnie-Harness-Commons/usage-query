@@ -427,7 +427,7 @@ def _get_retry(url, headers):
 
 
 def _claude_account_name(cred_path):
-    """Identify a query's account before reading its credentials or cache."""
+    """Resolve the marker's live account or the selected stash's name."""
     if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
         return os.path.splitext(os.path.basename(cred_path))[0]
     directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
@@ -464,13 +464,39 @@ def _claude_accounts_lock(directory):
                 continue
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
     else:
-        raise TimeoutError("Claude accounts lock was not acquired within 30 s; refreshed pair not persisted")
+        raise TimeoutError("Claude accounts lock was not acquired within 30 s")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(f"{os.getpid()} {time.time()}\n")
         yield
     finally:
         os.remove(path)
+
+
+def _claude_credential_snapshot(cred_path, errors):
+    """Bind identity and credentials under a brief lock before any HTTP."""
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    if not os.path.isdir(directory):
+        with open(cred_path, encoding="utf-8") as stream:
+            return json.load(stream), None, True
+    try:
+        with _claude_accounts_lock(directory):
+            account_name = _claude_account_name(cred_path)
+            source = cred_path
+            if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
+                with open(os.path.join(directory, "live"), encoding="utf-8") as stream:
+                    live = stream.read().strip()
+                if account_name == live:
+                    source = CLAUDE_CRED
+            with open(source, encoding="utf-8") as stream:
+                return json.load(stream), account_name, True
+    except TimeoutError as exc:
+        account_name = _claude_account_name(cred_path)
+        if errors is not None:
+            key = f"claude:{account_name}" if account_name else "claude_accounts"
+            errors[key] = str(exc)
+        with open(cred_path, encoding="utf-8") as stream:
+            return json.load(stream), None, False
 
 
 def _write_claude_cred(full, cred_path):
@@ -523,10 +549,9 @@ def _persist_claude_cred(full, resp, cred_path, account_name, errors):
     return oa["accessToken"]
 
 
-def _claude_access_token(cred_path, account_name, errors):
-    """Read a usable token, refreshing and persisting to the selected file."""
-    with open(cred_path, encoding="utf-8") as f:
-        full = json.load(f)
+def _claude_access_token(cred_path, errors):
+    """Use a consistent snapshot, refreshing and persisting when allowed."""
+    full, account_name, may_persist = _claude_credential_snapshot(cred_path, errors)
     oa = full.get("claudeAiOauth") or {}
     access = oa.get("accessToken") or ""
     expires_at = float(oa.get("expiresAt") or 0) / 1000.0  # stored in ms
@@ -558,6 +583,8 @@ def _claude_access_token(cred_path, account_name, errors):
             f"Claude token refresh failed (HTTP {e.code}). The harness normally "
             "refreshes this token on its own activity — send Claude a message and "
             f"retry, or re-login if it persists. {detail}") from e
+    if not may_persist:
+        return resp.get("access_token") or access
     return _persist_claude_cred(full, resp, cred_path, account_name, errors)
 
 
@@ -568,7 +595,6 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
     payload however stale, tagged with '_stale_age' (seconds) so the caller can
     label it — better a known-old number than an error."""
     cred_path = cred_path or CLAUDE_CRED
-    account_name = _claude_account_name(cred_path)
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
     now = time.time()
@@ -587,7 +613,7 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
         pass
     age = 0
     if data is None:
-        token = _claude_access_token(cred_path, account_name, errors)
+        token = _claude_access_token(cred_path, errors)
         try:
             data = _get_retry(CLAUDE_URL, {
                 "Authorization": f"Bearer {token}",

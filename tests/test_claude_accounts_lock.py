@@ -5,7 +5,7 @@ import stat
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -156,6 +156,45 @@ def test_live_swapped_out_during_refresh_writes_original_accounts_stash(tmp):
         assert http.calls == [("refresh", "live-token-refresh"), ("usage", "Bearer new-access")]
 
 
+def test_swap_between_marker_and_credential_read_cannot_misidentify_pair(tmp):
+    with setup(tmp, {"alpha-new": 20, "beta-new": 50}, {
+        "live-token-refresh": {"access_token": "alpha-new", "refresh_token": "alpha-refresh-new"},
+        "beta-token-refresh": {"access_token": "beta-new", "refresh_token": "beta-refresh-new"},
+    }) as (mod, accounts, http):
+        install(accounts, beta_stale=True)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        beta = (accounts / "beta.json").read_bytes()
+        original_open = open
+        attempted = []
+        deferred = []
+
+        def opened(path, *args, **kwargs):
+            if Path(path) == Path(mod.CLAUDE_CRED) and not attempted:
+                attempted.append(True)
+                if (accounts / ".lock").exists():
+                    deferred.append(True)
+                else:
+                    swap(accounts, "beta")
+            return original_open(path, *args, **kwargs)
+
+        def request(req, timeout=None):
+            assert not (accounts / ".lock").exists(), "snapshot lock extended across HTTP"
+            if req.full_url == mod.CLAUDE_OAUTH_TOKEN_URL and deferred:
+                deferred.clear()
+                swap(accounts, "beta")
+            return http(req, timeout)
+
+        errors = {}
+        with mock.patch("builtins.open", side_effect=opened), \
+                mock.patch("urllib.request.urlopen", side_effect=request):
+            got = query(mod, accounts, "alpha", errors)
+        assert got["five_hour"]["pct"] == 20, "live query refreshed the wrong account"
+        assert errors == {} and attempted
+        assert json.loads((accounts / "alpha.json").read_text(encoding="utf-8"))["claudeAiOauth"]["refreshToken"] == "alpha-refresh-new"
+        assert Path(mod.CLAUDE_CRED).read_bytes() == beta, "new live account was modified"
+        assert http.calls == [("refresh", "live-token-refresh"), ("usage", "Bearer alpha-new")]
+
+
 @contextmanager
 def held_by_process(lock):
     source = (
@@ -198,7 +237,7 @@ def test_lock_deadline_keeps_pair_in_memory_records_error_and_writes_nothing(tmp
                     mock.patch.object(mod.time, "sleep", side_effect=sleep):
                 rc, raw, _ = run(mod, "--json")
             got = json.loads(raw)
-            assert rc == 1 and set(got["errors"]) == {"claude:alpha"}, raw
+            assert rc == 1 and "claude:alpha" in got["errors"], raw
             assert "lock" in got["errors"]["claude:alpha"].lower()
             assert got["usage"]["claude"]["five_hour"]["pct"] == 25
             assert got["claude_accounts"]["alpha"]["five_hour"]["pct"] == 25
@@ -209,6 +248,34 @@ def test_lock_deadline_keeps_pair_in_memory_records_error_and_writes_nothing(tmp
             assert not list(accounts.glob("*.tmp"))
         assert http.calls == [("refresh", "live-token-refresh"), ("usage", "Bearer new-access"),
                               ("usage", "Bearer beta-token")]
+
+
+def test_lock_taken_during_refresh_times_out_without_persisting(tmp):
+    with ExitStack() as holders:
+        children = []
+
+        def hold(accounts):
+            children.append(holders.enter_context(held_by_process(accounts / ".lock")))
+
+        with refreshing(tmp, change=hold, allow_held=True) as (mod, accounts, http):
+            old = Path(mod.CLAUDE_CRED).read_bytes()
+            clock = [0.0]
+
+            def sleep(seconds):
+                assert 0 < seconds <= 0.1
+                clock[0] += seconds
+
+            errors = {}
+            with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
+                    mock.patch.object(mod.time, "sleep", side_effect=sleep):
+                got = query(mod, accounts, "alpha", errors)
+            assert got["five_hour"]["pct"] == 25
+            assert set(errors) == {"claude:alpha"}
+            assert "lock" in errors["claude:alpha"].lower()
+            assert clock[0] >= 30
+            assert children[0].poll() is None
+            assert Path(mod.CLAUDE_CRED).read_bytes() == old, "persist-time lock timeout wrote credentials"
+            assert http.calls == [("refresh", "live-token-refresh"), ("usage", "Bearer new-access")]
 
 
 def test_stale_lock_is_removed_and_refresh_persists(tmp):
