@@ -1982,7 +1982,12 @@ def main(argv=None):
         except Exception as e:
             errors[account] = f"{type(e).__name__}: {e}"
 
-    accounts = query_claude_accounts(results.get("claude"), errors) if want_claude else None
+    accounts = None
+    if want_claude:
+        try:
+            accounts = query_claude_accounts(results.get("claude"), errors)
+        except Exception as e:
+            errors["claude_accounts"] = f"{type(e).__name__}: {e}"
     openrouter = None
     try:
         openrouter = query_openrouter()
@@ -2034,6 +2039,8 @@ def main(argv=None):
                     print(f"Claude {account.split(':', 1)[1]}: ERROR — {error}", file=sys.stderr)
             if "openrouter" in errors:
                 print(f"OpenRouter: ERROR — {errors['openrouter']}", file=sys.stderr)
+            if "claude_accounts" in errors:
+                print(f"Claude accounts: ERROR — {errors['claude_accounts']}", file=sys.stderr)
         if rows:
             print(_render_table(rows, provider_notes))
         if openrouter is not None:

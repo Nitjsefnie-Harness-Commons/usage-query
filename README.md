@@ -48,7 +48,8 @@ beside the stashes (`.<name>.usage-cache`); the live account keeps its existing
 cache. A failed account is omitted and named under `errors` as
 `claude:<name>`, while the others still report. Text output keeps the live
 `Claude` rows and places each inactive account's `Claude <name>` rows after
-them, in the same columns.
+them, in the same columns. An unreadable directory or marker is reported as
+`errors.claude_accounts`, preserving the live result.
 
 When `~/.agent-bundle/scripts/openrouter_key.py` exists, every provider selection
 also runs it as `credits --json` with a timeout. Its returned object appears

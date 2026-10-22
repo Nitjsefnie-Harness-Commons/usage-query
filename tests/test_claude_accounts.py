@@ -386,5 +386,39 @@ def test_live_entry_carries_only_public_windows(tmp):
             "live": True, "five_hour": window, "weekly": window}
 
 
+def test_accounts_directory_read_failure_preserves_live_output(tmp):
+    with setup(tmp) as (mod, accounts, _):
+        install(accounts)
+        with mock.patch.object(mod.os, "listdir", side_effect=PermissionError("directory unreadable")):
+            rc, raw, _ = run(mod, "--json")
+        got = json.loads(raw)
+        assert rc == 1 and "claude_accounts" not in got
+        assert got["usage"]["claude"]["five_hour"]["pct"] == 10
+        assert set(got["errors"]) == {"claude_accounts"}
+        assert "directory unreadable" in got["errors"]["claude_accounts"]
+
+
+def test_marker_read_failure_is_reported_in_json_and_text(tmp):
+    with setup(tmp) as (mod, accounts, _):
+        install(accounts)
+        real_open = open
+
+        def opened(path, *args, **kwargs):
+            if Path(path) == accounts / "live":
+                raise PermissionError("marker unreadable")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=opened):
+            rc, raw, _ = run(mod, "--json")
+            got = json.loads(raw)
+            assert rc == 1 and "claude_accounts" not in got
+            assert got["usage"]["claude"]["five_hour"]["pct"] == 10
+            assert set(got["errors"]) == {"claude_accounts"}
+            assert "marker unreadable" in got["errors"]["claude_accounts"]
+            rc, text, err = run(mod)
+            assert rc == 1 and "Claude" in text and "Claude accounts: ERROR" in err
+            assert run(mod, "--quiet")[2] == ""
+
+
 if __name__ == "__main__":
     sys.exit(_util.runner(_util.collect(globals()), "claudeaccounts_"))
