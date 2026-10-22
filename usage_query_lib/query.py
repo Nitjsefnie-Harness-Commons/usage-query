@@ -127,6 +127,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -295,6 +296,7 @@ CODEX_CACHE = os.path.join(TEMPDIR, ".codex_usage_cache.json")
 ZAI_CACHE = os.path.join(TEMPDIR, ".zai_usage_cache.json")
 ZAI_RESETS_CACHE = os.path.join(TEMPDIR, ".zai_resets_cache.json")
 CACHE_TTL = 30
+CLAUDE_ACCOUNT_CACHE_TTL = 300
 # Codex gets its own, much longer TTL. A status line refreshing every 30 s and a
 # 30 s TTL expire in lockstep, so essentially every refresh missed and paid for a
 # full round trip; and Codex's shortest window is 5 hours, so a percentage that
@@ -423,13 +425,9 @@ def _get_retry(url, headers):
     raise last  # unreachable: loop always returns or raises
 
 
-def _persist_claude_cred(full, resp):
-    """Atomically write a refreshed Claude token set back into the credential file,
-    preserving the rest of the claudeAiOauth object and 0600 perms. Anthropic
-    ROTATES the refresh_token (single-use — verified 2026-06-11), so the rotated
-    refresh_token MUST be persisted or the next refresh fails; the live harness
-    reads this file as its source of truth, so writing a valid fresh set keeps it
-    working. tempfile + os.replace so a concurrent reader never sees a torn file."""
+def _persist_claude_cred(full, resp, cred_path=None):
+    """Atomically persist rotated Claude tokens to the selected file at 0600."""
+    cred_path = cred_path or CLAUDE_CRED
     oa = full["claudeAiOauth"]
     if resp.get("access_token"):
         oa["accessToken"] = resp["access_token"]
@@ -437,7 +435,7 @@ def _persist_claude_cred(full, resp):
         oa["refreshToken"] = resp["refresh_token"]
     if resp.get("expires_in") is not None:
         oa["expiresAt"] = int((time.time() + float(resp["expires_in"])) * 1000)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CLAUDE_CRED),
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cred_path),
                                prefix=".credentials.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -446,7 +444,7 @@ def _persist_claude_cred(full, resp):
             os.chmod(tmp, 0o600)
         except OSError:
             pass
-        os.replace(tmp, CLAUDE_CRED)
+        os.replace(tmp, cred_path)
     finally:
         if os.path.exists(tmp):
             try:
@@ -456,13 +454,10 @@ def _persist_claude_cred(full, resp):
     return oa["accessToken"]
 
 
-def _claude_access_token():
-    """A usable Claude access token. Uses the stored token if still valid (no
-    network); if it is stale — e.g. after a long idle when the harness hasn't
-    refreshed it — refreshes from the refresh_token against api.anthropic.com AND
-    persists the rotated set back to the credential file (single-use grant — see
-    module docstring), then returns the fresh access token."""
-    with open(CLAUDE_CRED, encoding="utf-8") as f:
+def _claude_access_token(cred_path=None):
+    """Read a usable token, refreshing and persisting to the selected file."""
+    cred_path = cred_path or CLAUDE_CRED
+    with open(cred_path, encoding="utf-8") as f:
         full = json.load(f)
     oa = full.get("claudeAiOauth") or {}
     access = oa.get("accessToken") or ""
@@ -495,25 +490,27 @@ def _claude_access_token():
             f"Claude token refresh failed (HTTP {e.code}). The harness normally "
             "refreshes this token on its own activity — send Claude a message and "
             f"retry, or re-login if it persists. {detail}") from e
-    return _persist_claude_cred(full, resp)
+    return _persist_claude_cred(full, resp, cred_path)
 
 
-def query_claude():
+def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL):
     """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?} normalized, or
     raises. A fresh cache is used as-is; otherwise we fetch live (retrying a
     transient 429). If the live fetch still fails, we fall back to the last cached
     payload however stale, tagged with '_stale_age' (seconds) so the caller can
     label it — better a known-old number than an error."""
-    _require_configured("Claude", CLAUDE_CRED)
+    cred_path = cred_path or CLAUDE_CRED
+    cache_path = cache_path or CACHE
+    _require_configured("Claude", cred_path)
     now = time.time()
     data, stale = None, None
     try:
-        with open(CACHE, encoding="utf-8") as f:
+        with open(cache_path, encoding="utf-8") as f:
             c = json.load(f)
         cdata = c.get("data")
         cage = now - float(c.get("fetched_at") or 0)
         if cdata is not None:
-            if cage < CACHE_TTL:
+            if cage < cache_ttl:
                 data = cdata
             else:
                 stale = (cdata, int(cage))
@@ -521,13 +518,13 @@ def query_claude():
         pass
     age = 0
     if data is None:
-        token = _claude_access_token()
+        token = _claude_access_token(cred_path)
         try:
             data = _get_retry(CLAUDE_URL, {
                 "Authorization": f"Bearer {token}",
                 "anthropic-beta": "oauth-2025-04-20",
             })
-            _write_cache(CACHE, data)
+            _write_cache(cache_path, data)
         except Exception:
             if stale is None:
                 raise
@@ -575,6 +572,51 @@ def query_claude():
     if age:
         out["_stale_age"] = age
     return out
+
+
+def query_claude_accounts(live_result, errors):
+    """Read installed stashes only when the live marker names a stash."""
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    if not os.path.isdir(directory):
+        return None
+    stashes = {os.path.splitext(name)[0]: os.path.join(directory, name)
+               for name in sorted(os.listdir(directory))
+               if name.endswith(".json") and os.path.isfile(os.path.join(directory, name))}
+    if not stashes:
+        return None
+    try:
+        with open(os.path.join(directory, "live"), encoding="utf-8") as f:
+            live = f.read().strip()
+    except FileNotFoundError:
+        return None
+    if live not in stashes:
+        return None
+    accounts = {}
+    for name, path in stashes.items():
+        try:
+            reading = live_result if name == live else query_claude(
+                path, os.path.join(directory, f".{name}.usage-cache"),
+                CLAUDE_ACCOUNT_CACHE_TTL)
+            if reading is not None:
+                accounts[name] = {"live": name == live,
+                                  "five_hour": reading["five_hour"],
+                                  "weekly": reading["weekly"]}
+        except Exception as e:
+            errors[f"claude:{name}"] = f"{type(e).__name__}: {e}"
+    return accounts
+
+
+def query_openrouter():
+    """Read the optional installed helper's credits object with a timeout."""
+    script = os.path.expanduser("~/.agent-bundle/scripts/openrouter_key.py")
+    if not os.path.isfile(script):
+        return None
+    result = subprocess.run([sys.executable, script, "credits", "--json"],
+                            capture_output=True, text=True, timeout=TIMEOUT, check=True)
+    credit_info = json.loads(result.stdout)
+    if not isinstance(credit_info, dict) or not isinstance(credit_info.get("balance"), (int, float)):
+        raise ValueError("OpenRouter helper returned no numeric balance")
+    return credit_info
 
 
 def _kimi_client_id():
@@ -1940,9 +1982,20 @@ def main(argv=None):
         except Exception as e:
             errors[account] = f"{type(e).__name__}: {e}"
 
+    accounts = query_claude_accounts(results.get("claude"), errors) if want_claude else None
+    openrouter = None
+    try:
+        openrouter = query_openrouter()
+    except Exception as e:
+        errors["openrouter"] = f"{type(e).__name__}: {e}"
+
     if args.json:
-        json.dump({"usage": results, "errors": errors,
-                   "unconfigured": unconfigured}, sys.stdout, indent=2)
+        output = {"usage": results, "errors": errors, "unconfigured": unconfigured}
+        if accounts is not None:
+            output["claude_accounts"] = accounts
+        if openrouter is not None:
+            output["openrouter"] = openrouter
+        json.dump(output, sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         rows = []
@@ -1971,8 +2024,20 @@ def main(argv=None):
                             _banked_spend_note(name, _ZAI_SPEND_ROUTE))
             elif account in errors and not args.quiet:
                 print(f"{name}: ERROR — {errors[account]}", file=sys.stderr)
+            if account == "claude":
+                for name, reading in (accounts or {}).items():
+                    if not reading["live"]:
+                        rows.extend(_table_rows(f"Claude {name}", reading))
+        if not args.quiet:
+            for account, error in errors.items():
+                if account.startswith("claude:"):
+                    print(f"Claude {account.split(':', 1)[1]}: ERROR — {error}", file=sys.stderr)
+            if "openrouter" in errors:
+                print(f"OpenRouter: ERROR — {errors['openrouter']}", file=sys.stderr)
         if rows:
             print(_render_table(rows, provider_notes))
+        if openrouter is not None:
+            print(f"OpenRouter balance ${openrouter['balance']:.2f}")
 
     return 1 if errors else 0
 

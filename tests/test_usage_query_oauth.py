@@ -5,6 +5,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 import urllib.error
@@ -223,18 +224,25 @@ def _capture_get(seen, payload):
 
 
 def test_codex_never_reaches_for_the_codex_cli(tmp):
-    """The whole point of reading auth.json directly: no `codex app-server` is
-    started, so the status line stops paying a CLI boot (and, on Windows, a
-    console window) once a minute."""
-    del tmp
+    """Codex quota reads use HTTP without starting a CLI process."""
     mod = _util.load(USAGE_QUERY, "usage_query_codex_no_subprocess")
-    assert not hasattr(mod, "subprocess"), "the module can still spawn processes"
-    with open(USAGE_QUERY, encoding="utf-8") as f:
-        source = f.read()
-    # Prose about the app-server is fine; a way to start one is not.
-    assert "Popen" not in source
-    assert "--stdio" not in source
-    assert "CODEX_BIN" not in source
+    mod.CODEX_AUTH = os.path.join(tmp, "auth.json")
+    original = _write_codex_auth(mod.CODEX_AUTH, 86400)
+    calls = []
+
+    def fetch(url, headers):
+        assert url == "https://chatgpt.com/backend-api/wham/usage", url
+        assert headers["Authorization"] == "Bearer " + original["tokens"]["access_token"]
+        calls.append(url)
+        payload = _wham_payload()
+        payload["rate_limit_reset_credits"] = {"available_count": 0}
+        return payload
+
+    with mock.patch.object(subprocess, "run", side_effect=AssertionError("Codex spawned a process")), \
+            mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Codex spawned a process")), \
+            mock.patch.object(mod, "_get_retry", side_effect=fetch):
+        assert mod._codex_rate_limits()["rateLimits"]["primary"]["usedPercent"] == 95
+    assert calls == ["https://chatgpt.com/backend-api/wham/usage"]
 
 
 def test_codex_maps_the_backend_payload_into_the_rpc_shape(tmp):

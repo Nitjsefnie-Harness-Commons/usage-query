@@ -11,6 +11,7 @@ import os
 import tempfile
 import traceback
 from pathlib import Path
+from unittest import mock
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = str(_PROJECT_ROOT / "usage_query_lib")
@@ -67,7 +68,8 @@ def runner(tests, tmp_prefix="usagequerytests_"):
             d = os.path.join(tmp, t.__name__)
             os.makedirs(d, exist_ok=True)
             try:
-                t(d)
+                with mock.patch.dict(os.environ, {"HOME": d, "USERPROFILE": d}):
+                    t(d)
                 print(f"  PASS  {t.__name__}")
             except Skipped as e:
                 skipped.append(t.__name__)

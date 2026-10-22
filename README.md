@@ -19,6 +19,45 @@ The `usage-query` command queries all four providers by default, or one with
 `--quiet` suppresses per-account error lines. The command reports its own
 version with `--version`.
 
+Claude reads the live account from `~/.claude/.credentials.json` as usual.
+When `~/.claude/accounts/live` names an installed `*.json` stash in that
+directory, the default query and `--claude` also report every installed Claude
+account. Other files and directories are ignored. A missing or empty accounts
+directory, or a missing or unknown marker, keeps the existing output.
+This command reads the marker; it does not switch accounts or write it.
+
+JSON keeps `usage.claude` and all of `usage`'s provider keys unchanged, and
+adds a top-level `claude_accounts` object. For example:
+
+```json
+{
+  "claude_accounts": {
+    "alpha": {
+      "live": true,
+      "five_hour": {"pct": 0.0, "resets_at": "no reset scheduled (window inactive)", "resets_in": "—", "pace_pct": null, "recover_in": null},
+      "weekly": {"pct": 0.0, "resets_at": "no reset scheduled (window inactive)", "resets_in": "—", "pace_pct": null, "recover_in": null}
+    }
+  }
+}
+```
+
+The live entry reuses `usage.claude`'s window readings. Inactive accounts use
+their stash's token, refreshing stale credentials atomically into that same
+stash with mode `0600`. Their readings have separate five-minute caches
+beside the stashes (`.<name>.usage-cache`); the live account keeps its existing
+cache. A failed account is omitted and named under `errors` as
+`claude:<name>`, while the others still report. Text output keeps the live
+`Claude` rows and places each inactive account's `Claude <name>` rows after
+them, in the same columns.
+
+When `~/.agent-bundle/scripts/openrouter_key.py` exists, every provider selection
+also runs it as `credits --json` with a timeout. Its returned object appears
+under the top-level `openrouter` key, for example
+`{"total_credits": 170.0, "total_usage": 166.6, "balance": 3.36}`; text output
+adds `OpenRouter balance $3.36`. An absent helper adds nothing. A failed helper
+adds one `errors.openrouter` entry and no balance. Account or helper errors
+make the command exit nonzero; `--quiet` suppresses their text error lines.
+
 The z.ai provider resolves its API key the way the bundle's `spawn_zai`
 launchers do — `$ZAI_API_KEY`, then `~/.config/claude-zai/api-key`, then the
 copy shipped beside those launchers, then a harness auth file's `zai.key`
