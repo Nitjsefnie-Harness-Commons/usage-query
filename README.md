@@ -35,13 +35,19 @@ adds a top-level `claude_accounts` object. For example:
     "alpha": {
       "live": true,
       "five_hour": {"pct": 0.0, "resets_at": "no reset scheduled (window inactive)", "resets_in": "—", "pace_pct": null, "recover_in": null},
-      "weekly": {"pct": 0.0, "resets_at": "no reset scheduled (window inactive)", "resets_in": "—", "pace_pct": null, "recover_in": null}
+      "weekly": {"pct": 0.0, "resets_at": "no reset scheduled (window inactive)", "resets_in": "—", "pace_pct": null, "recover_in": null},
+      "_scoped": [
+        {"label": "7d:Model One", "pct": 0.0, "resets_at": "no reset scheduled (window inactive)", "resets_in": "—", "pace_pct": null, "recover_in": null}
+      ]
     }
   }
 }
 ```
 
-The live entry reuses `usage.claude`'s window readings. Inactive accounts use
+The live entry reuses `usage.claude`'s window readings. Each account also retains
+the reading's optional `_scoped` list, in the same shape as
+`usage.claude._scoped`; readings without scoped limits omit that key.
+Inactive accounts use
 their stash's token, refreshing stale credentials atomically into that same
 account's current credential file with mode `0600`. Refresh HTTP requests run
 without holding the accounts lock. Persistence takes `accounts/.lock`, re-reads
@@ -67,7 +73,8 @@ beside the stashes (`.<name>.usage-cache`); the live account keeps its existing
 cache. A failed account is omitted and named under `errors` as
 `claude:<name>`, while the others still report. Text output keeps the live
 `Claude` rows and places each inactive account's `Claude <name>` rows after
-them, in the same columns. An unreadable directory or marker is reported as
+them, in the same columns. Each account's scoped rows follow its `5h` and `7d`
+rows, preserving the reading's scoped-list order. An unreadable directory or marker is reported as
 `errors.claude_accounts`, preserving the live result.
 
 When `~/.agent-bundle/scripts/openrouter_key.py` exists, every provider selection

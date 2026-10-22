@@ -713,6 +713,8 @@ def query_claude_accounts(live_result, errors):
                 accounts[name] = {"live": name == live,
                                   "five_hour": reading["five_hour"],
                                   "weekly": reading["weekly"]}
+                if "_scoped" in reading:
+                    accounts[name]["_scoped"] = reading["_scoped"]
         except Exception as e:
             errors[f"claude:{name}"] = f"{type(e).__name__}: {e}"
     return accounts

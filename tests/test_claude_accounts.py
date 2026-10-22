@@ -177,6 +177,64 @@ def test_fresh_inactive_account_uses_its_token_and_live_is_reused(tmp):
                               ("usage", "Bearer beta-token")]
 
 
+@contextmanager
+def scoped_accounts(tmp):
+    with setup(tmp, {"live-token": 10, "beta-token": 40}) as (mod, accounts, http):
+        install(accounts)
+
+        def request(req, timeout=None):
+            payload = json.loads(http(req, timeout).raw)
+            scopes = (("Model One", 23), ("Model Two", 31))
+            if req.get_header("Authorization") == "Bearer beta-token":
+                scopes = (("Model Two", 73), ("Model One", 39))
+            payload["limits"] = [
+                {"group": "weekly", "scope": {"model": {"display_name": model}},
+                 "percent": pct, "resets_at": None} for model, pct in scopes]
+            return Response(payload)
+
+        with mock.patch("urllib.request.urlopen", side_effect=request):
+            yield mod, http
+
+
+def test_inactive_scoped_weekly_limits_are_in_account_json(tmp):
+    with scoped_accounts(tmp) as (mod, http):
+        rc, raw, err = run(mod, "--json")
+        got = json.loads(raw)
+        assert rc == 0 and err == "", (rc, raw, err)
+        beta = got["claude_accounts"]["beta"]
+        assert beta.get("_scoped") == [
+            {"label": "7d:Model Two", "pct": 73.0,
+             "resets_at": "no reset scheduled (window inactive)", "resets_in": "—",
+             "pace_pct": None, "recover_in": None},
+            {"label": "7d:Model One", "pct": 39.0,
+             "resets_at": "no reset scheduled (window inactive)", "resets_in": "—",
+             "pace_pct": None, "recover_in": None},
+        ], "inactive scoped limits were dropped or changed"
+        assert got["claude_accounts"]["alpha"].get("_scoped") == got["usage"]["claude"]["_scoped"]
+        assert [row["pct"] for row in got["usage"]["claude"]["_scoped"]] == [23, 31]
+        assert set(got["usage"]) == {"claude"}
+        assert http.calls == [("usage", "Bearer live-token"), ("usage", "Bearer beta-token")]
+
+
+def test_inactive_scoped_rows_follow_account_windows_in_text(tmp):
+    with scoped_accounts(tmp) as (mod, http):
+        rc, text, err = run(mod)
+        assert rc == 0 and err == "", (rc, text, err)
+        lines = text.splitlines()
+        scoped = [line for line in lines if "7d:Model " in line]
+        assert [line.split()[:3] for line in scoped] == [
+            ["7d:Model", "One", "23%"], ["7d:Model", "Two", "31%"],
+            ["7d:Model", "Two", "73%"], ["7d:Model", "One", "39%"],
+        ], "inactive scoped text rows were dropped or reordered"
+        assert lines[5].startswith("Claude beta")
+        assert lines[6].split()[0] == "7d"
+        assert lines[7:9] == scoped[2:]
+        assert scoped[0].index("7d:Model One") == scoped[3].index("7d:Model One")
+        assert scoped[1].index("7d:Model Two") == scoped[2].index("7d:Model Two")
+        assert scoped[0].index("23%") == scoped[2].index("73%")
+        assert http.calls == [("usage", "Bearer live-token"), ("usage", "Bearer beta-token")]
+
+
 def test_stale_inactive_account_refreshes_only_its_stash(tmp):
     with setup(tmp, {"live-token": 10, "beta-new": 50}, {
         "beta-token-refresh": {"access_token": "beta-new",
@@ -366,8 +424,8 @@ def test_other_provider_selection_does_not_read_stashes(tmp):
         assert got["usage"] == {"kimi": {}} and http.calls == []
 
 
-def test_live_entry_carries_only_public_windows(tmp):
-    with setup(tmp, {"beta-token": 40}) as (mod, accounts, _):
+def test_live_entry_preserves_scoped_limits_and_omits_cache_metadata(tmp):
+    with setup(tmp, {"beta-token": 40}) as (mod, accounts, http):
         install(accounts)
         window = {"pct": 10.0, "resets_at": "reset", "resets_in": "1h",
                   "pace_pct": 20.0, "recover_in": None}
@@ -383,7 +441,9 @@ def test_live_entry_carries_only_public_windows(tmp):
         got = json.loads(raw)
         assert rc == 0 and got["usage"]["claude"] == live
         assert got["claude_accounts"]["alpha"] == {
-            "live": True, "five_hour": window, "weekly": window}
+            "live": True, "five_hour": window, "weekly": window,
+            "_scoped": [{"label": "7d:scoped", **window}]}
+        assert http.calls == [("usage", "Bearer beta-token")]
 
 
 def test_accounts_directory_read_failure_preserves_live_output(tmp):
