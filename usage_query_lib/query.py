@@ -137,7 +137,7 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
