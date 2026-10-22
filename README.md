@@ -56,10 +56,11 @@ An unidentified live account's refreshed pair goes to `.credentials.json`.
 Without an accounts directory, live credential refresh keeps its existing
 behavior.
 
-While `accounts/state.json` has a `pending` key, stash queries use their last
-cached readings, even when stale, or report an account error if none exists.
-They make no refresh or usage request during that pending swap. Live queries
-continue normally. `state.json` is switcher metadata and is not an account.
+While `accounts/state.json` has a `pending` key, every Claude account, including
+the live one, uses its last cached reading, even when stale, or reports an
+account error if none exists. No Claude refresh or usage request is made during
+that pending swap. Without a `pending` key, live queries behave normally.
+`state.json` is switcher metadata and is not an account.
 
 Their readings have separate five-minute caches
 beside the stashes (`.<name>.usage-cache`); the live account keeps its existing

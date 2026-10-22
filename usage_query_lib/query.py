@@ -480,7 +480,7 @@ def _claude_accounts_lock(directory):
 
 
 class _ClaudeSwapPending(RuntimeError):
-    """A stash reading is paused while the switcher has pending state."""
+    """A Claude reading is paused while the switcher has pending state."""
 
 
 def _claude_credential_snapshot(cred_path):
@@ -490,16 +490,16 @@ def _claude_credential_snapshot(cred_path):
         with open(cred_path, encoding="utf-8") as stream:
             return json.load(stream), None
     with _claude_accounts_lock(directory):
+        try:
+            with open(os.path.join(directory, "state.json"), encoding="utf-8") as stream:
+                state = json.load(stream)
+        except FileNotFoundError:
+            state = {}
+        if "pending" in state:
+            raise _ClaudeSwapPending("Claude reading paused while an account swap is pending")
         account_name = _claude_account_name(cred_path)
         source = cred_path
         if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
-            try:
-                with open(os.path.join(directory, "state.json"), encoding="utf-8") as stream:
-                    state = json.load(stream)
-            except FileNotFoundError:
-                state = {}
-            if "pending" in state:
-                raise _ClaudeSwapPending("Claude stash reading paused while an account swap is pending")
             with open(os.path.join(directory, "live"), encoding="utf-8") as stream:
                 live = stream.read().strip()
             if account_name == live:
@@ -602,7 +602,8 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
     raises. A fresh cache is used as-is; otherwise we fetch live (retrying a
     transient 429). If the live fetch still fails, we fall back to the last cached
     payload however stale, tagged with '_stale_age' (seconds) so the caller can
-    label it — better a known-old number than an error."""
+    label it — better a known-old number than an error. Pending swaps use the
+    last cached reading for every Claude account, or raise if none exists."""
     cred_path = cred_path or CLAUDE_CRED
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
