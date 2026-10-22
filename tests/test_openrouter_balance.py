@@ -71,7 +71,9 @@ def test_script_is_invoked_with_argv_no_shell_and_timeout(tmp):
     mod, helper = setup(tmp, "")
 
     def execute(argv, **kwargs):
-        assert argv == [sys.executable, str(helper), "credits", "--json"]
+        assert argv[0] == sys.executable
+        assert Path(argv[1]) == helper
+        assert argv[2:] == ["credits", "--json"]
         assert kwargs.get("shell", False) is False
         assert 0 < kwargs["timeout"] <= 30
         assert kwargs["capture_output"] and kwargs["text"] and kwargs["check"]
@@ -79,7 +81,7 @@ def test_script_is_invoked_with_argv_no_shell_and_timeout(tmp):
 
     with mock.patch("subprocess.run", side_effect=execute):
         rc, raw, _ = run(mod, "--json")
-    assert rc == 0 and json.loads(raw)["openrouter"] == BALANCE
+    assert rc == 0 and json.loads(raw)["openrouter"] == BALANCE, (rc, raw)
 
 
 def test_timeout_records_an_error_and_keeps_usage(tmp):
