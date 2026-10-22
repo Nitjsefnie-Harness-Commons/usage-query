@@ -138,7 +138,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
 
-__version__ = "1.9.2"
+__version__ = "1.9.3"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
