@@ -180,6 +180,13 @@ shared 30 s TTL expired in lockstep with a 30 s status-line refresh, so
 essentially every refresh was a miss, and a quota percentage does not move
 meaningfully inside a quarter of an hour.
 
+Every Codex cache hit exposes its age in seconds as `usage.codex._cache_age`
+in JSON and labels the account `Codex (cached Ns)` in text, even inside that
+TTL. The age applies to the credit balance and `credits.usable` as well as the
+quota windows: they describe the saved snapshot, not a fresh authorization to
+spend credits. A failed refresh still reports `_stale_age` alongside the cache
+age; a successful live fetch has neither cache-age marker.
+
 ## Development
 
 ```sh

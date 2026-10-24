@@ -8,6 +8,7 @@ while Codex keeps answering.
 import json
 import os
 import sys
+from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _util  # noqa: E402
 from test_banked_resets_display import _main_text  # noqa: E402
@@ -140,6 +141,116 @@ def test_a_window_under_100_keeps_its_pace_flag(tmp):
     text = _main_text(mod, codex=_result(mod, payload))
     weekly = next(r for r in _codex_rows(text) if " 7d " in r)
     assert "SPENT" not in weekly, text
+
+
+def _cache_snapshot(mod, tmp, payload, fetched_at):
+    mod.CODEX_CACHE = os.path.join(tmp, "codex-usage.json")
+    with open(mod.CODEX_CACHE, "w", encoding="utf-8") as cached:
+        json.dump({"fetched_at": fetched_at, "data": payload}, cached)
+
+
+def test_codex_cache_hit_exposes_the_snapshot_age(tmp):
+    mod = _util.load(USAGE_QUERY, "usage_query_credits_cache_age")
+    payload = mod._codex_rpc_shape(_spent_payload())
+    _cache_snapshot(mod, tmp, payload, 1000)
+    with mock.patch.object(mod.time, "time", return_value=1120.75), \
+            mock.patch.object(mod, "_codex_rate_limits") as fetch:
+        got = mod.query_codex()
+    fetch.assert_not_called()
+    assert got["credits"]["usable"] is True
+    assert got["_cache_age"] == 120, got
+    assert "_stale_age" not in got, "a TTL-valid hit is not a failed refresh"
+    assert mod.CODEX_CACHE_TTL == 900
+
+
+def test_codex_cache_age_advances_without_rewriting_the_snapshot(tmp):
+    mod = _util.load(USAGE_QUERY, "usage_query_credits_cache_clock")
+    payload = mod._codex_rpc_shape(_spent_payload())
+    _cache_snapshot(mod, tmp, payload, 1000)
+    with mock.patch.object(mod.time, "time", side_effect=[1120, 1150]), \
+            mock.patch.object(mod, "_codex_rate_limits") as fetch:
+        first = mod.query_codex()
+        second = mod.query_codex()
+    fetch.assert_not_called()
+    assert first["_cache_age"] == 120
+    assert second["_cache_age"] == 150
+    with open(mod.CODEX_CACHE, encoding="utf-8") as cached:
+        assert json.load(cached) == {"fetched_at": 1000, "data": payload}
+
+
+def test_codex_cache_age_zero_or_future_timestamp_is_never_negative(tmp):
+    mod = _util.load(USAGE_QUERY, "usage_query_credits_cache_zero")
+    payload = mod._codex_rpc_shape(_spent_payload())
+    for fetched_at in (999.75, 1005):
+        _cache_snapshot(mod, tmp, payload, fetched_at)
+        with mock.patch.object(mod.time, "time", return_value=1000), \
+                mock.patch.object(mod, "_codex_rate_limits") as fetch:
+            got = mod.query_codex()
+        fetch.assert_not_called()
+        assert got["_cache_age"] == 0, got
+
+
+def test_codex_cache_age_is_rendered_in_text_and_json(tmp):
+    del tmp
+    mod = _util.load(USAGE_QUERY, "usage_query_credits_cache_output")
+    for age in (0, 120):
+        reading = dict(_result(mod, _spent_payload()), _cache_age=age)
+        text = _main_text(mod, codex=reading)
+        assert f"Codex (cached {age}s)" in text, text
+        assert "SPENT (credits serving)" in text
+        data = json.loads(_main_text(mod, codex=reading, argv=("--json",)))
+        assert data["usage"]["codex"]["_cache_age"] == age
+        assert data["usage"]["codex"]["credits"]["usable"] is True
+
+
+def test_codex_expired_cache_age_is_kept_when_refresh_fails(tmp):
+    mod = _util.load(USAGE_QUERY, "usage_query_credits_cache_fallback")
+    _cache_snapshot(mod, tmp, mod._codex_rpc_shape(_spent_payload()), 1000)
+    with mock.patch.object(mod.time, "time", return_value=1905), \
+            mock.patch.object(mod, "_codex_rate_limits",
+                              side_effect=RuntimeError("offline")) as fetch:
+        got = mod.query_codex()
+    fetch.assert_called_once_with()
+    assert got["_cache_age"] == got["_stale_age"] == 905
+
+
+def test_codex_expired_cache_refreshed_from_backend_has_no_cache_age(tmp):
+    mod = _util.load(USAGE_QUERY, "usage_query_credits_cache_replaced")
+    _cache_snapshot(mod, tmp, mod._codex_rpc_shape(_spent_payload()), 1000)
+    fresh = mod._codex_rpc_shape(_spent_payload(has_credits=False, balance="0"))
+    with mock.patch.object(mod.time, "time", return_value=1900), \
+            mock.patch.object(mod, "_codex_rate_limits", return_value=fresh) as fetch:
+        got = mod.query_codex()
+    fetch.assert_called_once_with()
+    assert got["credits"]["usable"] is False
+    assert "_cache_age" not in got and "_stale_age" not in got
+    with open(mod.CODEX_CACHE, encoding="utf-8") as cached:
+        assert json.load(cached) == {"fetched_at": 1900, "data": fresh}
+
+
+def test_codex_live_read_has_no_cache_age(tmp):
+    mod = _util.load(USAGE_QUERY, "usage_query_credits_live_age")
+    mod.CODEX_CACHE = os.path.join(tmp, "not-created-yet.json")
+    fresh = mod._codex_rpc_shape(_spent_payload())
+    with mock.patch.object(mod, "_codex_rate_limits", return_value=fresh) as fetch:
+        got = mod.query_codex()
+    fetch.assert_called_once_with()
+    assert "_cache_age" not in got and "_stale_age" not in got
+    assert "(cached " not in _main_text(mod, codex=got)
+
+
+def test_codex_invalid_cache_age_does_not_leave_unlabelled_cached_credits(tmp):
+    mod = _util.load(USAGE_QUERY, "usage_query_credits_invalid_cache_age")
+    saved = mod._codex_rpc_shape(_spent_payload())
+    fresh = mod._codex_rpc_shape(_spent_payload(has_credits=False, balance="0"))
+    for fetched_at in ("not-a-timestamp", float("inf"), float("-inf"), float("nan")):
+        _cache_snapshot(mod, tmp, saved, fetched_at)
+        with mock.patch.object(mod.time, "time", return_value=1900), \
+                mock.patch.object(mod, "_codex_rate_limits", return_value=fresh) as fetch:
+            got = mod.query_codex()
+        fetch.assert_called_once_with()
+        assert got["credits"]["usable"] is False
+        assert "_cache_age" not in got and "_stale_age" not in got
 
 
 def main():
