@@ -642,7 +642,9 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
                 data, age = stale
     out = {}
     for key, src in (("five_hour", "five_hour"), ("weekly", "seven_day")):
-        block = data[src]
+        # The API returns a window as null when the account has no usage in it
+        # (seen for five_hour on an idle account); read that as 0% and inactive.
+        block = data[src] or {"utilization": 0, "resets_at": None}
         at, dur = _reset_info(block["resets_at"])
         out[key] = {"pct": float(block["utilization"]),
                     "resets_at": at, "resets_in": dur,

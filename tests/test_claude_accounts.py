@@ -177,6 +177,30 @@ def test_fresh_inactive_account_uses_its_token_and_live_is_reused(tmp):
                               ("usage", "Bearer beta-token")]
 
 
+def test_null_window_on_inactive_account_reads_as_inactive(tmp):
+    inactive = {"pct": 0.0, "resets_at": "no reset scheduled (window inactive)",
+                "resets_in": "—", "pace_pct": None, "recover_in": None}
+    for src, key, other, other_pct in (("five_hour", "five_hour", "weekly", 41),
+                                       ("seven_day", "weekly", "five_hour", 40)):
+        with setup(os.path.join(tmp, src),
+                   {"live-token": 10, "beta-token": 40}) as (mod, accounts, http):
+            install(accounts)
+
+            def request(req, timeout=None, src=src, http=http):
+                payload = json.loads(http(req, timeout).raw)
+                if req.get_header("Authorization") == "Bearer beta-token":
+                    payload[src] = None
+                return Response(payload)
+
+            with mock.patch("urllib.request.urlopen", side_effect=request):
+                rc, raw, err = run(mod, "--json")
+            got = json.loads(raw)
+            assert rc == 0 and err == "" and got["errors"] == {}, (src, rc, raw, err)
+            beta = got["claude_accounts"]["beta"]
+            assert beta[key] == inactive, (src, beta)
+            assert beta[other]["pct"] == other_pct, (src, beta)
+
+
 @contextmanager
 def scoped_accounts(tmp):
     with setup(tmp, {"live-token": 10, "beta-token": 40}) as (mod, accounts, http):
