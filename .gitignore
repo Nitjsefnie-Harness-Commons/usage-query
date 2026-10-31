@@ -62,6 +62,7 @@
 !/tests/test_claude_accounts_lock.py
 !/tests/test_claude_pending_swap.py
 !/tests/test_openrouter_balance.py
+!/tests/test_refresh_coordination.py
 !/tests/test_package_contract.py
 !/tests/test_usage_query_behavior.py
 !/tests/test_usage_query_oauth.py
