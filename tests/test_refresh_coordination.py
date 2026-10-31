@@ -357,6 +357,30 @@ def test_a_stale_claude_code_lock_is_reclaimed_without_waiting(tmp):
         assert not current.exists() and not legacy.exists()
 
 
+def test_an_unusable_legacy_lock_is_skipped_as_claude_code_skips_it(tmp):
+    # Claude Code logs a non-ELOCKED legacy-lock error and proceeds without
+    # it; treating that error as "held" would wait out the deadline instead.
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        current, legacy = claude_code_locks(mod)
+        real_mkdir = os.mkdir
+
+        def mkdir(path, *args, **kwargs):
+            if Path(path) == legacy:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_mkdir(path, *args, **kwargs)
+
+        def held():
+            assert current.is_dir() and not legacy.exists()
+
+        with posting(http, held), mock.patch.object(mod.os, "mkdir", side_effect=mkdir), \
+                mock.patch.object(mod.time, "sleep", side_effect=AssertionError("waited on an unusable legacy lock")):
+            assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
+        assert http.calls == [("refresh", "live-token-refresh")]
+        assert not current.exists()
+
+
 def test_a_held_claude_code_lock_times_out_without_a_refresh(tmp):
     with setup(tmp, {}, {}) as (mod, accounts, http):
         install(accounts)
