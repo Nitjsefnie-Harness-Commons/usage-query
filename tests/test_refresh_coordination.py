@@ -1,4 +1,5 @@
 """Concurrent refreshes of one single-use refresh token spend it once."""
+import contextlib
 import hashlib
 import io
 import json
@@ -15,7 +16,7 @@ from unittest import mock
 
 import _util
 from test_claude_accounts import credentials, install, setup
-from test_claude_accounts_lock import on_lock_entry, swap
+from test_claude_accounts_lock import held_by_process, on_lock_entry, swap
 from test_usage_query_oauth import _FakeResponse, _fake_jwt, _wham_payload, _write_codex_auth, _write_kimi_cred
 
 USAGE_QUERY = os.path.join(_util.SCRIPTS, "query.py")
@@ -574,6 +575,35 @@ def test_a_live_refresh_whose_pair_was_swapped_out_refreshes_the_stash(tmp):
         stash = json.loads((accounts / "alpha.json").read_text(encoding="utf-8"))["claudeAiOauth"]
         assert stash["refreshToken"] == "new-refresh", stash
         assert Path(mod.CLAUDE_CRED).read_bytes() == beta, "rotation overwrote the new live account"
+
+
+def test_a_lock_timeout_serves_the_last_reading_labelled_stale(tmp):
+    payload = {"five_hour": {"utilization": 7, "resets_at": None},
+               "seven_day": {"utilization": 8, "resets_at": None}}
+    for held in ("claude-code", "accounts"):
+        home = os.path.join(tmp, held)
+        os.makedirs(home)
+        with setup(home, {}, {}) as (mod, accounts, http):
+            install(accounts)
+            credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+            Path(mod.CACHE).write_text(json.dumps({"fetched_at": time.time() - 600, "data": payload}),
+                                       encoding="utf-8")
+            clock = [0.0]
+
+            def sleep(seconds, clock=clock):
+                clock[0] += seconds
+
+            with contextlib.ExitStack() as stack:
+                if held == "claude-code":
+                    claude_code_locks(mod)[0].mkdir()
+                else:
+                    stack.enter_context(held_by_process(accounts / ".lock"))
+                stack.enter_context(mock.patch.object(mod.time, "monotonic", side_effect=lambda clock=clock: clock[0]))
+                stack.enter_context(mock.patch.object(mod.time, "sleep", side_effect=sleep))
+                got = mod.query_claude(errors={})
+            assert got["five_hour"]["pct"] == 7 and got["weekly"]["pct"] == 8, (held, got)
+            assert got["_stale_age"] >= 600, (held, got)
+            assert http.calls == [], (held, http.calls)
 
 
 if __name__ == "__main__":
