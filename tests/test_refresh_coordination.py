@@ -7,9 +7,11 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+from pathlib import Path
 from unittest import mock
 
 import _util
+from test_claude_accounts import credentials, install, setup
 from test_usage_query_oauth import _FakeResponse, _fake_jwt, _wham_payload, _write_codex_auth, _write_kimi_cred
 
 USAGE_QUERY = os.path.join(_util.SCRIPTS, "query.py")
@@ -24,7 +26,8 @@ class SingleUseEndpoint:
     without sleeping: an uncoordinated pair always races.
     """
 
-    def __init__(self, valid, rotated, token_of):
+    def __init__(self, valid, rotated, token_of, check=None):
+        self.check = check
         self.valid = {valid}
         self.rotated = rotated
         self.token_of = token_of
@@ -34,6 +37,8 @@ class SingleUseEndpoint:
 
     def __call__(self, req, timeout=None):
         token = self.token_of(req)
+        if self.check:
+            self.check()
         with self.guard:
             self.sent.append(token)
             first = len(self.sent) == 1
@@ -136,27 +141,91 @@ def test_codex_contenders_spend_the_refresh_token_once(tmp):
     assert os.listdir(tmp) == ["auth.json"], "lock or temp file left behind"
 
 
-def test_a_refresh_lock_held_across_the_request_keeps_its_mtime_fresh(tmp):
+def claude_endpoint(check=None):
+    return SingleUseEndpoint("beta-token-refresh", {"access_token": "beta-new",
+                                                    "refresh_token": "beta-refresh-new",
+                                                    "expires_in": 3600}, json_token, check)
+
+
+def test_claude_stash_contenders_spend_the_refresh_token_once(tmp):
+    with setup(tmp) as (mod, accounts, _):
+        install(accounts, beta_stale=True)
+        stash = str(accounts / "beta.json")
+        live = Path(mod.CLAUDE_CRED).read_bytes()
+
+        def locked():
+            assert (accounts / ".lock").exists(), "stash refresh POST ran without the accounts lock"
+
+        endpoint = claude_endpoint(locked)
+        # Both contenders pass the first (briefly locked) snapshot with the
+        # stale pair before either takes the stash lock, so the loser's only
+        # defence is the re-read under that lock.
+        both_stale = threading.Barrier(2)
+        real_route = mod._claude_refresh_stash
+
+        def route(*args):
+            both_stale.wait(WAIT)
+            return real_route(*args)
+
+        with mock.patch("urllib.request.urlopen", side_effect=endpoint), \
+                mock.patch.object(mod, "_claude_refresh_stash", side_effect=route), \
+                mock.patch.object(mod.time, "sleep", side_effect=endpoint.sleep_hook(time.sleep)):
+            results, errors = contend(lambda: mod._claude_access_token(stash, {}))
+        assert errors == [], errors
+        assert results == ["beta-new", "beta-new"], results
+        assert endpoint.sent == ["beta-token-refresh"], endpoint.sent
+        stored = json.loads(Path(stash).read_text(encoding="utf-8"))["claudeAiOauth"]
+        assert stored["refreshToken"] == "beta-refresh-new"
+        assert Path(mod.CLAUDE_CRED).read_bytes() == live
+        assert not (accounts / ".lock").exists()
+
+
+def aged_then_touched(*locks):
+    """Age every held lock to the epoch; True once the heartbeat renewed each."""
+    for lock in locks:
+        os.utime(lock, (0, 0))
+    renewed = threading.Event()
+    deadline = time.monotonic() + WAIT
+    while time.monotonic() < deadline:
+        if all(os.stat(lock).st_mtime > time.time() - 60 for lock in locks):
+            return True
+        renewed.wait(0.01)
+    return False
+
+
+def test_a_kimi_refresh_lock_keeps_its_mtime_fresh_across_the_request(tmp):
     mod = _util.load(USAGE_QUERY, "usage_query_kimi_heartbeat")
     mod.KIMI_CRED = os.path.join(tmp, "kimi-code.json")
     mod.LOCK_HEARTBEAT = 0.01
     lock = mod.KIMI_CRED + ".usage-query.lock"
     _write_kimi_cred(mod.KIMI_CRED, {"access_token": "a", "refresh_token": "r",
                                      "expires_at": time.time() - 60})
-    touched = threading.Event()
 
     def slow_endpoint(req, timeout=None):
-        os.utime(lock, (0, 0))
-        deadline = time.monotonic() + WAIT
-        while os.stat(lock).st_mtime < 1000 and time.monotonic() < deadline:
-            touched.wait(0.01)
-        assert os.stat(lock).st_mtime > time.time() - 60, "held lock aged toward reclaim"
+        assert aged_then_touched(lock), "held lock aged toward reclaim"
         return _FakeResponse({"access_token": "a2", "refresh_token": "r2", "expires_in": 900})
 
     with mock.patch("urllib.request.urlopen", side_effect=slow_endpoint), \
             mock.patch.object(mod, "_kimi_client_id", return_value="public-client"):
         assert mod._kimi_access_token() == "a2"
     assert not os.path.exists(lock)
+
+
+def test_a_claude_stash_refresh_lock_keeps_its_mtime_fresh_across_the_request(tmp):
+    with setup(tmp) as (mod, accounts, _):
+        install(accounts, beta_stale=True)
+        mod.LOCK_HEARTBEAT = 0.01
+
+        endpoint = claude_endpoint()
+        endpoint.contended.set()  # one caller: nothing to wait for
+
+        def slow_endpoint(req, timeout=None):
+            assert aged_then_touched(accounts / ".lock"), "held accounts lock aged toward reclaim"
+            return endpoint(req)
+
+        with mock.patch("urllib.request.urlopen", side_effect=slow_endpoint):
+            assert mod._claude_access_token(str(accounts / "beta.json"), {}) == "beta-new"
+        assert not (accounts / ".lock").exists()
 
 
 if __name__ == "__main__":
