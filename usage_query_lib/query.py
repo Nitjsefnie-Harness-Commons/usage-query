@@ -642,24 +642,22 @@ def _claude_snapshot_locked(directory, cred_path):
 
 
 def _write_live_claude_cred(full, sent):
-    """Write a rotated pair into the live file the way Claude Code saves one:
-    under its storage write lock, re-reading the file and replacing only
-    `claudeAiOauth`, and only while the stored refresh token is empty or the
-    one this rotation consumed. Returns (written, lock timeout or None)."""
+    """Write a rotated pair into the live file the way Claude Code 2.1.316
+    saves one: under its storage write lock, re-reading the file and replacing
+    only `claudeAiOauth`, and only while that entry exists and its stored
+    refresh token is "" or the one this rotation consumed. A newer pair, a
+    removed entry or a removed file (a /login or /logout meanwhile) is left as
+    it is. Returns (written, lock timeout or None)."""
     def write():
         try:
             with open(CLAUDE_CRED, encoding="utf-8") as stream:
                 current = json.load(stream)
         except (OSError, ValueError):
-            current = None
-        if isinstance(current, dict):
-            stored = (current.get("claudeAiOauth") or {}).get("refreshToken")
-            if stored and stored != sent:
-                return False  # a newer pair (a /login, or Claude Code) is stored
-            merged = {**current, "claudeAiOauth": full["claudeAiOauth"]}
-        else:
-            merged = full
-        _replace_claude_cred(merged, CLAUDE_CRED)
+            return False
+        oauth = current.get("claudeAiOauth") if isinstance(current, dict) else None
+        if not (isinstance(oauth, dict) and oauth.get("refreshToken") in ("", sent)):
+            return False
+        _replace_claude_cred({**current, "claudeAiOauth": full["claudeAiOauth"]}, CLAUDE_CRED)
         return True
 
     try:
@@ -861,9 +859,11 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
     raises. A fresh cache is used as-is; otherwise we fetch live (retrying a
     transient 429). If the live fetch still fails, we fall back to the last cached
     payload however stale, tagged with '_stale_age' (seconds) so the caller can
-    label it — better a known-old number than an error. Pending swaps and a
-    refresh lock still held at its deadline use the last cached reading the
-    same way, or raise if none exists."""
+    label it — better a known-old number than an error. A pending swap, or
+    Claude Code's refresh lock or the accounts lock still held at its 30 s
+    deadline, uses the last cached reading the same way, or raises if none
+    exists. (The storage write lock never gets here: its timeout comes after
+    the grant and is written through, see _write_live_claude_cred.)"""
     cred_path = cred_path or CLAUDE_CRED
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
@@ -886,8 +886,8 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
         try:
             token = _claude_access_token(cred_path, errors)
         except (_ClaudeSwapPending, _LockTimeout):
-            # A pending swap or a lock (Claude Code's or the accounts one)
-            # still held at its deadline: no refresh this run, serve the cache.
+            # A pending swap, or Claude Code's refresh lock or the accounts
+            # lock still held at its deadline: no refresh this run, serve the cache.
             if stale is None:
                 raise
             data, age = stale

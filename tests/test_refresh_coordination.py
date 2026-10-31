@@ -589,6 +589,82 @@ def test_live_write_proceeds_when_the_stored_refresh_token_is_empty(tmp):
         assert live_oauth(mod)["claudeAiOauth"]["refreshToken"] == "new-refresh"
 
 
+def logged_out(mod, how):
+    """A /logout during our POST: the entry removed, or the whole file."""
+    def logout():
+        if how == "file":
+            os.remove(mod.CLAUDE_CRED)
+        else:
+            data = live_oauth(mod)
+            del data["claudeAiOauth"]
+            Path(mod.CLAUDE_CRED).write_text(json.dumps(data), encoding="utf-8")
+    return logout
+
+
+def assert_still_logged_out(mod, how):
+    if how == "file":
+        assert not os.path.exists(mod.CLAUDE_CRED), "a removed credentials file was recreated"
+    else:
+        data = live_oauth(mod)
+        assert "claudeAiOauth" not in data and data["keep"] == "outer", data
+
+
+def test_a_logout_during_the_post_is_not_undone(tmp):
+    for how in ("entry", "file"):
+        for stash in (True, False):
+            home = os.path.join(tmp, f"{how}-{stash}")
+            os.makedirs(home)
+            with setup(home, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+                install(accounts)
+                if not stash:
+                    (accounts / "alpha.json").unlink()
+                credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+                with posting(http, logged_out(mod, how)):
+                    assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
+                assert_still_logged_out(mod, how)
+                if stash:
+                    saved = json.loads((accounts / "alpha.json").read_text(encoding="utf-8"))["claudeAiOauth"]
+                    assert saved["refreshToken"] == "new-refresh", (how, saved)
+                    want = ("alpha", os.path.normpath(accounts / "alpha.json"), "ok rt_new=" + fp("new-refresh"))
+                else:
+                    want = ("?", os.path.normpath(mod.CLAUDE_CRED), "write_skipped_newer rt_new=" + fp("new-refresh"))
+                got = [(a, d, o) for a, _, d, o in log_lines(accounts)]
+                assert got == [want], (how, stash, got)
+
+
+def test_the_unlocked_fallback_refuses_what_the_locked_write_refuses(tmp):
+    def newer_pair(mod):
+        return lambda: credentials(Path(mod.CLAUDE_CRED), "other-login")
+
+    for case in ("newer", "entry", "file"):
+        home = os.path.join(tmp, case)
+        os.makedirs(home)
+        with setup(home, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+            install(accounts)
+            credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+            storage = Path(mod.CLAUDE_CRED).parent / ".storage-write.lock"
+            change = newer_pair(mod) if case == "newer" else logged_out(mod, case)
+
+            def during_post(change=change, storage=storage):
+                storage.mkdir()
+                change()
+
+            monotonic, sleep = fake_clock()
+            errors = {}
+            with posting(http, during_post), \
+                    mock.patch.object(mod.time, "monotonic", side_effect=monotonic), \
+                    mock.patch.object(mod.time, "sleep", side_effect=sleep):
+                assert mod._claude_access_token(mod.CLAUDE_CRED, errors) == "new-access"
+            assert monotonic() >= mod.CLAUDE_CODE_LOCK_WAIT, case
+            if case == "newer":
+                assert live_oauth(mod)["claudeAiOauth"]["refreshToken"] == "other-login-refresh"
+            else:
+                assert_still_logged_out(mod, case)
+            saved = json.loads((accounts / "alpha.json").read_text(encoding="utf-8"))["claudeAiOauth"]
+            assert saved["refreshToken"] == "new-refresh", (case, saved)
+            assert set(errors) == {"claude:alpha"}, (case, errors)
+
+
 def test_a_storage_lock_timeout_after_the_post_still_saves_the_rotated_pair(tmp):
     with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
         install(accounts)

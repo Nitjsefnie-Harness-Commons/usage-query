@@ -71,18 +71,21 @@ meanwhile instead of refreshing. Every write to `.credentials.json` takes Claude
 Code's credential write lock (`~/.claude/.storage-write.lock`, reclaimed after
 15 seconds), re-reads the file under it, and replaces only its `claudeAiOauth`
 entry, so keys another writer saved meanwhile (MCP OAuth tokens, for one) are
-kept. Like Claude Code's own save, it writes only while the stored refresh
-token is empty or the one this refresh sent; when a newer pair is stored (a
-`/login` to another account, say) it leaves the file alone and saves the
-rotated pair to the posting account's stash, or logs `write_skipped_newer` when
-no stash knows the account. The query also takes a brief lock to read the
+kept. Like Claude Code's own save, it writes only while the `claudeAiOauth`
+entry exists and its refresh token is empty or the one this refresh sent. A
+newer pair (a `/login` to another account, say), a removed entry or a removed
+file (a `/logout`) is left as it is, and the rotated pair is saved to the
+posting account's stash instead, or `write_skipped_newer` is logged when no
+stash knows the account. The query also takes a brief lock to read the
 account name and credentials together before HTTP. Accounts-lock acquisition
 retries for up to 30 seconds and reclaims a lock whose modification time is
 older than 30 seconds; a held lock's modification time is touched every 5
-seconds. A refresh-lock or accounts-lock timeout stops the query before a
-refresh grant and serves the last cached reading, labelled stale. A
+seconds. A timeout on Claude Code's refresh lock or on the accounts lock (and
+only those) stops the query before a refresh grant and serves the last cached
+reading, labelled stale. A
 storage-write-lock timeout comes after the grant, so the rotated pair is still
-written, without that lock, and an account error is recorded.
+written, without that lock but with the same checks, and an account error is
+recorded.
 An unidentified live account's refreshed pair goes to `.credentials.json`.
 Every Claude refresh attempt appends one line to `accounts/accounts.log` when
 the accounts directory exists, in the switcher's format: UTC time, pid,
