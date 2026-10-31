@@ -81,7 +81,8 @@ Every Claude refresh attempt appends one line to `accounts/accounts.log` when
 the accounts directory exists, in the switcher's format: UTC time, pid,
 `op=refresh`, the account, `rt=` the first 10 hex digits of the SHA-256 of the
 refresh token sent, `file=` the destination, and `outcome=` `ok rt_new=<that
-fingerprint of the rotated token>`, `http <status>`, or `unknown` when the
+fingerprint of the rotated token>`, `write_failed rt_new=<fp>` when the rotated
+pair could not be written (it is lost), `http <status>`, or `unknown` when the
 request failed without an HTTP status and may have reached the server. No token
 is logged.
 Without an accounts directory, live credential refresh keeps its existing
