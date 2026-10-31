@@ -481,9 +481,8 @@ def test_a_failed_write_logs_the_lost_rotation_not_ok(tmp):
             install(accounts, beta_stale=True)
             credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
             path = mod.CLAUDE_CRED if name == "alpha" else str(accounts / "beta.json")
-            real_replace = os.replace
 
-            def replace(src, dst, path=path):
+            def replace(src, dst, path=path, real_replace=os.replace):
                 if os.path.normpath(dst) == os.path.normpath(path):
                     raise OSError("disk full")
                 return real_replace(src, dst)
@@ -553,7 +552,7 @@ def test_live_write_replaces_an_older_pair_written_after_our_read(tmp):
 
 
 def test_live_write_waits_for_claude_codes_storage_lock_and_rereads(tmp):
-    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, _):
         install(accounts)
         credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
         storage = Path(mod.CLAUDE_CRED).parent / ".storage-write.lock"
@@ -628,6 +627,16 @@ def test_a_live_refresh_whose_pair_was_swapped_out_refreshes_the_stash(tmp):
         assert Path(mod.CLAUDE_CRED).read_bytes() == beta, "rotation overwrote the new live account"
 
 
+def fake_clock():
+    """(monotonic, sleep) doubles: sleeping advances the clock instantly."""
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    return (lambda: clock[0]), sleep
+
+
 def test_a_lock_timeout_serves_the_last_reading_labelled_stale(tmp):
     payload = {"five_hour": {"utilization": 7, "resets_at": None},
                "seven_day": {"utilization": 8, "resets_at": None}}
@@ -639,17 +648,13 @@ def test_a_lock_timeout_serves_the_last_reading_labelled_stale(tmp):
             credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
             Path(mod.CACHE).write_text(json.dumps({"fetched_at": time.time() - 600, "data": payload}),
                                        encoding="utf-8")
-            clock = [0.0]
-
-            def sleep(seconds, clock=clock):
-                clock[0] += seconds
-
+            monotonic, sleep = fake_clock()
             with contextlib.ExitStack() as stack:
                 if held == "claude-code":
                     claude_code_locks(mod)[0].mkdir()
                 else:
                     stack.enter_context(held_by_process(accounts / ".lock"))
-                stack.enter_context(mock.patch.object(mod.time, "monotonic", side_effect=lambda clock=clock: clock[0]))
+                stack.enter_context(mock.patch.object(mod.time, "monotonic", side_effect=monotonic))
                 stack.enter_context(mock.patch.object(mod.time, "sleep", side_effect=sleep))
                 got = mod.query_claude(errors={})
             assert got["five_hour"]["pct"] == 7 and got["weekly"]["pct"] == 8, (held, got)
