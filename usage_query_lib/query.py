@@ -468,6 +468,10 @@ LOCK_HEARTBEAT = 5
 # the stored credentials and adopts a pair another process rotated in.
 CLAUDE_CODE_LOCK_STALE = 60
 CLAUDE_CODE_LOCK_WAIT = 30
+# Claude Code read-modify-writes .credentials.json (OAuth pair and MCP OAuth
+# tokens alike) under `.storage-write.lock` in the same directory, the same
+# proper-lockfile shape with a 15 s stale age (read from the 2.1.316 binary).
+CLAUDE_STORAGE_LOCK_STALE = 15
 
 
 @contextmanager
@@ -492,7 +496,7 @@ def _lock_heartbeat(*paths):
         thread.join()
 
 
-def _mkdir_lock(path):
+def _mkdir_lock(path, stale=CLAUDE_CODE_LOCK_STALE):
     """Create a lock directory, reclaiming a stale one once; False while held."""
     try:
         os.mkdir(path)
@@ -500,7 +504,7 @@ def _mkdir_lock(path):
     except FileExistsError:
         pass
     try:
-        if time.time() - os.stat(path).st_mtime <= CLAUDE_CODE_LOCK_STALE:
+        if time.time() - os.stat(path).st_mtime <= stale:
             return False
         os.rmdir(path)
     except FileNotFoundError:
@@ -543,6 +547,27 @@ def _claude_code_refresh_lock():
                 os.rmdir(path)
             except FileNotFoundError:
                 pass
+
+
+@contextmanager
+def _claude_storage_write_lock():
+    """Hold Claude Code's credential-storage write lock (CLAUDE_STORAGE_LOCK_STALE)."""
+    path = os.path.join(os.path.dirname(CLAUDE_CRED), ".storage-write.lock")
+    deadline = time.monotonic() + CLAUDE_CODE_LOCK_WAIT
+    while not _mkdir_lock(path, CLAUDE_STORAGE_LOCK_STALE):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Claude Code's credential write lock ({path}) was not acquired "
+                f"within {CLAUDE_CODE_LOCK_WAIT} s")
+        time.sleep(0.1)
+    try:
+        with _lock_heartbeat(path):
+            yield
+    finally:
+        try:
+            os.rmdir(path)
+        except FileNotFoundError:
+            pass
 
 
 def _claude_accounts_lock(directory):
@@ -613,7 +638,24 @@ def _claude_snapshot_locked(directory, cred_path):
 
 
 def _write_claude_cred(full, cred_path):
-    """Replace a Claude credential file atomically at mode 0600."""
+    """Replace a Claude credential file atomically at mode 0600. The live file
+    is shared with Claude Code, so it is re-read under Claude Code's storage
+    write lock and only its `claudeAiOauth` entry is replaced."""
+    if not _claude_is_live(cred_path):
+        _replace_claude_cred(full, cred_path)
+        return
+    with _claude_storage_write_lock():
+        try:
+            with open(cred_path, encoding="utf-8") as stream:
+                current = json.load(stream)
+        except (OSError, ValueError):
+            current = None
+        if isinstance(current, dict):
+            full = {**current, "claudeAiOauth": full["claudeAiOauth"]}
+        _replace_claude_cred(full, cred_path)
+
+
+def _replace_claude_cred(full, cred_path):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cred_path),
                                prefix=".credentials.", suffix=".tmp")
     try:

@@ -64,7 +64,11 @@ lock instead, taken the way Claude Code takes it: the directories
 `~/.claude/.oauth_refresh.lock` and then `~/.claude.lock`, each reclaimed once
 its modification time is over 60 seconds old and touched every 5 seconds while
 held, waiting up to 30 seconds. Under that lock it re-reads the credentials and
-uses a pair Claude Code rotated meanwhile instead of refreshing. Its token
+uses a pair Claude Code rotated meanwhile instead of refreshing. Every write
+to `.credentials.json` takes Claude Code's credential write lock
+(`~/.claude/.storage-write.lock`, reclaimed after 15 seconds), re-reads the
+file under it, and replaces only its `claudeAiOauth` entry, so keys another
+writer saved meanwhile (MCP OAuth tokens, for one) are kept. Its token
 request runs without the accounts lock; its persistence takes `accounts/.lock`, re-reads `live`, and
 writes to `.credentials.json` if the account is still live, or its stash
 otherwise. The query also takes a brief lock to read the account name
