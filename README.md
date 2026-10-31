@@ -71,18 +71,26 @@ meanwhile instead of refreshing. Every write to `.credentials.json` takes Claude
 Code's credential write lock (`~/.claude/.storage-write.lock`, reclaimed after
 15 seconds), re-reads the file under it, and replaces only its `claudeAiOauth`
 entry, so keys another writer saved meanwhile (MCP OAuth tokens, for one) are
-kept. The query also takes a brief lock to read the account name and
-credentials together before HTTP. Accounts-lock acquisition retries for up to
-30 seconds and reclaims a lock whose modification time is older than 30
-seconds; a held lock's modification time is touched every 5 seconds. A lock
-timeout stops the query before a refresh grant.
+kept. Like Claude Code's own save, it writes only while the stored refresh
+token is empty or the one this refresh sent; when a newer pair is stored (a
+`/login` to another account, say) it leaves the file alone and saves the
+rotated pair to the posting account's stash, or logs `write_skipped_newer` when
+no stash knows the account. The query also takes a brief lock to read the
+account name and credentials together before HTTP. Accounts-lock acquisition
+retries for up to 30 seconds and reclaims a lock whose modification time is
+older than 30 seconds; a held lock's modification time is touched every 5
+seconds. A refresh-lock or accounts-lock timeout stops the query before a
+refresh grant and serves the last cached reading, labelled stale. A
+storage-write-lock timeout comes after the grant, so the rotated pair is still
+written, without that lock, and an account error is recorded.
 An unidentified live account's refreshed pair goes to `.credentials.json`.
 Every Claude refresh attempt appends one line to `accounts/accounts.log` when
 the accounts directory exists, in the switcher's format: UTC time, pid,
 `op=refresh`, the account, `rt=` the first 10 hex digits of the SHA-256 of the
 refresh token sent, `file=` the destination, and `outcome=` `ok rt_new=<that
 fingerprint of the rotated token>`, `write_failed rt_new=<fp>` when the rotated
-pair could not be written (it is lost), `http <status>`, or `unknown` when the
+pair could not be written (it is lost), `write_skipped_newer rt_new=<fp>` when a
+newer stored pair and no stash left it unsaved, `http <status>`, or `unknown` when the
 request failed without an HTTP status and may have reached the server. No token
 is logged.
 Without an accounts directory, live credential refresh keeps its existing

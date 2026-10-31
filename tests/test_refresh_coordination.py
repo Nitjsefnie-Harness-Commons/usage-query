@@ -537,18 +537,73 @@ def test_live_write_keeps_what_another_writer_added_after_our_read(tmp):
         assert not storage.exists()
 
 
-def test_live_write_replaces_an_older_pair_written_after_our_read(tmp):
+def test_live_write_saves_to_the_stash_when_a_newer_pair_is_stored(tmp):
+    # A /login to another account during our POST: its pair stays live, and
+    # ours goes to the posting account's stash, as Claude Code's own save does.
     with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
         install(accounts)
         credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
 
-        def older_pair():
-            credentials(Path(mod.CLAUDE_CRED), "older", stale=True)
+        def other_login():
+            credentials(Path(mod.CLAUDE_CRED), "other-login")
 
-        with posting(http, older_pair):
+        with posting(http, other_login):
             assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
-        oauth = live_oauth(mod)["claudeAiOauth"]
-        assert (oauth["accessToken"], oauth["refreshToken"]) == ("new-access", "new-refresh"), oauth
+        assert live_oauth(mod)["claudeAiOauth"]["refreshToken"] == "other-login-refresh"
+        stash = json.loads((accounts / "alpha.json").read_text(encoding="utf-8"))["claudeAiOauth"]
+        assert stash["refreshToken"] == "new-refresh", stash
+        assert log_lines(accounts) == [("alpha", fp("live-token-refresh"), os.path.normpath(accounts / "alpha.json"),
+                                        "ok rt_new=" + fp("new-refresh"))]
+
+
+def test_live_write_is_skipped_and_logged_when_no_stash_knows_the_account(tmp):
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+        install(accounts)
+        (accounts / "alpha.json").unlink()  # the live account is unidentified
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+
+        def other_login():
+            credentials(Path(mod.CLAUDE_CRED), "other-login")
+
+        with posting(http, other_login):
+            assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
+        assert live_oauth(mod)["claudeAiOauth"]["refreshToken"] == "other-login-refresh"
+        assert not (accounts / "alpha.json").exists()
+        assert log_lines(accounts) == [("?", fp("live-token-refresh"), os.path.normpath(mod.CLAUDE_CRED),
+                                        "write_skipped_newer rt_new=" + fp("new-refresh"))]
+
+
+def test_live_write_proceeds_when_the_stored_refresh_token_is_empty(tmp):
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+
+        def emptied():
+            data = live_oauth(mod)
+            data["claudeAiOauth"]["refreshToken"] = ""
+            Path(mod.CLAUDE_CRED).write_text(json.dumps(data), encoding="utf-8")
+
+        with posting(http, emptied):
+            assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
+        assert live_oauth(mod)["claudeAiOauth"]["refreshToken"] == "new-refresh"
+
+
+def test_a_storage_lock_timeout_after_the_post_still_saves_the_rotated_pair(tmp):
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        storage = Path(mod.CLAUDE_CRED).parent / ".storage-write.lock"
+        monotonic, sleep = fake_clock()
+        errors = {}
+        with posting(http, storage.mkdir), \
+                mock.patch.object(mod.time, "monotonic", side_effect=monotonic), \
+                mock.patch.object(mod.time, "sleep", side_effect=sleep):
+            assert mod._claude_access_token(mod.CLAUDE_CRED, errors) == "new-access"
+        assert monotonic() >= mod.CLAUDE_CODE_LOCK_WAIT, "never waited for the storage lock"
+        assert live_oauth(mod)["claudeAiOauth"]["refreshToken"] == "new-refresh", "the rotated pair was lost"
+        assert set(errors) == {"claude:alpha"} and "written without it" in errors["claude:alpha"], errors
+        assert storage.is_dir(), "removed the other holder's storage lock"
+        assert log_lines(accounts)[-1][3] == "ok rt_new=" + fp("new-refresh")
 
 
 def test_a_response_read_timeout_stays_an_account_error(tmp):

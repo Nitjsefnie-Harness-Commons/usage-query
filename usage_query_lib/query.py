@@ -641,22 +641,34 @@ def _claude_snapshot_locked(directory, cred_path):
         return json.load(stream), account_name, source
 
 
-def _write_claude_cred(full, cred_path):
-    """Replace a Claude credential file atomically at mode 0600. The live file
-    is shared with Claude Code, so it is re-read under Claude Code's storage
-    write lock and only its `claudeAiOauth` entry is replaced."""
-    if not _claude_is_live(cred_path):
-        _replace_claude_cred(full, cred_path)
-        return
-    with _claude_storage_write_lock():
+def _write_live_claude_cred(full, sent):
+    """Write a rotated pair into the live file the way Claude Code saves one:
+    under its storage write lock, re-reading the file and replacing only
+    `claudeAiOauth`, and only while the stored refresh token is empty or the
+    one this rotation consumed. Returns (written, lock timeout or None)."""
+    def write():
         try:
-            with open(cred_path, encoding="utf-8") as stream:
+            with open(CLAUDE_CRED, encoding="utf-8") as stream:
                 current = json.load(stream)
         except (OSError, ValueError):
             current = None
         if isinstance(current, dict):
-            full = {**current, "claudeAiOauth": full["claudeAiOauth"]}
-        _replace_claude_cred(full, cred_path)
+            stored = (current.get("claudeAiOauth") or {}).get("refreshToken")
+            if stored and stored != sent:
+                return False  # a newer pair (a /login, or Claude Code) is stored
+            merged = {**current, "claudeAiOauth": full["claudeAiOauth"]}
+        else:
+            merged = full
+        _replace_claude_cred(merged, CLAUDE_CRED)
+        return True
+
+    try:
+        with _claude_storage_write_lock():
+            return write(), None
+    except _LockTimeout as late:
+        # The token is already spent: losing the rotated pair would log every
+        # session out, so it is written without the lock and reported.
+        return write(), late
 
 
 def _replace_claude_cred(full, cred_path):
@@ -678,9 +690,10 @@ def _replace_claude_cred(full, cred_path):
                 pass
 
 
-def _persist_claude_cred(full, resp, cred_path, account_name, sent):
+def _persist_claude_cred(full, resp, cred_path, account_name, sent, errors):
     """Save every rotation; with an accounts directory the caller holds its
-    lock. `sent` is the refresh token the rotation consumed, for the log."""
+    lock. `sent` is the refresh token the rotation consumed. A live write that
+    finds a newer pair stored saves ours to the account's stash instead."""
     oa = full["claudeAiOauth"]
     if resp.get("access_token"):
         oa["accessToken"] = resp["access_token"]
@@ -689,17 +702,29 @@ def _persist_claude_cred(full, resp, cred_path, account_name, sent):
     if resp.get("expires_in") is not None:
         oa["expiresAt"] = int((time.time() + float(resp["expires_in"])) * 1000)
     directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
-    if not os.path.isdir(directory):
-        _write_claude_cred(full, cred_path)
-        return oa["accessToken"]
-
-    live = _claude_live_marker(directory)
-    unidentified_live = live is None and os.path.abspath(cred_path) == os.path.abspath(CLAUDE_CRED)
-    destination = (CLAUDE_CRED if account_name is None or account_name == live or unidentified_live
-                   else os.path.join(directory, account_name + ".json"))
+    destination = cred_path
+    if os.path.isdir(directory):
+        live = _claude_live_marker(directory)
+        unidentified_live = live is None and os.path.abspath(cred_path) == os.path.abspath(CLAUDE_CRED)
+        destination = (CLAUDE_CRED if account_name is None or account_name == live or unidentified_live
+                       else os.path.join(directory, account_name + ".json"))
     rotated = _token_fingerprint(oa["refreshToken"])
     try:
-        _write_claude_cred(full, destination)
+        if not _claude_is_live(destination):
+            _replace_claude_cred(full, destination)
+        else:
+            written, late = _write_live_claude_cred(full, sent)
+            if late is not None and errors is not None:
+                errors[f"claude:{account_name}" if account_name else "claude_accounts"] = (
+                    f"{late}; the rotated pair was written without it")
+            if not written:
+                stash = os.path.join(directory, f"{account_name}.json") if account_name else None
+                if not (stash and os.path.isfile(stash)):
+                    _claude_log_refresh(account_name, sent, destination,
+                                        f"write_skipped_newer rt_new={rotated}")
+                    return oa["accessToken"]
+                destination = stash
+                _replace_claude_cred(full, destination)
     except Exception:
         # The server rotated the pair but it never reached disk: it is lost.
         _claude_log_refresh(account_name, sent, destination, f"write_failed rt_new={rotated}")
@@ -731,13 +756,13 @@ def _claude_access_token(cred_path, errors):
         return access
     directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
     if os.path.isdir(directory) and not _claude_is_live(source):
-        access = _claude_refresh_stash(cred_path)
+        access = _claude_refresh_stash(cred_path, errors)
         if access is not None:
             return access
-    return _claude_refresh_live(cred_path)
+    return _claude_refresh_live(cred_path, errors)
 
 
-def _claude_refresh_live(cred_path):
+def _claude_refresh_live(cred_path, errors):
     """Refresh the live pair, the one Claude Code itself refreshes, only under
     Claude Code's own refresh lock and only if the pair re-read under it is
     still stale: a pair Claude Code rotated meanwhile is used as-is. The
@@ -748,14 +773,14 @@ def _claude_refresh_live(cred_path):
         if not os.path.isdir(directory):
             full, account_name, source = _claude_credential_snapshot(cred_path)
             return (_claude_fresh_access(full)
-                    or _claude_refresh_grant(full, cred_path, account_name, source))
+                    or _claude_refresh_grant(full, cred_path, account_name, source, errors))
         with _claude_accounts_lock(directory), _lock_heartbeat(os.path.join(directory, ".lock")):
             full, account_name, source = _claude_snapshot_locked(directory, cred_path)
             return (_claude_fresh_access(full)
-                    or _claude_refresh_grant(full, cred_path, account_name, source))
+                    or _claude_refresh_grant(full, cred_path, account_name, source, errors))
 
 
-def _claude_refresh_stash(cred_path):
+def _claude_refresh_stash(cred_path, errors):
     """Refresh a stash with the accounts lock held across re-read, POST and
     persist, so a contender that waited re-reads the rotated pair instead of
     spending the consumed refresh token. None when the pair is now live."""
@@ -767,7 +792,7 @@ def _claude_refresh_stash(cred_path):
             return access
         if _claude_is_live(source):
             return None
-        return _claude_refresh_grant(full, cred_path, account_name, source)
+        return _claude_refresh_grant(full, cred_path, account_name, source, errors)
 
 
 def _token_fingerprint(token):
@@ -794,7 +819,7 @@ def _claude_log_refresh(account_name, sent, destination, outcome):
         pass
 
 
-def _claude_refresh_grant(full, cred_path, account_name, source):
+def _claude_refresh_grant(full, cred_path, account_name, source, errors):
     """POST the stored refresh token and persist the rotated pair. Every
     attempt is logged; one that fails without an HTTP status may still have
     reached the server and spent the token, so it is logged as unknown."""
@@ -828,7 +853,7 @@ def _claude_refresh_grant(full, cred_path, account_name, source):
     except Exception:
         _claude_log_refresh(account_name, refresh, source, "unknown")
         raise
-    return _persist_claude_cred(full, resp, cred_path, account_name, refresh)
+    return _persist_claude_cred(full, resp, cred_path, account_name, refresh, errors)
 
 
 def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=None):
