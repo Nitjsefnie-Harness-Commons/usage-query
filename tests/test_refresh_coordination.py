@@ -1,11 +1,14 @@
 """Concurrent refreshes of one single-use refresh token spend it once."""
+import hashlib
 import io
 import json
 import os
+import re
 import sys
 import threading
 import time
 import urllib.error
+from datetime import datetime, timezone
 import urllib.parse
 from pathlib import Path
 from unittest import mock
@@ -388,6 +391,65 @@ def test_claude_codes_lock_keeps_its_mtime_fresh_across_the_request(tmp):
 
         with posting(http, renewed):
             assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
+
+
+LOG_LINE = re.compile(r"^(\S+) pid=(\d+) op=refresh account=(\S+) rt=(\S+) file=(.+) outcome=(.+)$")
+
+
+def fp(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10]
+
+
+def log_lines(accounts, *secrets):
+    """Parsed accounts.log lines; no token may appear in the file."""
+    text = (accounts / "accounts.log").read_text(encoding="utf-8")
+    for secret in secrets:
+        assert secret not in text, "a token was logged"
+    lines = []
+    for raw in text.splitlines():
+        match = LOG_LINE.match(raw)
+        assert match, raw
+        when, pid, account, sent, destination, outcome = match.groups()
+        stamp = datetime.fromisoformat(when)
+        assert stamp.utcoffset() == timezone.utc.utcoffset(None), when
+        assert abs(stamp.timestamp() - time.time()) < 60, when
+        assert int(pid) == os.getpid()
+        lines.append((account, sent, destination, outcome))
+    return lines
+
+
+def test_every_claude_refresh_attempt_is_logged_by_fingerprint(tmp):
+    timeout = TimeoutError("timed out")
+    cases = (
+        ("live-ok", "alpha", LIVE_REFRESH["live-token-refresh"], "ok rt_new=" + fp("new-refresh")),
+        ("stash-ok", "beta", {"access_token": "new-access", "refresh_token": "new-refresh",
+                              "expires_in": 3600}, "ok rt_new=" + fp("new-refresh")),
+        ("live-http", "alpha", urllib.error.HTTPError("u", 400, "Bad Request", {},
+                                                      io.BytesIO(b'{"error": "invalid_grant"}')), "http 400"),
+        ("live-timeout", "alpha", timeout, "unknown"),
+        ("live-reset", "alpha", urllib.error.URLError(ConnectionResetError("reset")), "unknown"),
+    )
+    for case, name, answer, outcome in cases:
+        home = os.path.join(tmp, case)
+        os.makedirs(home)
+        sent = "live-token-refresh" if name == "alpha" else "beta-token-refresh"
+        with setup(home, {"new-access": 25}, {sent: answer}) as (mod, accounts, _):
+            install(accounts, beta_stale=True)
+            credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+            path = mod.CLAUDE_CRED if name == "alpha" else str(accounts / "beta.json")
+            try:
+                mod._claude_access_token(path, {})
+            except Exception:  # noqa: BLE001  the failing cases raise; the log is the subject
+                assert not outcome.startswith("ok"), case
+            got = log_lines(accounts, "live-token", "beta-token", "new-refresh", "new-access")
+            assert got == [(name, fp(sent), path, outcome)], (case, got)
+
+
+def test_no_accounts_directory_means_no_refresh_log(tmp):
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, _):
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
+        assert not accounts.exists(), "the log created the accounts directory"
 
 
 if __name__ == "__main__":
