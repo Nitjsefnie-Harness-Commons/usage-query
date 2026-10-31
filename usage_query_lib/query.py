@@ -474,6 +474,10 @@ CLAUDE_CODE_LOCK_WAIT = 30
 CLAUDE_STORAGE_LOCK_STALE = 15
 
 
+class _LockTimeout(TimeoutError):
+    """A lock still held by someone else at its deadline: nothing was spent."""
+
+
 @contextmanager
 def _lock_heartbeat(*paths):
     """Keep the mtime of each held lock path fresh until the block exits."""
@@ -533,7 +537,7 @@ def _claude_code_refresh_lock():
                 break
             os.rmdir(current)
         if time.monotonic() >= deadline:
-            raise TimeoutError(
+            raise _LockTimeout(
                 f"Claude Code's refresh lock ({current}) was not acquired within "
                 f"{CLAUDE_CODE_LOCK_WAIT} s: another process is refreshing the live token")
         time.sleep(0.1)
@@ -556,7 +560,7 @@ def _claude_storage_write_lock():
     deadline = time.monotonic() + CLAUDE_CODE_LOCK_WAIT
     while not _mkdir_lock(path, CLAUDE_STORAGE_LOCK_STALE):
         if time.monotonic() >= deadline:
-            raise TimeoutError(
+            raise _LockTimeout(
                 f"Claude Code's credential write lock ({path}) was not acquired "
                 f"within {CLAUDE_CODE_LOCK_WAIT} s")
         time.sleep(0.1)
@@ -594,7 +598,7 @@ def _exclusive_lock(path, what):
                 continue
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
     else:
-        raise TimeoutError(f"{what} lock was not acquired within 30 s")
+        raise _LockTimeout(f"{what} lock was not acquired within 30 s")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(f"{os.getpid()} {time.time()}\n")
@@ -856,7 +860,7 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
     if data is None:
         try:
             token = _claude_access_token(cred_path, errors)
-        except (_ClaudeSwapPending, TimeoutError):
+        except (_ClaudeSwapPending, _LockTimeout):
             # A pending swap or a lock (Claude Code's or the accounts one)
             # still held at its deadline: no refresh this run, serve the cache.
             if stale is None:

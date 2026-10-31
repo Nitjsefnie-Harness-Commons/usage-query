@@ -551,6 +551,25 @@ def test_live_write_replaces_an_older_pair_written_after_our_read(tmp):
         assert (oauth["accessToken"], oauth["refreshToken"]) == ("new-access", "new-refresh"), oauth
 
 
+def test_a_response_read_timeout_stays_an_account_error(tmp):
+    # A read timeout after the request was sent may have spent the token: it
+    # is no lock timeout, so it is reported, not hidden behind the cache.
+    payload = {"five_hour": {"utilization": 7, "resets_at": None},
+               "seven_day": {"utilization": 8, "resets_at": None}}
+    with setup(tmp, {}, {"live-token-refresh": TimeoutError("The read operation timed out")}) as (mod, accounts, _):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        Path(mod.CACHE).write_text(json.dumps({"fetched_at": time.time() - 600, "data": payload}),
+                                   encoding="utf-8")
+        try:
+            got = mod.query_claude(errors={})
+        except TimeoutError as exc:
+            assert "read operation" in str(exc), exc
+        else:
+            raise AssertionError(f"a spent-token timeout was served from the cache: {got}")
+        assert [line[3] for line in log_lines(accounts)] == ["unknown"]
+
+
 def test_live_write_waits_for_claude_codes_storage_lock_and_rereads(tmp):
     with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, _):
         install(accounts)
