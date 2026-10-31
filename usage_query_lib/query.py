@@ -829,8 +829,9 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
     raises. A fresh cache is used as-is; otherwise we fetch live (retrying a
     transient 429). If the live fetch still fails, we fall back to the last cached
     payload however stale, tagged with '_stale_age' (seconds) so the caller can
-    label it — better a known-old number than an error. Pending swaps use the
-    last cached reading for every Claude account, or raise if none exists."""
+    label it — better a known-old number than an error. Pending swaps and a
+    refresh lock still held at its deadline use the last cached reading the
+    same way, or raise if none exists."""
     cred_path = cred_path or CLAUDE_CRED
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
@@ -852,7 +853,9 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
     if data is None:
         try:
             token = _claude_access_token(cred_path, errors)
-        except _ClaudeSwapPending:
+        except (_ClaudeSwapPending, TimeoutError):
+            # A pending swap or a lock (Claude Code's or the accounts one)
+            # still held at its deadline: no refresh this run, serve the cache.
             if stale is None:
                 raise
             data, age = stale
