@@ -130,6 +130,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -450,10 +451,41 @@ def _claude_account_name(cred_path):
     return name if name and os.path.isfile(os.path.join(directory, name + ".json")) else None
 
 
+# Seconds between mtime touches of a lock held across a network call, well
+# inside the 30 s stale-reclaim age, so no contender reclaims a live holder.
+LOCK_HEARTBEAT = 5
+
+
 @contextmanager
+def _lock_heartbeat(*paths):
+    """Keep the mtime of each held lock path fresh until the block exits."""
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(LOCK_HEARTBEAT):
+            for path in paths:
+                try:
+                    os.utime(path)
+                except OSError:
+                    pass
+
+    thread = threading.Thread(target=beat, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+
+
 def _claude_accounts_lock(directory):
     """Take the shared accounts lock, reclaiming a stale file once."""
-    path = os.path.join(directory, ".lock")
+    return _exclusive_lock(os.path.join(directory, ".lock"), "Claude accounts")
+
+
+@contextmanager
+def _exclusive_lock(path, what):
+    """Take an O_EXCL lock file, reclaiming one older than 30 s once."""
     deadline = time.monotonic() + 30
     removed_stale = False
     while time.monotonic() < deadline:
@@ -470,7 +502,7 @@ def _claude_accounts_lock(directory):
                 continue
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
     else:
-        raise TimeoutError("Claude accounts lock was not acquired within 30 s")
+        raise TimeoutError(f"{what} lock was not acquired within 30 s")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(f"{os.getpid()} {time.time()}\n")
@@ -809,12 +841,27 @@ def _kimi_access_token():
     valid (no network); otherwise refreshes from the refresh_token AND persists
     the rotated tokens back to the credential file (single-use grant — see module
     docstring), then returns the fresh access token."""
-    with open(KIMI_CRED, encoding="utf-8") as f:
-        cred = json.load(f)
-    access = cred.get("access_token") or ""
-    expires_at = float(cred.get("expires_at") or 0)
-    if access and expires_at - time.time() > KIMI_EXPIRY_MARGIN:
+    def read():
+        with open(KIMI_CRED, encoding="utf-8") as f:
+            cred = json.load(f)
+        access = cred.get("access_token") or ""
+        expires_at = float(cred.get("expires_at") or 0)
+        live = access and expires_at - time.time() > KIMI_EXPIRY_MARGIN
+        return cred, access if live else None
+
+    cred, access = read()
+    if access:
         return access
+    # usage-query's own contenders serialize here and re-read, so a loser
+    # reuses the winner's rotated pair instead of spending the consumed one.
+    lock = KIMI_CRED + ".usage-query.lock"
+    with _exclusive_lock(lock, "Kimi refresh"), _lock_heartbeat(lock):
+        cred, access = read()
+        return access or _kimi_refresh(cred)
+
+
+def _kimi_refresh(cred):
+    """Run the Kimi refresh grant and persist the rotated pair."""
     refresh = cred.get("refresh_token")
     if not refresh:
         raise RuntimeError("Kimi access token expired and no refresh_token present")
@@ -1506,7 +1553,22 @@ def _persist_codex_cred(full, resp):
 
 def _codex_refresh(full):
     """Run codex's refresh grant and persist the rotated set; returns the fresh
-    access token."""
+    access token. usage-query's own contenders serialize on a lock beside
+    auth.json and re-read it: an access token another one rotated in since
+    `full` was read is used instead of spending the consumed refresh token."""
+    lock = CODEX_AUTH + ".usage-query.lock"
+    with _exclusive_lock(lock, "Codex refresh"), _lock_heartbeat(lock):
+        sent = (full.get("tokens") or {}).get("access_token")
+        full = _codex_auth()
+        access = (full.get("tokens") or {}).get("access_token")
+        exp = _jwt_expiry(access or "")
+        if access and access != sent and (
+                exp is None or exp - time.time() > CODEX_EXPIRY_MARGIN):
+            return access
+        return _codex_refresh_locked(full)
+
+
+def _codex_refresh_locked(full):
     refresh = (full.get("tokens") or {}).get("refresh_token")
     if not refresh:
         raise RuntimeError(
