@@ -693,11 +693,14 @@ def _persist_claude_cred(full, resp, cred_path, account_name, sent):
     unidentified_live = live is None and os.path.abspath(cred_path) == os.path.abspath(CLAUDE_CRED)
     destination = (CLAUDE_CRED if account_name is None or account_name == live or unidentified_live
                    else os.path.join(directory, account_name + ".json"))
+    rotated = _token_fingerprint(oa["refreshToken"])
     try:
         _write_claude_cred(full, destination)
-    finally:
-        _claude_log_refresh(account_name, sent, destination,
-                            f"ok rt_new={_token_fingerprint(oa['refreshToken'])}")
+    except Exception:
+        # The server rotated the pair but it never reached disk: it is lost.
+        _claude_log_refresh(account_name, sent, destination, f"write_failed rt_new={rotated}")
+        raise
+    _claude_log_refresh(account_name, sent, destination, f"ok rt_new={rotated}")
     return oa["accessToken"]
 
 

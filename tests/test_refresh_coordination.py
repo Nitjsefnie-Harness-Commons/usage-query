@@ -448,6 +448,33 @@ def test_every_claude_refresh_attempt_is_logged_by_fingerprint(tmp):
             assert got == [(name, fp(sent), os.path.normpath(path), outcome)], (case, got)
 
 
+def test_a_failed_write_logs_the_lost_rotation_not_ok(tmp):
+    for name in ("alpha", "beta"):
+        home = os.path.join(tmp, name)
+        os.makedirs(home)
+        sent = "live-token-refresh" if name == "alpha" else "beta-token-refresh"
+        with setup(home, {}, {sent: LIVE_REFRESH["live-token-refresh"]}) as (mod, accounts, _):
+            install(accounts, beta_stale=True)
+            credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+            path = mod.CLAUDE_CRED if name == "alpha" else str(accounts / "beta.json")
+            real_replace = os.replace
+
+            def replace(src, dst, path=path):
+                if os.path.normpath(dst) == os.path.normpath(path):
+                    raise OSError("disk full")
+                return real_replace(src, dst)
+
+            with mock.patch.object(mod.os, "replace", side_effect=replace):
+                try:
+                    mod._claude_access_token(path, {})
+                except OSError:
+                    pass
+                else:
+                    raise AssertionError("a failed write reported success")
+            got = log_lines(accounts, "live-token", "beta-token", "new-refresh", "new-access")
+            assert got == [(name, fp(sent), os.path.normpath(path), "write_failed rt_new=" + fp("new-refresh"))], (name, got)
+
+
 def test_no_accounts_directory_means_no_refresh_log(tmp):
     with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, _):
         credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
