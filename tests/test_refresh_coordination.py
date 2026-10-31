@@ -15,6 +15,7 @@ from unittest import mock
 
 import _util
 from test_claude_accounts import credentials, install, setup
+from test_claude_accounts_lock import on_lock_entry, swap
 from test_usage_query_oauth import _FakeResponse, _fake_jwt, _wham_payload, _write_codex_auth, _write_kimi_cred
 
 USAGE_QUERY = os.path.join(_util.SCRIPTS, "query.py")
@@ -522,6 +523,57 @@ def test_live_write_waits_for_claude_codes_storage_lock_and_rereads(tmp):
         data = live_oauth(mod)
         assert data["mcpOAuth"] == {"saved": "under its lock"}, data
         assert data["claudeAiOauth"]["refreshToken"] == "new-refresh"
+
+
+def test_a_swap_cannot_hand_a_live_refreshs_token_to_a_stash_refresh(tmp):
+    # While the live refresh POSTs, a switcher swap (taking the accounts lock)
+    # followed by a refresh of the swapped-out stash would send the same
+    # refresh token again, unless the live refresh holds the accounts lock.
+    with setup(tmp) as (mod, accounts, _):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        beta = (accounts / "beta.json").read_bytes()
+        endpoint = SingleUseEndpoint("live-token-refresh", LIVE_REFRESH["live-token-refresh"], json_token)
+        swapper = {}
+
+        def swap_then_refresh_stash():
+            with mod._claude_accounts_lock(str(accounts)):
+                swap(accounts, "beta", locked=False)
+            return mod._claude_access_token(str(accounts / "alpha.json"), {})
+
+        def on_post():
+            if not swapper:
+                swapper["started"] = True
+                swapper["thread"], swapper["out"] = started(swap_then_refresh_stash)
+
+        endpoint.check = on_post
+        with mock.patch("urllib.request.urlopen", side_effect=endpoint), \
+                mock.patch.object(mod.time, "sleep", side_effect=endpoint.sleep_hook(time.sleep)):
+            live, live_out = started(lambda: mod._claude_access_token(mod.CLAUDE_CRED, {}))
+            live.join(WAIT * 3)
+            swapper["thread"].join(WAIT * 3)
+        assert live_out == {"token": "new-access"}, live_out
+        assert swapper["out"] == {"token": "new-access"}, swapper["out"]
+        assert endpoint.sent == ["live-token-refresh"], endpoint.sent
+        stash = json.loads((accounts / "alpha.json").read_text(encoding="utf-8"))["claudeAiOauth"]
+        assert stash["refreshToken"] == "new-refresh", stash
+        assert Path(mod.CLAUDE_CRED).read_bytes() == beta
+
+
+def test_a_live_refresh_whose_pair_was_swapped_out_refreshes_the_stash(tmp):
+    # A stash path redirected to the live file takes the live route; a swap
+    # before that route's locked re-read leaves the pair in the stash, and the
+    # rotation must land there, not in the new live account's file.
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        beta = (accounts / "beta.json").read_bytes()
+        with on_lock_entry(mod, accounts, 2, lambda a: swap(a, "beta")):
+            assert mod._claude_access_token(str(accounts / "alpha.json"), {}) == "new-access"
+        assert http.calls == [("refresh", "live-token-refresh")]
+        stash = json.loads((accounts / "alpha.json").read_text(encoding="utf-8"))["claudeAiOauth"]
+        assert stash["refreshToken"] == "new-refresh", stash
+        assert Path(mod.CLAUDE_CRED).read_bytes() == beta, "rotation overwrote the new live account"
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import stat
 import subprocess
 import sys
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -20,27 +20,30 @@ def replace_bytes(path, data):
     os.replace(temp, path)
 
 
-def swap(accounts, name):
-    """Model the switcher's locked pair relocation while HTTP is in flight."""
+def swap(accounts, name, locked=True):
+    """Model the switcher's pair relocation. A refresh holds the accounts lock
+    across its POST, so a relocation during the POST is modelled unlocked: a
+    writer outside the lock, which the persistence routing must still follow."""
     lock = accounts / ".lock"
-    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600) if locked else None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(f"{os.getpid()} {time.time()}\n")
+        if fd is not None:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(f"{os.getpid()} {time.time()}\n")
         live = accounts.parent / ".credentials.json"
         old = (accounts / "live").read_text(encoding="utf-8").strip()
         replace_bytes(accounts / f"{old}.json", live.read_bytes())
         replace_bytes(live, (accounts / f"{name}.json").read_bytes())
         replace_bytes(accounts / "live", (name + "\n").encode())
     finally:
-        lock.unlink()
+        if fd is not None:
+            lock.unlink()
 
 
 @contextmanager
-def refreshing(tmp, name="alpha", change=None, allow_held=False, held=None):
-    """`held`: whether the accounts lock is held across the token POST; by
-    default only a stash refresh holds it. The usage GET never does."""
-    held = name != "alpha" if held is None else held
+def refreshing(tmp, name="alpha", change=None, allow_held=False):
+    """Every refresh holds the accounts lock across its token POST; the usage
+    GET never does."""
     old_token = "live-token" if name == "alpha" else "beta-token"
     with setup(tmp, {"new-access": 25, "beta-token": 40}, {
         old_token + "-refresh": {"access_token": "new-access",
@@ -53,9 +56,9 @@ def refreshing(tmp, name="alpha", change=None, allow_held=False, held=None):
 
         def request(req, timeout=None):
             if not allow_held:
-                expect = held and req.full_url == mod.CLAUDE_OAUTH_TOKEN_URL
+                expect = req.full_url == mod.CLAUDE_OAUTH_TOKEN_URL
                 assert lock.exists() == expect, (
-                    "stash refresh POST ran without the accounts lock" if expect
+                    "refresh POST ran without the accounts lock" if expect
                     else "network request held the accounts lock")
             answer = http(req, timeout)
             if req.full_url == mod.CLAUDE_OAUTH_TOKEN_URL and change:
@@ -152,7 +155,7 @@ def on_lock_entry(mod, accounts, entry, action):
 def test_inactive_becomes_live_before_locked_reread_writes_live_file(tmp):
     # Entry 1 is the first snapshot, entry 2 the stash refresh's own lock: a
     # swap between them moves the refresh to the live route.
-    with refreshing(tmp, "beta", held=False) as (mod, accounts, http):
+    with refreshing(tmp, "beta") as (mod, accounts, http):
         old_beta = (accounts / "beta.json").read_bytes()
         old_alpha = Path(mod.CLAUDE_CRED).read_bytes()
         errors = {}
@@ -172,7 +175,7 @@ def test_inactive_becomes_live_without_stash_uses_live_file(tmp):
         swap(accounts, "beta")
         (accounts / "beta.json").unlink()
 
-    with refreshing(tmp, "beta", held=False) as (mod, accounts, _):
+    with refreshing(tmp, "beta") as (mod, accounts, _):
         errors = {}
         with on_lock_entry(mod, accounts, 2, swap_and_remove_stash):
             got = query(mod, accounts, "beta", errors)
@@ -181,8 +184,8 @@ def test_inactive_becomes_live_without_stash_uses_live_file(tmp):
         assert not (accounts / "beta.json").exists(), "live pair was written to a recreated stash"
 
 
-def test_live_swapped_out_during_refresh_writes_original_accounts_stash(tmp):
-    with refreshing(tmp, change=lambda accounts: swap(accounts, "beta")) as (mod, accounts, http):
+def test_live_swapped_out_by_an_unlocked_writer_during_refresh_writes_original_accounts_stash(tmp):
+    with refreshing(tmp, change=lambda accounts: swap(accounts, "beta", locked=False)) as (mod, accounts, http):
         beta = (accounts / "beta.json").read_bytes()
         errors = {}
         got = query(mod, accounts, "alpha", errors)
@@ -228,7 +231,7 @@ def test_live_marker_lost_during_refresh_still_updates_live_file(tmp):
 
 def test_swapped_in_account_without_stash_is_not_overwritten(tmp):
     def swap_and_remove_stash(accounts):
-        swap(accounts, "beta")
+        swap(accounts, "beta", locked=False)
         (accounts / "beta.json").unlink()
 
     with refreshing(tmp, change=swap_and_remove_stash) as (mod, accounts, _):
@@ -262,10 +265,11 @@ def test_swap_between_marker_and_credential_read_cannot_misidentify_pair(tmp):
             return original_open(path, *args, **kwargs)
 
         def request(req, timeout=None):
-            assert not (accounts / ".lock").exists(), "snapshot lock extended across HTTP"
-            if req.full_url == mod.CLAUDE_OAUTH_TOKEN_URL and deferred:
+            posting = req.full_url == mod.CLAUDE_OAUTH_TOKEN_URL
+            assert (accounts / ".lock").exists() == posting, "accounts lock not held exactly across the POST"
+            if posting and deferred:
                 deferred.clear()
-                swap(accounts, "beta")
+                swap(accounts, "beta", locked=False)
             return http(req, timeout)
 
         errors = {}
@@ -343,68 +347,6 @@ def test_snapshot_lock_deadline_does_not_refresh(tmp):
             assert {p.name: p.read_bytes() for p in accounts.glob("*.json")} == stashes
             assert not list(accounts.glob("*.tmp"))
         assert http.calls == [], "snapshot timeout spent a refresh token"
-
-
-def test_persist_lock_timeout_saves_refreshed_pair_without_lock(tmp):
-    with ExitStack() as holders:
-        children = []
-
-        def hold(accounts):
-            children.append(holders.enter_context(held_by_process(accounts / ".lock")))
-
-        with refreshing(tmp, change=hold, allow_held=True) as (mod, accounts, http):
-            stash = (accounts / "alpha.json").read_bytes()
-            clock = [0.0]
-
-            def sleep(seconds):
-                assert 0 < seconds <= 0.1
-                clock[0] += seconds
-
-            errors = {}
-            with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
-                    mock.patch.object(mod.time, "sleep", side_effect=sleep):
-                got = query(mod, accounts, "alpha", errors)
-            assert got["five_hour"]["pct"] == 25
-            assert set(errors) == {"claude:alpha"}
-            assert "lock" in errors["claude:alpha"].lower()
-            assert clock[0] >= 30
-            assert children[0].poll() is None
-            assert_new_pair(Path(mod.CLAUDE_CRED))
-            assert (accounts / "alpha.json").read_bytes() == stash
-            assert http.calls == [("refresh", "live-token-refresh"), ("usage", "Bearer new-access")]
-
-
-def test_persist_lock_timeout_rereads_marker_and_saves_original_account(tmp):
-    with ExitStack() as holders:
-        children = []
-
-        def hold_after_swap(accounts):
-            children.append(holders.enter_context(held_by_process(accounts / ".lock")))
-
-        with refreshing(tmp, change=hold_after_swap, allow_held=True) as (mod, accounts, _):
-            beta = (accounts / "beta.json").read_bytes()
-            clock = [0.0]
-            swapped = []
-
-            def sleep(seconds):
-                assert 0 < seconds <= 0.1
-                if not swapped:
-                    children[0].stdin.write("swap beta\n")
-                    children[0].stdin.flush()
-                    assert children[0].stdout.readline().strip() == "swapped"
-                    swapped.append(True)
-                clock[0] += seconds
-
-            errors = {}
-            with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
-                    mock.patch.object(mod.time, "sleep", side_effect=sleep):
-                got = query(mod, accounts, "alpha", errors)
-            assert got["five_hour"]["pct"] == 25
-            assert set(errors) == {"claude:alpha"}
-            assert clock[0] >= 30 and children[0].poll() is None and swapped
-            assert_new_pair(accounts / "alpha.json")
-            assert Path(mod.CLAUDE_CRED).read_bytes() == beta, "timeout fallback overwrote the new live account"
-            assert (accounts / "live").read_text(encoding="utf-8").strip() == "beta"
 
 
 def test_stale_lock_is_removed_and_refresh_persists(tmp):

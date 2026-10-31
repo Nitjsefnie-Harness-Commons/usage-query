@@ -55,28 +55,27 @@ the reading's optional `_scoped` list, in the same shape as
 `usage.claude._scoped`; readings without scoped limits omit that key.
 Inactive accounts use
 their stash's token, refreshing stale credentials atomically into that same
-account's current credential file with mode `0600`. A stash refresh holds
-`accounts/.lock` across re-reading the stash, the token request and the write,
-so a second run waiting on the lock re-reads the rotated pair instead of sending
-the spent refresh token; if a swap made the account live meanwhile, the refresh
-moves to the live route. A live refresh runs under Claude Code's own refresh
-lock instead, taken the way Claude Code takes it: the directories
-`~/.claude/.oauth_refresh.lock` and then `~/.claude.lock`, each reclaimed once
-its modification time is over 60 seconds old and touched every 5 seconds while
-held, waiting up to 30 seconds. Under that lock it re-reads the credentials and
-uses a pair Claude Code rotated meanwhile instead of refreshing. Every write
-to `.credentials.json` takes Claude Code's credential write lock
-(`~/.claude/.storage-write.lock`, reclaimed after 15 seconds), re-reads the
-file under it, and replaces only its `claudeAiOauth` entry, so keys another
-writer saved meanwhile (MCP OAuth tokens, for one) are kept. Its token
-request runs without the accounts lock; its persistence takes `accounts/.lock`, re-reads `live`, and
-writes to `.credentials.json` if the account is still live, or its stash
-otherwise. The query also takes a brief lock to read the account name
-and credentials together before HTTP. Lock acquisition retries for up to 30 seconds and reclaims a lock
-whose modification time is older than 30 seconds. A snapshot-lock timeout stops
-the query before a refresh grant. If the persistence lock times out after a
-refresh, the command re-reads the marker without the lock, atomically writes the
-rotated pair to the current destination anyway, and records an account error.
+account's current credential file with mode `0600`. Every Claude refresh holds
+`accounts/.lock` (when the accounts directory exists) across re-reading the
+credentials, the token request and the write, so neither a second run nor a
+swap can send a refresh token that is being spent; a run that waited re-reads
+the rotated pair instead. The write follows the `live` marker re-read under that
+lock: `.credentials.json` if the account is live, its stash otherwise. A stash
+that a swap made live meanwhile is refreshed on the live route. A live refresh
+also runs under Claude Code's own refresh lock, taken first and the way Claude
+Code takes it: the directories `~/.claude/.oauth_refresh.lock` and then
+`~/.claude.lock`, each reclaimed once its modification time is over 60 seconds
+old and touched every 5 seconds while held, waiting up to 30 seconds. Under
+that lock it re-reads the credentials and uses a pair Claude Code rotated
+meanwhile instead of refreshing. Every write to `.credentials.json` takes Claude
+Code's credential write lock (`~/.claude/.storage-write.lock`, reclaimed after
+15 seconds), re-reads the file under it, and replaces only its `claudeAiOauth`
+entry, so keys another writer saved meanwhile (MCP OAuth tokens, for one) are
+kept. The query also takes a brief lock to read the account name and
+credentials together before HTTP. Accounts-lock acquisition retries for up to
+30 seconds and reclaims a lock whose modification time is older than 30
+seconds; a held lock's modification time is touched every 5 seconds. A lock
+timeout stops the query before a refresh grant.
 An unidentified live account's refreshed pair goes to `.credentials.json`.
 Every Claude refresh attempt appends one line to `accounts/accounts.log` when
 the accounts directory exists, in the switcher's format: UTC time, pid,
