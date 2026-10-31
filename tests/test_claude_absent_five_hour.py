@@ -28,11 +28,13 @@ def test_null_five_hour_without_session_limit_is_absent_everywhere(tmp):
             rc, raw, err = run(mod, "--json")
         got = json.loads(raw)
         assert rc == 0 and err == "" and got["errors"] == {}, (rc, raw, err)
-        assert "five_hour" not in got["usage"]["claude"], got["usage"]["claude"]
+        # Absent means the key is omitted, never present as null.
+        assert set(got["usage"]["claude"]) == {"weekly"}, got["usage"]["claude"]
         assert got["usage"]["claude"]["weekly"]["pct"] == 11
-        for name in ("alpha", "beta"):
-            assert "five_hour" not in got["claude_accounts"][name], got["claude_accounts"][name]
-            assert "weekly" in got["claude_accounts"][name]
+        for name, live in (("alpha", True), ("beta", False)):
+            entry = got["claude_accounts"][name]
+            assert set(entry) == {"live", "weekly"}, entry
+            assert entry["live"] is live
         os.remove(mod.CACHE)
         for cache in accounts.glob(".*.usage-cache"):
             cache.unlink()
