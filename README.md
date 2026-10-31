@@ -55,10 +55,14 @@ the reading's optional `_scoped` list, in the same shape as
 `usage.claude._scoped`; readings without scoped limits omit that key.
 Inactive accounts use
 their stash's token, refreshing stale credentials atomically into that same
-account's current credential file with mode `0600`. Refresh HTTP requests run
-without holding the accounts lock. Persistence takes `accounts/.lock`, re-reads
-`live`, and writes to `.credentials.json` if the account is now live, or its
-stash otherwise. The query also takes a brief lock to read the account name
+account's current credential file with mode `0600`. A stash refresh holds
+`accounts/.lock` across re-reading the stash, the token request and the write,
+so a second run waiting on the lock re-reads the rotated pair instead of sending
+the spent refresh token; if a swap made the account live meanwhile, the refresh
+moves to the live route. A live refresh's token request runs without the
+accounts lock; its persistence takes `accounts/.lock`, re-reads `live`, and
+writes to `.credentials.json` if the account is still live, or its stash
+otherwise. The query also takes a brief lock to read the account name
 and credentials together before HTTP. Lock acquisition retries for up to 30 seconds and reclaims a lock
 whose modification time is older than 30 seconds. A snapshot-lock timeout stops
 the query before a refresh grant. If the persistence lock times out after a

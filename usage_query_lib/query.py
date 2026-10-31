@@ -516,28 +516,33 @@ class _ClaudeSwapPending(RuntimeError):
 
 
 def _claude_credential_snapshot(cred_path):
-    """Bind identity and credentials under a brief lock before any HTTP."""
+    """(credentials, account name, file read), bound under a brief lock."""
     directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
     if not os.path.isdir(directory):
         with open(cred_path, encoding="utf-8") as stream:
-            return json.load(stream), None
+            return json.load(stream), None, cred_path
     with _claude_accounts_lock(directory):
-        try:
-            with open(os.path.join(directory, "state.json"), encoding="utf-8") as stream:
-                state = json.load(stream)
-        except FileNotFoundError:
-            state = {}
-        if "pending" in state:
-            raise _ClaudeSwapPending("Claude reading paused while an account swap is pending")
-        account_name = _claude_account_name(cred_path)
-        source = cred_path
-        if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
-            with open(os.path.join(directory, "live"), encoding="utf-8") as stream:
-                live = stream.read().strip()
-            if account_name == live:
-                source = CLAUDE_CRED
-        with open(source, encoding="utf-8") as stream:
-            return json.load(stream), account_name
+        return _claude_snapshot_locked(directory, cred_path)
+
+
+def _claude_snapshot_locked(directory, cred_path):
+    """The snapshot itself; the caller holds the accounts lock."""
+    try:
+        with open(os.path.join(directory, "state.json"), encoding="utf-8") as stream:
+            state = json.load(stream)
+    except FileNotFoundError:
+        state = {}
+    if "pending" in state:
+        raise _ClaudeSwapPending("Claude reading paused while an account swap is pending")
+    account_name = _claude_account_name(cred_path)
+    source = cred_path
+    if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
+        with open(os.path.join(directory, "live"), encoding="utf-8") as stream:
+            live = stream.read().strip()
+        if account_name == live:
+            source = CLAUDE_CRED
+    with open(source, encoding="utf-8") as stream:
+        return json.load(stream), account_name, source
 
 
 def _write_claude_cred(full, cred_path):
@@ -560,8 +565,9 @@ def _write_claude_cred(full, cred_path):
                 pass
 
 
-def _persist_claude_cred(full, resp, cred_path, account_name, errors):
-    """Save every rotation, falling back to an unlocked write on timeout."""
+def _persist_claude_cred(full, resp, cred_path, account_name, errors, locked=False):
+    """Save every rotation, falling back to an unlocked write on timeout.
+    `locked` means the caller already holds the accounts lock."""
     oa = full["claudeAiOauth"]
     if resp.get("access_token"):
         oa["accessToken"] = resp["access_token"]
@@ -581,6 +587,9 @@ def _persist_claude_cred(full, resp, cred_path, account_name, errors):
                        else os.path.join(directory, account_name + ".json"))
         _write_claude_cred(full, destination)
 
+    if locked:
+        write_current()
+        return oa["accessToken"]
     try:
         with _claude_accounts_lock(directory):
             write_current()
@@ -592,15 +601,70 @@ def _persist_claude_cred(full, resp, cred_path, account_name, errors):
     return oa["accessToken"]
 
 
-def _claude_access_token(cred_path, errors):
-    """Use a consistent snapshot and persist every refreshed token pair."""
-    full, account_name = _claude_credential_snapshot(cred_path)
+def _claude_fresh_access(full):
+    """The stored access token while it is outside the expiry margin, else None."""
     oa = full.get("claudeAiOauth") or {}
     access = oa.get("accessToken") or ""
     expires_at = float(oa.get("expiresAt") or 0) / 1000.0  # stored in ms
-    if access and expires_at - time.time() > CLAUDE_EXPIRY_MARGIN:
+    return access if access and expires_at - time.time() > CLAUDE_EXPIRY_MARGIN else None
+
+
+def _claude_is_live(source):
+    return os.path.abspath(source) == os.path.abspath(CLAUDE_CRED)
+
+
+def _claude_access_token(cred_path, errors):
+    """A usable access token, refreshing a stale pair on the route that owns it.
+
+    The live pair and a stash are refreshed under different locks; a route
+    answers None when a swap moved the pair to the other one while it waited.
+    """
+    full, _, source = _claude_credential_snapshot(cred_path)
+    access = _claude_fresh_access(full)
+    if access:
         return access
-    refresh = oa.get("refreshToken")
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    routes = (_claude_refresh_live, _claude_refresh_stash)
+    if os.path.isdir(directory) and not _claude_is_live(source):
+        routes = routes[::-1]
+    for route in routes:
+        access = route(cred_path, errors)
+        if access is not None:
+            return access
+    raise RuntimeError("Claude account moved between the live file and its stash "
+                       "during refresh; retry")
+
+
+def _claude_refresh_live(cred_path, errors):
+    """Refresh the pair in the live credentials file."""
+    full, account_name, source = _claude_credential_snapshot(cred_path)
+    access = _claude_fresh_access(full)
+    if access:
+        return access
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    if os.path.isdir(directory) and not _claude_is_live(source):
+        return None
+    return _claude_refresh_grant(full, cred_path, account_name, errors)
+
+
+def _claude_refresh_stash(cred_path, errors):
+    """Refresh a stash with the accounts lock held across re-read, POST and
+    persist, so a contender that waited re-reads the rotated pair instead of
+    spending the consumed refresh token."""
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    with _claude_accounts_lock(directory), _lock_heartbeat(os.path.join(directory, ".lock")):
+        full, account_name, source = _claude_snapshot_locked(directory, cred_path)
+        access = _claude_fresh_access(full)
+        if access:
+            return access
+        if _claude_is_live(source):
+            return None
+        return _claude_refresh_grant(full, cred_path, account_name, errors, locked=True)
+
+
+def _claude_refresh_grant(full, cred_path, account_name, errors, locked=False):
+    """POST the stored refresh token and persist the rotated pair."""
+    refresh = (full.get("claudeAiOauth") or {}).get("refreshToken")
     if not refresh:
         raise RuntimeError("Claude access token expired and no refreshToken present")
     body = json.dumps({
@@ -626,7 +690,7 @@ def _claude_access_token(cred_path, errors):
             f"Claude token refresh failed (HTTP {e.code}). The harness normally "
             "refreshes this token on its own activity — send Claude a message and "
             f"retry, or re-login if it persists. {detail}") from e
-    return _persist_claude_cred(full, resp, cred_path, account_name, errors)
+    return _persist_claude_cred(full, resp, cred_path, account_name, errors, locked)
 
 
 def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=None):

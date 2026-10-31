@@ -37,7 +37,10 @@ def swap(accounts, name):
 
 
 @contextmanager
-def refreshing(tmp, name="alpha", change=None, allow_held=False):
+def refreshing(tmp, name="alpha", change=None, allow_held=False, held=None):
+    """`held`: whether the accounts lock is held across the token POST; by
+    default only a stash refresh holds it. The usage GET never does."""
+    held = name != "alpha" if held is None else held
     old_token = "live-token" if name == "alpha" else "beta-token"
     with setup(tmp, {"new-access": 25, "beta-token": 40}, {
         old_token + "-refresh": {"access_token": "new-access",
@@ -50,7 +53,10 @@ def refreshing(tmp, name="alpha", change=None, allow_held=False):
 
         def request(req, timeout=None):
             if not allow_held:
-                assert not lock.exists(), "network request held the accounts lock"
+                expect = held and req.full_url == mod.CLAUDE_OAUTH_TOKEN_URL
+                assert lock.exists() == expect, (
+                    "stash refresh POST ran without the accounts lock" if expect
+                    else "network request held the accounts lock")
             answer = http(req, timeout)
             if req.full_url == mod.CLAUDE_OAUTH_TOKEN_URL and change:
                 change(accounts)
@@ -127,12 +133,31 @@ def test_inactive_stays_inactive_persists_under_lock_to_stash(tmp):
         assert not (accounts / ".lock").exists()
 
 
-def test_inactive_becomes_live_during_refresh_writes_live_file(tmp):
-    with refreshing(tmp, "beta", lambda accounts: swap(accounts, "beta")) as (mod, accounts, http):
+def on_lock_entry(mod, accounts, entry, action):
+    """Run `action` just before the `entry`-th accounts-lock acquisition."""
+    real = mod._claude_accounts_lock
+    count = [0]
+
+    @contextmanager
+    def lock(directory):
+        count[0] += 1
+        if count[0] == entry:
+            action(accounts)
+        with real(directory):
+            yield
+
+    return mock.patch.object(mod, "_claude_accounts_lock", side_effect=lock)
+
+
+def test_inactive_becomes_live_before_locked_reread_writes_live_file(tmp):
+    # Entry 1 is the first snapshot, entry 2 the stash refresh's own lock: a
+    # swap between them moves the refresh to the live route.
+    with refreshing(tmp, "beta", held=False) as (mod, accounts, http):
         old_beta = (accounts / "beta.json").read_bytes()
         old_alpha = Path(mod.CLAUDE_CRED).read_bytes()
         errors = {}
-        got = query(mod, accounts, "beta", errors)
+        with on_lock_entry(mod, accounts, 2, lambda a: swap(a, "beta")):
+            got = query(mod, accounts, "beta", errors)
         assert errors == {} and got["five_hour"]["pct"] == 25
         assert_new_pair(Path(mod.CLAUDE_CRED))
         assert (accounts / "beta.json").read_bytes() == old_beta, "rotation went to inactive snapshot"
@@ -147,9 +172,10 @@ def test_inactive_becomes_live_without_stash_uses_live_file(tmp):
         swap(accounts, "beta")
         (accounts / "beta.json").unlink()
 
-    with refreshing(tmp, "beta", swap_and_remove_stash) as (mod, accounts, _):
+    with refreshing(tmp, "beta", held=False) as (mod, accounts, _):
         errors = {}
-        got = query(mod, accounts, "beta", errors)
+        with on_lock_entry(mod, accounts, 2, swap_and_remove_stash):
+            got = query(mod, accounts, "beta", errors)
         assert errors == {} and got["five_hour"]["pct"] == 25
         assert_new_pair(Path(mod.CLAUDE_CRED))
         assert not (accounts / "beta.json").exists(), "live pair was written to a recreated stash"
