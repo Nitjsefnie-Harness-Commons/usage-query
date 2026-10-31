@@ -82,7 +82,10 @@ api.anthropic.com/v1/oauth/token (NOT platform.claude.com — that host is
 Cloudflare-WAF-gated and 1010-blocks a bare urllib request) with the SDK
 User-Agent, then atomically persist the rotated set back, exactly as Claude Code
 itself does. The harness reads this file as its source of truth, so a valid fresh
-set keeps it working.
+set keeps it working. Because Claude Code refreshes the same pair, this refresh
+holds Claude Code's own cross-process refresh lock (CLAUDE_CODE_LOCK_STALE) and
+re-reads the file under it, so it never spends a refresh token Claude Code has
+already rotated.
 
 Pace ceiling: alongside each utilization %, the output shows the MAX % you could
 be at right now under a constant, linear burn across the whole window — i.e. the
@@ -452,8 +455,18 @@ def _claude_account_name(cred_path):
 
 
 # Seconds between mtime touches of a lock held across a network call, well
-# inside the 30 s stale-reclaim age, so no contender reclaims a live holder.
+# inside every stale-reclaim age below (30 s, 60 s), so no contender reclaims a
+# live holder. Claude Code touches its own refresh lock at the same interval.
 LOCK_HEARTBEAT = 5
+# Claude Code's cross-process refresh lock, taken the way its bundled
+# proper-lockfile takes it (read from the 2.1.316 binary): mkdir of
+# `.oauth_refresh.lock` in its config directory, then of the legacy
+# `<realpath of that directory>.lock`; a held legacy lock makes it release the
+# first and retry. A holder touches each directory's mtime every 5 s and a
+# contender reclaims one older than 60 s. After acquiring, Claude Code re-reads
+# the stored credentials and adopts a pair another process rotated in.
+CLAUDE_CODE_LOCK_STALE = 60
+CLAUDE_CODE_LOCK_WAIT = 30
 
 
 @contextmanager
@@ -476,6 +489,59 @@ def _lock_heartbeat(*paths):
     finally:
         stop.set()
         thread.join()
+
+
+def _mkdir_lock(path):
+    """Create a lock directory, reclaiming a stale one once; False while held."""
+    try:
+        os.mkdir(path)
+        return True
+    except FileExistsError:
+        pass
+    try:
+        if time.time() - os.stat(path).st_mtime <= CLAUDE_CODE_LOCK_STALE:
+            return False
+        os.rmdir(path)
+    except FileNotFoundError:
+        pass
+    try:
+        os.mkdir(path)
+        return True
+    except FileExistsError:
+        return False
+
+
+@contextmanager
+def _claude_code_refresh_lock():
+    """Hold Claude Code's own refresh lock (see CLAUDE_CODE_LOCK_STALE)."""
+    config = os.path.dirname(CLAUDE_CRED)
+    current = os.path.join(config, ".oauth_refresh.lock")
+    legacy = os.path.realpath(config) + ".lock"
+    deadline = time.monotonic() + CLAUDE_CODE_LOCK_WAIT
+    while True:
+        if _mkdir_lock(current):
+            try:
+                legacy_held = _mkdir_lock(legacy)
+            except OSError:
+                legacy_held = None  # Claude Code proceeds without it as well
+            if legacy_held is not False:
+                break
+            os.rmdir(current)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Claude Code's refresh lock ({current}) was not acquired within "
+                f"{CLAUDE_CODE_LOCK_WAIT} s: another process is refreshing the live token")
+        time.sleep(0.1)
+    held = [current] + ([legacy] if legacy_held else [])
+    try:
+        with _lock_heartbeat(*held):
+            yield
+    finally:
+        for path in reversed(held):
+            try:
+                os.rmdir(path)
+            except FileNotFoundError:
+                pass
 
 
 def _claude_accounts_lock(directory):
@@ -636,15 +702,18 @@ def _claude_access_token(cred_path, errors):
 
 
 def _claude_refresh_live(cred_path, errors):
-    """Refresh the pair in the live credentials file."""
-    full, account_name, source = _claude_credential_snapshot(cred_path)
-    access = _claude_fresh_access(full)
-    if access:
-        return access
-    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
-    if os.path.isdir(directory) and not _claude_is_live(source):
-        return None
-    return _claude_refresh_grant(full, cred_path, account_name, errors)
+    """Refresh the live pair, the one Claude Code itself refreshes, only under
+    Claude Code's own refresh lock and only if the pair re-read under it is
+    still stale: a pair Claude Code rotated meanwhile is used as-is."""
+    with _claude_code_refresh_lock():
+        full, account_name, source = _claude_credential_snapshot(cred_path)
+        access = _claude_fresh_access(full)
+        if access:
+            return access
+        directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+        if os.path.isdir(directory) and not _claude_is_live(source):
+            return None
+        return _claude_refresh_grant(full, cred_path, account_name, errors)
 
 
 def _claude_refresh_stash(cred_path, errors):

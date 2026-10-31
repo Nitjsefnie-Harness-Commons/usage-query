@@ -59,8 +59,13 @@ account's current credential file with mode `0600`. A stash refresh holds
 `accounts/.lock` across re-reading the stash, the token request and the write,
 so a second run waiting on the lock re-reads the rotated pair instead of sending
 the spent refresh token; if a swap made the account live meanwhile, the refresh
-moves to the live route. A live refresh's token request runs without the
-accounts lock; its persistence takes `accounts/.lock`, re-reads `live`, and
+moves to the live route. A live refresh runs under Claude Code's own refresh
+lock instead, taken the way Claude Code takes it: the directories
+`~/.claude/.oauth_refresh.lock` and then `~/.claude.lock`, each reclaimed once
+its modification time is over 60 seconds old and touched every 5 seconds while
+held, waiting up to 30 seconds. Under that lock it re-reads the credentials and
+uses a pair Claude Code rotated meanwhile instead of refreshing. Its token
+request runs without the accounts lock; its persistence takes `accounts/.lock`, re-reads `live`, and
 writes to `.credentials.json` if the account is still live, or its stash
 otherwise. The query also takes a brief lock to read the account name
 and credentials together before HTTP. Lock acquisition retries for up to 30 seconds and reclaims a lock
