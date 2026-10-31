@@ -8,8 +8,8 @@ import sys
 import threading
 import time
 import urllib.error
-from datetime import datetime, timezone
 import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
