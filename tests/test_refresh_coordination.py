@@ -414,6 +414,7 @@ def test_claude_codes_lock_keeps_its_mtime_fresh_across_the_request(tmp):
 
         def renewed():
             assert aged_then_touched(*locks), "Claude Code's lock aged toward its 60 s reclaim"
+            assert aged_then_touched(accounts / ".lock"), "the accounts lock aged toward its 30 s reclaim"
 
         with posting(http, renewed):
             assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
