@@ -453,5 +453,76 @@ def test_no_accounts_directory_means_no_refresh_log(tmp):
         assert not accounts.exists(), "the log created the accounts directory"
 
 
+def live_oauth(mod):
+    return json.loads(Path(mod.CLAUDE_CRED).read_text(encoding="utf-8"))
+
+
+def test_live_write_keeps_what_another_writer_added_after_our_read(tmp):
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        storage = Path(mod.CLAUDE_CRED).parent / ".storage-write.lock"
+
+        def other_writer():
+            # Claude Code saving an MCP OAuth token between our read and write.
+            data = live_oauth(mod)
+            data["mcpOAuth"] = {"server": {"accessToken": "mcp-token"}}
+            Path(mod.CLAUDE_CRED).write_text(json.dumps(data), encoding="utf-8")
+
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if Path(dst) == Path(mod.CLAUDE_CRED):
+                assert storage.is_dir(), "live write outside Claude Code's storage lock"
+            return real_replace(src, dst)
+
+        with posting(http, other_writer), mock.patch.object(mod.os, "replace", side_effect=replace):
+            assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
+        data = live_oauth(mod)
+        assert data["mcpOAuth"] == {"server": {"accessToken": "mcp-token"}}, data
+        assert data["claudeAiOauth"]["refreshToken"] == "new-refresh"
+        assert data["keep"] == "outer" and data["claudeAiOauth"]["keep"] == "value"
+        assert not storage.exists()
+
+
+def test_live_write_replaces_an_older_pair_written_after_our_read(tmp):
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+
+        def older_pair():
+            credentials(Path(mod.CLAUDE_CRED), "older", stale=True)
+
+        with posting(http, older_pair):
+            assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
+        oauth = live_oauth(mod)["claudeAiOauth"]
+        assert (oauth["accessToken"], oauth["refreshToken"]) == ("new-access", "new-refresh"), oauth
+
+
+def test_live_write_waits_for_claude_codes_storage_lock_and_rereads(tmp):
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        storage = Path(mod.CLAUDE_CRED).parent / ".storage-write.lock"
+        storage.mkdir()  # Claude Code is mid-write
+        release = threading.Event()
+        waited, sleeping = waiting_on(mod, release)
+        with sleeping:
+            worker, out = started(lambda: mod._claude_access_token(mod.CLAUDE_CRED, {}))
+            assert waited.wait(WAIT), "the live write did not wait on the storage lock"
+            assert live_oauth(mod)["claudeAiOauth"]["refreshToken"] == "live-token-refresh", \
+                "wrote while Claude Code held its storage lock"
+            data = live_oauth(mod)
+            data["mcpOAuth"] = {"saved": "under its lock"}
+            Path(mod.CLAUDE_CRED).write_text(json.dumps(data), encoding="utf-8")
+            storage.rmdir()
+            release.set()
+            worker.join(WAIT)
+        assert out == {"token": "new-access"}, out
+        data = live_oauth(mod)
+        assert data["mcpOAuth"] == {"saved": "under its lock"}, data
+        assert data["claudeAiOauth"]["refreshToken"] == "new-refresh"
+
+
 if __name__ == "__main__":
     sys.exit(_util.runner(_util.collect(globals()), "refreshcoord_"))
