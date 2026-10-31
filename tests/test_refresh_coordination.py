@@ -228,5 +228,167 @@ def test_a_claude_stash_refresh_lock_keeps_its_mtime_fresh_across_the_request(tm
         assert not (accounts / ".lock").exists()
 
 
+def claude_code_locks(mod):
+    config = Path(mod.CLAUDE_CRED).parent
+    return config / ".oauth_refresh.lock", Path(os.path.realpath(config) + ".lock")
+
+
+LIVE_REFRESH = {"live-token-refresh": {"access_token": "new-access",
+                                       "refresh_token": "new-refresh", "expires_in": 3600}}
+
+
+def posting(http, check):
+    """Pass every request to the double, running `check` before a token POST."""
+    def request(req, timeout=None):
+        if req.full_url == http.mod.CLAUDE_OAUTH_TOKEN_URL:
+            check()
+        return http(req, timeout)
+    return mock.patch("urllib.request.urlopen", side_effect=request)
+
+
+def test_live_pair_refreshes_only_under_claude_codes_lock(tmp):
+    # Every route to the live file: the live path itself, a stash path the
+    # snapshot redirects because that stash is live, and no accounts directory.
+    for case in ("live", "redirected-stash", "no-accounts-dir"):
+        home = os.path.join(tmp, case)
+        os.makedirs(home)
+        with setup(home, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+            if case != "no-accounts-dir":
+                install(accounts)
+            credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+            current, legacy = claude_code_locks(mod)
+            path = str(accounts / "alpha.json") if case == "redirected-stash" else mod.CLAUDE_CRED
+
+            def held(current=current, legacy=legacy, case=case):
+                assert current.is_dir() and legacy.is_dir(), f"{case}: POST outside Claude Code's lock"
+
+            with posting(http, held):
+                assert mod._claude_access_token(path, {}) == "new-access", case
+            assert http.calls == [("refresh", "live-token-refresh")], (case, http.calls)
+            assert not current.exists() and not legacy.exists(), case
+            stored = json.loads(Path(mod.CLAUDE_CRED).read_text(encoding="utf-8"))
+            assert stored["claudeAiOauth"]["refreshToken"] == "new-refresh", case
+
+
+def started(call):
+    """Run `call` in a thread; its result or error lands in the returned dict."""
+    out = {}
+
+    def worker():
+        try:
+            out["token"] = call()
+        except Exception as exc:  # noqa: BLE001
+            out["error"] = f"{type(exc).__name__}: {exc}"
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    return thread, out
+
+
+def waiting_on(mod, release):
+    """A time.sleep that reports the first wait and blocks it until released."""
+    waited = threading.Event()
+
+    def sleep(seconds):
+        if not waited.is_set():
+            waited.set()
+            assert release.wait(WAIT), "the test never released the lock"
+    return waited, mock.patch.object(mod.time, "sleep", side_effect=sleep)
+
+
+def test_live_refresh_waits_for_claude_code_and_adopts_its_rotation(tmp):
+    with setup(tmp, {"cc-rotated": 30}, {}) as (mod, accounts, http):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        current, _ = claude_code_locks(mod)
+        current.mkdir()  # Claude Code is mid-refresh
+        release = threading.Event()
+        waited, sleeping = waiting_on(mod, release)
+        with sleeping:
+            worker, out = started(lambda: mod._claude_access_token(mod.CLAUDE_CRED, {}))
+            assert waited.wait(WAIT), "the live refresh did not wait on Claude Code's lock"
+            assert http.calls == [], "POSTed while Claude Code held its lock"
+            credentials(Path(mod.CLAUDE_CRED), "cc-rotated")
+            current.rmdir()
+            release.set()
+            worker.join(WAIT)
+        assert out == {"token": "cc-rotated"}, out
+        assert http.calls == [], "spent the refresh token Claude Code had already rotated"
+        assert not current.exists()
+
+
+def test_live_refresh_waits_while_the_legacy_lock_is_held(tmp):
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        current, legacy = claude_code_locks(mod)
+        legacy.mkdir()  # an older Claude Code holds only the legacy lock
+        release = threading.Event()
+        waited, sleeping = waiting_on(mod, release)
+        with sleeping:
+            worker, out = started(lambda: mod._claude_access_token(mod.CLAUDE_CRED, {}))
+            assert waited.wait(WAIT), "the live refresh did not wait on the legacy lock"
+            assert http.calls == [] and not current.exists(), "held the new lock while the legacy one was busy"
+            legacy.rmdir()
+            release.set()
+            worker.join(WAIT)
+        assert out == {"token": "new-access"}, out
+        assert http.calls == [("refresh", "live-token-refresh")]
+        assert not current.exists() and not legacy.exists()
+
+
+def test_a_stale_claude_code_lock_is_reclaimed_without_waiting(tmp):
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        current, legacy = claude_code_locks(mod)
+        for lock in (current, legacy):
+            lock.mkdir()
+            old = time.time() - mod.CLAUDE_CODE_LOCK_STALE - 1
+            os.utime(lock, (old, old))
+        with mock.patch.object(mod.time, "sleep", side_effect=AssertionError("waited on a stale lock")):
+            assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
+        assert http.calls == [("refresh", "live-token-refresh")]
+        assert not current.exists() and not legacy.exists()
+
+
+def test_a_held_claude_code_lock_times_out_without_a_refresh(tmp):
+    with setup(tmp, {}, {}) as (mod, accounts, http):
+        install(accounts)
+        live = credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        current, _ = claude_code_locks(mod)
+        current.mkdir()
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(mod.time, "sleep", side_effect=sleep):
+            try:
+                mod._claude_access_token(mod.CLAUDE_CRED, {})
+            except TimeoutError as exc:
+                assert "Claude Code" in str(exc), exc
+            else:
+                raise AssertionError("refreshed while Claude Code held its lock")
+        assert clock[0] >= mod.CLAUDE_CODE_LOCK_WAIT
+        assert http.calls == [] and current.is_dir()
+        assert Path(mod.CLAUDE_CRED).read_bytes() == live
+
+
+def test_claude_codes_lock_keeps_its_mtime_fresh_across_the_request(tmp):
+    with setup(tmp, {"new-access": 25}, LIVE_REFRESH) as (mod, accounts, http):
+        install(accounts)
+        credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
+        mod.LOCK_HEARTBEAT = 0.01
+        locks = claude_code_locks(mod)
+
+        def renewed():
+            assert aged_then_touched(*locks), "Claude Code's lock aged toward its 60 s reclaim"
+
+        with posting(http, renewed):
+            assert mod._claude_access_token(mod.CLAUDE_CRED, {}) == "new-access"
+
+
 if __name__ == "__main__":
     sys.exit(_util.runner(_util.collect(globals()), "refreshcoord_"))
