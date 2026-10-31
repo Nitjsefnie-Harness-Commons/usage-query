@@ -641,7 +641,13 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
                     raise
                 data, age = stale
     out = {}
+    session_listed = any(str(it.get("group") or "") == "session"
+                         for it in (data.get("limits") or []))
     for key, src in (("five_hour", "five_hour"), ("weekly", "seven_day")):
+        if key == "five_hour" and data.get(src) is None and not session_listed:
+            # Neither source names a session window: the plan has no 5h
+            # limit, so the key stays absent rather than reading as 0%.
+            continue
         # The API returns a window as null when the account has no usage in it
         # (seen for five_hour on an idle account); read that as 0% and inactive.
         block = data[src] or {"utilization": 0, "resets_at": None}
@@ -712,11 +718,10 @@ def query_claude_accounts(live_result, errors):
                 path, os.path.join(directory, f".{name}.usage-cache"),
                 CLAUDE_ACCOUNT_CACHE_TTL, errors=errors)
             if reading is not None:
-                accounts[name] = {"live": name == live,
-                                  "five_hour": reading["five_hour"],
-                                  "weekly": reading["weekly"]}
-                if "_scoped" in reading:
-                    accounts[name]["_scoped"] = reading["_scoped"]
+                accounts[name] = {"live": name == live}
+                accounts[name].update((key, reading[key]) for key in
+                                      ("five_hour", "weekly", "_scoped")
+                                      if key in reading)
         except Exception as e:
             errors[f"claude:{name}"] = f"{type(e).__name__}: {e}"
     return accounts

@@ -190,6 +190,9 @@ def test_null_window_on_inactive_account_reads_as_inactive(tmp):
                 payload = json.loads(http(req, timeout).raw)
                 if req.get_header("Authorization") == "Bearer beta-token":
                     payload[src] = None
+                    # A listed session group keeps a null five_hour as an
+                    # inactive 0% window; without one the window is absent.
+                    payload["limits"] = [{"group": "session", "percent": 0}]
                 return Response(payload)
 
             with mock.patch("urllib.request.urlopen", side_effect=request):

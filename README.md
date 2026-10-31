@@ -44,6 +44,12 @@ adds a top-level `claude_accounts` object. For example:
 }
 ```
 
+A Claude reading whose payload carries no 5h window (`five_hour` is null and
+no `limits[]` entry has group `session`) omits the `five_hour` key, in
+`usage.claude` and in each account entry, and the table prints no `5h` row for
+it. A null `five_hour` beside a listed session group still reads as an inactive
+0% window.
+
 The live entry reuses `usage.claude`'s window readings. Each account also retains
 the reading's optional `_scoped` list, in the same shape as
 `usage.claude._scoped`; readings without scoped limits omit that key.
