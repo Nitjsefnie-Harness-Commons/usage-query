@@ -414,7 +414,8 @@ def log_lines(accounts, *secrets):
         assert stamp.utcoffset() == timezone.utc.utcoffset(None), when
         assert abs(stamp.timestamp() - time.time()) < 60, when
         assert int(pid) == os.getpid()
-        lines.append((account, sent, destination, outcome))
+        # Windows: the module joins ~-expanded paths, so separators may mix.
+        lines.append((account, sent, os.path.normpath(destination), outcome))
     return lines
 
 
@@ -442,7 +443,7 @@ def test_every_claude_refresh_attempt_is_logged_by_fingerprint(tmp):
             except Exception:  # noqa: BLE001  the failing cases raise; the log is the subject
                 assert not outcome.startswith("ok"), case
             got = log_lines(accounts, "live-token", "beta-token", "new-refresh", "new-access")
-            assert got == [(name, fp(sent), path, outcome)], (case, got)
+            assert got == [(name, fp(sent), os.path.normpath(path), outcome)], (case, got)
 
 
 def test_no_accounts_directory_means_no_refresh_log(tmp):
