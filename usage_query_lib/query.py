@@ -125,6 +125,7 @@ UTC->local conversion — the same convention as the hook.
 import argparse
 import base64
 import glob
+import hashlib
 import json
 import os
 import re
@@ -631,9 +632,10 @@ def _write_claude_cred(full, cred_path):
                 pass
 
 
-def _persist_claude_cred(full, resp, cred_path, account_name, errors, locked=False):
+def _persist_claude_cred(full, resp, cred_path, account_name, errors, locked=False, sent=None):
     """Save every rotation, falling back to an unlocked write on timeout.
-    `locked` means the caller already holds the accounts lock."""
+    `locked` means the caller already holds the accounts lock; `sent` is the
+    refresh token the rotation consumed, for the accounts.log line."""
     oa = full["claudeAiOauth"]
     if resp.get("access_token"):
         oa["accessToken"] = resp["access_token"]
@@ -651,7 +653,11 @@ def _persist_claude_cred(full, resp, cred_path, account_name, errors, locked=Fal
         unidentified_live = live is None and os.path.abspath(cred_path) == os.path.abspath(CLAUDE_CRED)
         destination = (CLAUDE_CRED if account_name is None or account_name == live or unidentified_live
                        else os.path.join(directory, account_name + ".json"))
-        _write_claude_cred(full, destination)
+        try:
+            _write_claude_cred(full, destination)
+        finally:
+            _claude_log_refresh(account_name, sent, destination,
+                                f"ok rt_new={_token_fingerprint(oa['refreshToken'])}")
 
     if locked:
         write_current()
@@ -713,7 +719,7 @@ def _claude_refresh_live(cred_path, errors):
         directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
         if os.path.isdir(directory) and not _claude_is_live(source):
             return None
-        return _claude_refresh_grant(full, cred_path, account_name, errors)
+        return _claude_refresh_grant(full, cred_path, account_name, source, errors)
 
 
 def _claude_refresh_stash(cred_path, errors):
@@ -728,11 +734,37 @@ def _claude_refresh_stash(cred_path, errors):
             return access
         if _claude_is_live(source):
             return None
-        return _claude_refresh_grant(full, cred_path, account_name, errors, locked=True)
+        return _claude_refresh_grant(full, cred_path, account_name, source, errors, locked=True)
 
 
-def _claude_refresh_grant(full, cred_path, account_name, errors, locked=False):
-    """POST the stored refresh token and persist the rotated pair."""
+def _token_fingerprint(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10] if token else "none"
+
+
+def _claude_log_refresh(account_name, sent, destination, outcome):
+    """Append one refresh attempt to accounts/accounts.log in claude_accounts.py's
+    line format; tokens appear only as fingerprints. Without an accounts
+    directory the open fails and nothing is logged; a failed log write never
+    fails the refresh."""
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    line = (f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} pid={os.getpid()} "
+            f"op=refresh account={account_name or '?'} rt={_token_fingerprint(sent)} "
+            f"file={destination} outcome={outcome}\n")
+    try:
+        fd = os.open(os.path.join(directory, "accounts.log"),
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _claude_refresh_grant(full, cred_path, account_name, source, errors, locked=False):
+    """POST the stored refresh token and persist the rotated pair. Every
+    attempt is logged; one that fails without an HTTP status may still have
+    reached the server and spent the token, so it is logged as unknown."""
     refresh = (full.get("claudeAiOauth") or {}).get("refreshToken")
     if not refresh:
         raise RuntimeError("Claude access token expired and no refreshToken present")
@@ -750,6 +782,7 @@ def _claude_refresh_grant(full, cred_path, account_name, errors, locked=False):
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
             resp = json.loads(r.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
+        _claude_log_refresh(account_name, refresh, source, f"http {e.code}")
         detail = ""
         try:
             detail = e.read().decode("utf-8", "replace")[:200]
@@ -759,7 +792,10 @@ def _claude_refresh_grant(full, cred_path, account_name, errors, locked=False):
             f"Claude token refresh failed (HTTP {e.code}). The harness normally "
             "refreshes this token on its own activity — send Claude a message and "
             f"retry, or re-login if it persists. {detail}") from e
-    return _persist_claude_cred(full, resp, cred_path, account_name, errors, locked)
+    except Exception:
+        _claude_log_refresh(account_name, refresh, source, "unknown")
+        raise
+    return _persist_claude_cred(full, resp, cred_path, account_name, errors, locked, refresh)
 
 
 def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=None):
