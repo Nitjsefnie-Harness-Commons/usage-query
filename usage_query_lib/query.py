@@ -2232,9 +2232,10 @@ def _banked_spend_note(name, route):
 
 
 def query_codex():
-    """Normalized Codex quota windows, with fresh-cache and stale fallback."""
+    """Normalized Codex windows, tagging every cached snapshot with its age."""
     now = time.time()
     data, stale = None, None
+    cache_age = None
     try:
         with open(CODEX_CACHE, encoding="utf-8") as f:
             cached = json.load(f)
@@ -2242,6 +2243,7 @@ def query_codex():
         age = now - float(cached.get("fetched_at") or 0)
         if cached_data is not None:
             if age < CODEX_CACHE_TTL:
+                cache_age = max(0, int(age))
                 data = cached_data
             else:
                 stale = (cached_data, int(age))
@@ -2256,7 +2258,10 @@ def query_codex():
             if stale is None:
                 raise
             data, stale_age = stale
+            cache_age = stale_age
     out = _normalize_codex(data)
+    if cache_age is not None:
+        out["_cache_age"] = cache_age
     if stale_age:
         out["_stale_age"] = stale_age
     return out
@@ -2275,8 +2280,8 @@ def _table_rows(account, res):
     time-to-reset, plus the cached-age marker on the account name. Window
     labels are duration-style throughout (5h, 7d, and e.g. 7d:Fable for a
     scoped weekly) so they read consistently."""
-    stale = res.get("_stale_age")
-    name = account + (f" (cached {stale}s)" if stale else "")
+    cache_age = res.get("_cache_age", res.get("_stale_age"))
+    name = account + (f" (cached {cache_age}s)" if cache_age is not None else "")
     # The banked-resets annotation is one shape for every provider; only its
     # placement differs. z.ai's weekly reset restores the weekly window, so it
     # rides the 7d row; a Codex Full reset restores every window, so it rides
