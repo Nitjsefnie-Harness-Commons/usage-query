@@ -855,13 +855,17 @@ def _claude_refresh_grant(full, cred_path, account_name, source, errors):
 
 
 def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=None):
-    """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?} normalized, or
+    """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?,
+    '_stale_error': str?} normalized, or
     raises. A fresh cache is used as-is; otherwise we fetch live (retrying a
     transient 429). If the live fetch still fails, we fall back to the last cached
-    payload however stale, tagged with '_stale_age' (seconds) so the caller can
-    label it — better a known-old number than an error. A pending swap, or
+    payload however stale, tagged with '_stale_age' (seconds) and
+    '_stale_error' (the failure, as '<ExceptionType>: <message>', the form
+    `errors` uses) so the caller can label it — better a known-old number than
+    an error. A pending swap, or
     Claude Code's refresh lock or the accounts lock still held at its 30 s
-    deadline, uses the last cached reading the same way, or raises if none
+    deadline, uses the last cached reading the same way, tagged with
+    '_stale_age' only (no fetch ran, so no '_stale_error'), or raises if none
     exists. (The storage write lock never gets here: its timeout comes after
     the grant and is written through, see _write_live_claude_cred.)"""
     cred_path = cred_path or CLAUDE_CRED
@@ -881,7 +885,7 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
                 stale = (cdata, int(cage))
     except Exception:
         pass
-    age = 0
+    age, stale_error = 0, None
     if data is None:
         try:
             token = _claude_access_token(cred_path, errors)
@@ -898,10 +902,11 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
                     "anthropic-beta": "oauth-2025-04-20",
                 })
                 _write_cache(cache_path, data)
-            except Exception:
+            except Exception as e:
                 if stale is None:
                     raise
                 data, age = stale
+                stale_error = f"{type(e).__name__}: {e}"
     out = {}
     session_listed = any(str(it.get("group") or "") == "session"
                          for it in (data.get("limits") or []))
@@ -952,6 +957,8 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
         out["_scoped"] = scoped
     if age:
         out["_stale_age"] = age
+    if stale_error:
+        out["_stale_error"] = stale_error
     return out
 
 
@@ -1150,14 +1157,16 @@ def _kimi_pct(block):
 
 
 def query_kimi():
-    """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?} normalized, or
+    """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?,
+    '_stale_error': str?} normalized, or
     raises.
 
     5h window = limits[] entry whose window is 300 MINUTE (falls back to the
     first limit); weekly = the top-level `usage` block. Percentages are
     used/limit*100, the same 'how full' utilization sense as the Claude side.
     On a failed live fetch we fall back to the last cached payload (however
-    stale), tagged with '_stale_age' seconds — same as the Claude side."""
+    stale), tagged with '_stale_age' seconds and '_stale_error' — same as the
+    Claude side."""
     _require_configured("Kimi", KIMI_CRED)
     now = time.time()
     data, stale = None, None
@@ -1173,16 +1182,17 @@ def query_kimi():
                 stale = (cdata, int(cage))
     except Exception:
         pass
-    age = 0
+    age, stale_error = 0, None
     if data is None:
         token = _kimi_access_token()
         try:
             data = _get(KIMI_URL, {"Authorization": f"Bearer {token}"})
             _write_cache(KIMI_CACHE, data)
-        except Exception:
+        except Exception as e:
             if stale is None:
                 raise
             data, age = stale
+            stale_error = f"{type(e).__name__}: {e}"
 
     limits = data.get("limits") or []
     five = None
@@ -1212,6 +1222,8 @@ def query_kimi():
                                                 _kimi_pct(wk))}
     if age:
         out["_stale_age"] = age
+    if stale_error:
+        out["_stale_error"] = stale_error
     return out
 
 
@@ -1496,12 +1508,14 @@ def _normalize_zai(envelope, peak_note):
 
 
 def _cached_fetch(path, fetch, live=True):
-    """(payload, stale_age) through a box-wide cache file: a payload younger
-    than CACHE_TTL answers without a fetch; otherwise `fetch()` runs (only when
-    `live`) and its result is cached; if it raises - or `live` is False - the
-    last cached payload answers however stale, with its age in seconds (0 when
-    fresh). Raises the fetch's error, or LookupError when not `live`, if there
-    is nothing cached at all."""
+    """(payload, stale_age, stale_error) through a box-wide cache file: a
+    payload younger than CACHE_TTL answers without a fetch; otherwise `fetch()`
+    runs (only when `live`) and its result is cached; if it raises - or `live`
+    is False - the last cached payload answers however stale, with its age in
+    seconds (0 when fresh). `stale_error` is the fetch's failure as
+    '<ExceptionType>: <message>', the form `errors` uses; None unless a fetch
+    ran and raised. Raises the fetch's error, or LookupError when not `live`,
+    if there is nothing cached at all."""
     now = time.time()
     stale = None
     try:
@@ -1511,20 +1525,22 @@ def _cached_fetch(path, fetch, live=True):
         cage = now - float(c.get("fetched_at") or 0)
         if cdata is not None:
             if cage < CACHE_TTL:
-                return cdata, 0
+                return cdata, 0, None
             stale = (cdata, int(cage))
     except Exception:
         pass
-    try:
-        if not live:
+    if not live:
+        if stale is None:
             raise LookupError(f"no cached payload in {path}")
+        return (*stale, None)
+    try:
         data = fetch()
         _write_cache(path, data)
-        return data, 0
-    except Exception:
+        return data, 0, None
+    except Exception as e:
         if stale is None:
             raise
-        return stale
+        return (*stale, f"{type(e).__name__}: {e}")
 
 
 def _zai_headers(key):
@@ -1590,7 +1606,7 @@ def _zai_weekly_resets(key, live=True):
         return envelope
 
     try:
-        envelope, age = _cached_fetch(ZAI_RESETS_CACHE, fetch, live)
+        envelope, age, _ = _cached_fetch(ZAI_RESETS_CACHE, fetch, live)
         block = _normalize_zai_weekly_resets(envelope)
     except Exception:
         return None
@@ -1649,15 +1665,15 @@ def _zai_banked_row_note(res):
 def query_zai():
     """{'five_hour': {...}, 'weekly': {...}, '_scoped': [...], '_plan_type': str,
     '_billing': {...}, '_weekly_resets': {...}?, 'banked_resets': {...}?,
-    '_stale_age': int?}
+    '_stale_age': int?, '_stale_error': str?}
     normalized, or raises.
 
     `limits[]` entries carry the window in unit/number, the allowance in
     `usage` (a confusing name - `currentValue` is what was consumed), and
     `percentage` used, with `nextResetTime` in epoch milliseconds. Fresh cache
     wins; on a failed live fetch the last cached payload is used however
-    stale, tagged with '_stale_age' - same as every other provider here.
-    '_weekly_resets' is absent when the reset list could not be read."""
+    stale, tagged with '_stale_age' and '_stale_error' - same as every other
+    provider here. '_weekly_resets' is absent when the reset list could not be read."""
     key = _zai_cred()
     fetched_live = []
 
@@ -1667,7 +1683,7 @@ def query_zai():
         fetched_live.append(True)
         return envelope
 
-    data, age = _cached_fetch(ZAI_CACHE, fetch)
+    data, age, stale_error = _cached_fetch(ZAI_CACHE, fetch)
     # One clock read feeds both: fetched separately, an instant straddling a
     # window boundary would put the _billing entry and the peak_note stamped
     # on every window into different windows.
@@ -1691,6 +1707,8 @@ def query_zai():
             out["banked_resets"] = banked
     if age:
         out["_stale_age"] = age
+    if stale_error:
+        out["_stale_error"] = stale_error
     return out
 
 
@@ -2232,7 +2250,11 @@ def _banked_spend_note(name, route):
 
 
 def query_codex():
-    """Normalized Codex quota windows, with fresh-cache and stale fallback."""
+    """Normalized Codex quota windows, with fresh-cache and stale fallback.
+
+    A failed live fetch serves the last cached payload however stale, tagged
+    with '_stale_age' (seconds) and '_stale_error' (the failure, as
+    '<ExceptionType>: <message>', the form `errors` uses); raises if none."""
     now = time.time()
     data, stale = None, None
     try:
@@ -2247,18 +2269,21 @@ def query_codex():
                 stale = (cached_data, int(age))
     except Exception:
         pass
-    stale_age = 0
+    stale_age, stale_error = 0, None
     if data is None:
         try:
             data = _codex_rate_limits()
             _write_cache(CODEX_CACHE, data)
-        except Exception:
+        except Exception as e:
             if stale is None:
                 raise
             data, stale_age = stale
+            stale_error = f"{type(e).__name__}: {e}"
     out = _normalize_codex(data)
     if stale_age:
         out["_stale_age"] = stale_age
+    if stale_error:
+        out["_stale_error"] = stale_error
     return out
 
 
@@ -2272,11 +2297,14 @@ def _table_rows(account, res):
     model/surface-SCOPED cap the payload carries (Claude's _scoped list). Each
     row: pct, pace ceiling (or — when the window length is unknown), the OVER
     PACE flag, reset timestamp (tz note moved to a shared footnote) and
-    time-to-reset, plus the cached-age marker on the account name. Window
+    time-to-reset, plus the cached-age marker on the account name (with
+    `; refresh failed: <error>` after the age when a live fetch raised). Window
     labels are duration-style throughout (5h, 7d, and e.g. 7d:Fable for a
     scoped weekly) so they read consistently."""
     stale = res.get("_stale_age")
-    name = account + (f" (cached {stale}s)" if stale else "")
+    failed = res.get("_stale_error")
+    detail = f"cached {stale}s" + (f"; refresh failed: {failed}" if failed else "")
+    name = account + (f" ({detail})" if stale else "")
     # The banked-resets annotation is one shape for every provider; only its
     # placement differs. z.ai's weekly reset restores the weekly window, so it
     # rides the 7d row; a Codex Full reset restores every window, so it rides
