@@ -9,9 +9,9 @@ it, and checking against it is the point: fetching "the newest release" is
 otherwise a promise about a URL, not about the artifact CI built.
 
 ```sh
-gh release download v1.9.4 --repo Nitjsefnie-Harness-Commons/usage-query
+gh release download v1.10.1 --repo Nitjsefnie-Harness-Commons/usage-query
 sha256sum -c SHA256SUMS
-pip install ./usage_query-1.9.4-py3-none-any.whl
+pip install ./usage_query-1.10.1-py3-none-any.whl
 ```
 
 The `usage-query` command queries all four providers by default, or one with
@@ -44,21 +44,58 @@ adds a top-level `claude_accounts` object. For example:
 }
 ```
 
+A Claude reading whose payload carries no 5h window (`five_hour` is null and
+no `limits[]` entry has group `session`) omits the `five_hour` key, in
+`usage.claude` and in each account entry, and the table prints no `5h` row for
+it. A null `five_hour` beside a listed session group still reads as an inactive
+0% window.
+
 The live entry reuses `usage.claude`'s window readings. Each account also retains
 the reading's optional `_scoped` list, in the same shape as
 `usage.claude._scoped`; readings without scoped limits omit that key.
 Inactive accounts use
 their stash's token, refreshing stale credentials atomically into that same
-account's current credential file with mode `0600`. Refresh HTTP requests run
-without holding the accounts lock. Persistence takes `accounts/.lock`, re-reads
-`live`, and writes to `.credentials.json` if the account is now live, or its
-stash otherwise. The query also takes a brief lock to read the account name
-and credentials together before HTTP. Lock acquisition retries for up to 30 seconds and reclaims a lock
-whose modification time is older than 30 seconds. A snapshot-lock timeout stops
-the query before a refresh grant. If the persistence lock times out after a
-refresh, the command re-reads the marker without the lock, atomically writes the
-rotated pair to the current destination anyway, and records an account error.
+account's current credential file with mode `0600`. Every Claude refresh holds
+`accounts/.lock` (when the accounts directory exists) across re-reading the
+credentials, the token request and the write, so neither a second run nor a
+swap can send a refresh token that is being spent; a run that waited re-reads
+the rotated pair instead. The write follows the `live` marker re-read under that
+lock: `.credentials.json` if the account is live, its stash otherwise. A stash
+that a swap made live meanwhile is refreshed on the live route. A live refresh
+also runs under Claude Code's own refresh lock, taken first and the way Claude
+Code takes it: the directories `~/.claude/.oauth_refresh.lock` and then
+`~/.claude.lock`, each reclaimed once its modification time is over 60 seconds
+old and touched every 5 seconds while held, waiting up to 30 seconds. Under
+that lock it re-reads the credentials and uses a pair Claude Code rotated
+meanwhile instead of refreshing. Every write to `.credentials.json` takes Claude
+Code's credential write lock (`~/.claude/.storage-write.lock`, reclaimed after
+15 seconds), re-reads the file under it, and replaces only its `claudeAiOauth`
+entry, so keys another writer saved meanwhile (MCP OAuth tokens, for one) are
+kept. Like Claude Code's own save, it writes only while the `claudeAiOauth`
+entry exists and its refresh token is empty or the one this refresh sent. A
+newer pair (a `/login` to another account, say), a removed entry or a removed
+file (a `/logout`) is left as it is, and the rotated pair is saved to the
+posting account's stash instead, or `write_skipped_newer` is logged when no
+stash knows the account. The query also takes a brief lock to read the
+account name and credentials together before HTTP. Accounts-lock acquisition
+retries for up to 30 seconds and reclaims a lock whose modification time is
+older than 30 seconds; a held lock's modification time is touched every 5
+seconds. A timeout on Claude Code's refresh lock or on the accounts lock (and
+only those) stops the query before a refresh grant and serves the last cached
+reading, labelled stale. A
+storage-write-lock timeout comes after the grant, so the rotated pair is still
+written, without that lock but with the same checks, and an account error is
+recorded.
 An unidentified live account's refreshed pair goes to `.credentials.json`.
+Every Claude refresh attempt appends one line to `accounts/accounts.log` when
+the accounts directory exists, in the switcher's format: UTC time, pid,
+`op=refresh`, the account, `rt=` the first 10 hex digits of the SHA-256 of the
+refresh token sent, `file=` the destination, and `outcome=` `ok rt_new=<that
+fingerprint of the rotated token>`, `write_failed rt_new=<fp>` when the rotated
+pair could not be written (it is lost), `write_skipped_newer rt_new=<fp>` when a
+newer stored pair and no stash left it unsaved, `http <status>`, or `unknown` when the
+request failed without an HTTP status and may have reached the server. No token
+is logged.
 Without an accounts directory, live credential refresh keeps its existing
 behavior.
 

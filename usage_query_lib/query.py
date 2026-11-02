@@ -82,7 +82,10 @@ api.anthropic.com/v1/oauth/token (NOT platform.claude.com — that host is
 Cloudflare-WAF-gated and 1010-blocks a bare urllib request) with the SDK
 User-Agent, then atomically persist the rotated set back, exactly as Claude Code
 itself does. The harness reads this file as its source of truth, so a valid fresh
-set keeps it working.
+set keeps it working. Because Claude Code refreshes the same pair, this refresh
+holds Claude Code's own cross-process refresh lock (CLAUDE_CODE_LOCK_STALE) and
+re-reads the file under it, so it never spends a refresh token Claude Code has
+already rotated.
 
 Pace ceiling: alongside each utilization %, the output shows the MAX % you could
 be at right now under a constant, linear burn across the whole window — i.e. the
@@ -122,6 +125,7 @@ UTC->local conversion — the same convention as the hook.
 import argparse
 import base64
 import glob
+import hashlib
 import json
 import os
 import re
@@ -130,6 +134,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -138,7 +143,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
 
-__version__ = "1.9.4"
+__version__ = "1.10.1"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
@@ -450,10 +455,133 @@ def _claude_account_name(cred_path):
     return name if name and os.path.isfile(os.path.join(directory, name + ".json")) else None
 
 
+# Seconds between mtime touches of a lock held across a network call, well
+# inside every stale-reclaim age below (30 s, 60 s), so no contender reclaims a
+# live holder. Claude Code touches its own refresh lock at the same interval.
+LOCK_HEARTBEAT = 5
+# Claude Code's cross-process refresh lock, taken the way its bundled
+# proper-lockfile takes it (read from the 2.1.316 binary): mkdir of
+# `.oauth_refresh.lock` in its config directory, then of the legacy
+# `<realpath of that directory>.lock`; a held legacy lock makes it release the
+# first and retry. A holder touches each directory's mtime every 5 s and a
+# contender reclaims one older than 60 s. After acquiring, Claude Code re-reads
+# the stored credentials and adopts a pair another process rotated in.
+CLAUDE_CODE_LOCK_STALE = 60
+CLAUDE_CODE_LOCK_WAIT = 30
+# Claude Code read-modify-writes .credentials.json (OAuth pair and MCP OAuth
+# tokens alike) under `.storage-write.lock` in the same directory, the same
+# proper-lockfile shape with a 15 s stale age (read from the 2.1.316 binary).
+CLAUDE_STORAGE_LOCK_STALE = 15
+
+
+class _LockTimeout(TimeoutError):
+    """A lock still held by someone else at its deadline: nothing was spent."""
+
+
 @contextmanager
+def _lock_heartbeat(*paths):
+    """Keep the mtime of each held lock path fresh until the block exits."""
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(LOCK_HEARTBEAT):
+            for path in paths:
+                try:
+                    os.utime(path)
+                except OSError:
+                    pass
+
+    thread = threading.Thread(target=beat, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+
+
+def _mkdir_lock(path, stale=CLAUDE_CODE_LOCK_STALE):
+    """Create a lock directory, reclaiming a stale one once; False while held."""
+    try:
+        os.mkdir(path)
+        return True
+    except FileExistsError:
+        pass
+    try:
+        if time.time() - os.stat(path).st_mtime <= stale:
+            return False
+        os.rmdir(path)
+    except FileNotFoundError:
+        pass
+    try:
+        os.mkdir(path)
+        return True
+    except FileExistsError:
+        return False
+
+
+@contextmanager
+def _claude_code_refresh_lock():
+    """Hold Claude Code's own refresh lock (see CLAUDE_CODE_LOCK_STALE)."""
+    config = os.path.dirname(CLAUDE_CRED)
+    current = os.path.join(config, ".oauth_refresh.lock")
+    legacy = os.path.realpath(config) + ".lock"
+    deadline = time.monotonic() + CLAUDE_CODE_LOCK_WAIT
+    while True:
+        if _mkdir_lock(current):
+            try:
+                legacy_held = _mkdir_lock(legacy)
+            except OSError:
+                legacy_held = None  # Claude Code proceeds without it as well
+            if legacy_held is not False:
+                break
+            os.rmdir(current)
+        if time.monotonic() >= deadline:
+            raise _LockTimeout(
+                f"Claude Code's refresh lock ({current}) was not acquired within "
+                f"{CLAUDE_CODE_LOCK_WAIT} s: another process is refreshing the live token")
+        time.sleep(0.1)
+    held = [current] + ([legacy] if legacy_held else [])
+    try:
+        with _lock_heartbeat(*held):
+            yield
+    finally:
+        for path in reversed(held):
+            try:
+                os.rmdir(path)
+            except FileNotFoundError:
+                pass
+
+
+@contextmanager
+def _claude_storage_write_lock():
+    """Hold Claude Code's credential-storage write lock (CLAUDE_STORAGE_LOCK_STALE)."""
+    path = os.path.join(os.path.dirname(CLAUDE_CRED), ".storage-write.lock")
+    deadline = time.monotonic() + CLAUDE_CODE_LOCK_WAIT
+    while not _mkdir_lock(path, CLAUDE_STORAGE_LOCK_STALE):
+        if time.monotonic() >= deadline:
+            raise _LockTimeout(
+                f"Claude Code's credential write lock ({path}) was not acquired "
+                f"within {CLAUDE_CODE_LOCK_WAIT} s")
+        time.sleep(0.1)
+    try:
+        with _lock_heartbeat(path):
+            yield
+    finally:
+        try:
+            os.rmdir(path)
+        except FileNotFoundError:
+            pass
+
+
 def _claude_accounts_lock(directory):
     """Take the shared accounts lock, reclaiming a stale file once."""
-    path = os.path.join(directory, ".lock")
+    return _exclusive_lock(os.path.join(directory, ".lock"), "Claude accounts")
+
+
+@contextmanager
+def _exclusive_lock(path, what):
+    """Take an O_EXCL lock file, reclaiming one older than 30 s once."""
     deadline = time.monotonic() + 30
     removed_stale = False
     while time.monotonic() < deadline:
@@ -470,7 +598,7 @@ def _claude_accounts_lock(directory):
                 continue
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
     else:
-        raise TimeoutError("Claude accounts lock was not acquired within 30 s")
+        raise _LockTimeout(f"{what} lock was not acquired within 30 s")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(f"{os.getpid()} {time.time()}\n")
@@ -484,32 +612,64 @@ class _ClaudeSwapPending(RuntimeError):
 
 
 def _claude_credential_snapshot(cred_path):
-    """Bind identity and credentials under a brief lock before any HTTP."""
+    """(credentials, account name, file read), bound under a brief lock."""
     directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
     if not os.path.isdir(directory):
         with open(cred_path, encoding="utf-8") as stream:
-            return json.load(stream), None
+            return json.load(stream), None, cred_path
     with _claude_accounts_lock(directory):
+        return _claude_snapshot_locked(directory, cred_path)
+
+
+def _claude_snapshot_locked(directory, cred_path):
+    """The snapshot itself; the caller holds the accounts lock."""
+    try:
+        with open(os.path.join(directory, "state.json"), encoding="utf-8") as stream:
+            state = json.load(stream)
+    except FileNotFoundError:
+        state = {}
+    if "pending" in state:
+        raise _ClaudeSwapPending("Claude reading paused while an account swap is pending")
+    account_name = _claude_account_name(cred_path)
+    source = cred_path
+    if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
+        with open(os.path.join(directory, "live"), encoding="utf-8") as stream:
+            live = stream.read().strip()
+        if account_name == live:
+            source = CLAUDE_CRED
+    with open(source, encoding="utf-8") as stream:
+        return json.load(stream), account_name, source
+
+
+def _write_live_claude_cred(full, sent):
+    """Write a rotated pair into the live file the way Claude Code 2.1.316
+    saves one: under its storage write lock, re-reading the file and replacing
+    only `claudeAiOauth`, and only while that entry exists and its stored
+    refresh token is "" or the one this rotation consumed. A newer pair, a
+    removed entry or a removed file (a /login or /logout meanwhile) is left as
+    it is. Returns (written, lock timeout or None)."""
+    def write():
         try:
-            with open(os.path.join(directory, "state.json"), encoding="utf-8") as stream:
-                state = json.load(stream)
-        except FileNotFoundError:
-            state = {}
-        if "pending" in state:
-            raise _ClaudeSwapPending("Claude reading paused while an account swap is pending")
-        account_name = _claude_account_name(cred_path)
-        source = cred_path
-        if os.path.abspath(cred_path) != os.path.abspath(CLAUDE_CRED):
-            with open(os.path.join(directory, "live"), encoding="utf-8") as stream:
-                live = stream.read().strip()
-            if account_name == live:
-                source = CLAUDE_CRED
-        with open(source, encoding="utf-8") as stream:
-            return json.load(stream), account_name
+            with open(CLAUDE_CRED, encoding="utf-8") as stream:
+                current = json.load(stream)
+        except (OSError, ValueError):
+            return False
+        oauth = current.get("claudeAiOauth") if isinstance(current, dict) else None
+        if not (isinstance(oauth, dict) and oauth.get("refreshToken") in ("", sent)):
+            return False
+        _replace_claude_cred({**current, "claudeAiOauth": full["claudeAiOauth"]}, CLAUDE_CRED)
+        return True
+
+    try:
+        with _claude_storage_write_lock():
+            return write(), None
+    except _LockTimeout as late:
+        # The token is already spent: losing the rotated pair would log every
+        # session out, so it is written without the lock and reported.
+        return write(), late
 
 
-def _write_claude_cred(full, cred_path):
-    """Replace a Claude credential file atomically at mode 0600."""
+def _replace_claude_cred(full, cred_path):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cred_path),
                                prefix=".credentials.", suffix=".tmp")
     try:
@@ -528,8 +688,10 @@ def _write_claude_cred(full, cred_path):
                 pass
 
 
-def _persist_claude_cred(full, resp, cred_path, account_name, errors):
-    """Save every rotation, falling back to an unlocked write on timeout."""
+def _persist_claude_cred(full, resp, cred_path, account_name, sent, errors):
+    """Save every rotation; with an accounts directory the caller holds its
+    lock. `sent` is the refresh token the rotation consumed. A live write that
+    finds a newer pair stored saves ours to the account's stash instead."""
     oa = full["claudeAiOauth"]
     if resp.get("access_token"):
         oa["accessToken"] = resp["access_token"]
@@ -538,37 +700,128 @@ def _persist_claude_cred(full, resp, cred_path, account_name, errors):
     if resp.get("expires_in") is not None:
         oa["expiresAt"] = int((time.time() + float(resp["expires_in"])) * 1000)
     directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
-    if not os.path.isdir(directory):
-        _write_claude_cred(full, cred_path)
-        return oa["accessToken"]
-
-    def write_current():
+    destination = cred_path
+    if os.path.isdir(directory):
         live = _claude_live_marker(directory)
         unidentified_live = live is None and os.path.abspath(cred_path) == os.path.abspath(CLAUDE_CRED)
         destination = (CLAUDE_CRED if account_name is None or account_name == live or unidentified_live
                        else os.path.join(directory, account_name + ".json"))
-        _write_claude_cred(full, destination)
-
+    rotated = _token_fingerprint(oa["refreshToken"])
     try:
-        with _claude_accounts_lock(directory):
-            write_current()
-    except TimeoutError as exc:
-        if errors is not None:
-            key = f"claude:{account_name}" if account_name else "claude_accounts"
-            errors[key] = str(exc)
-        write_current()
+        if not _claude_is_live(destination):
+            _replace_claude_cred(full, destination)
+        else:
+            written, late = _write_live_claude_cred(full, sent)
+            if late is not None and errors is not None:
+                errors[f"claude:{account_name}" if account_name else "claude_accounts"] = (
+                    f"{late}; the rotated pair was written without it")
+            if not written:
+                stash = os.path.join(directory, f"{account_name}.json") if account_name else None
+                if not (stash and os.path.isfile(stash)):
+                    _claude_log_refresh(account_name, sent, destination,
+                                        f"write_skipped_newer rt_new={rotated}")
+                    return oa["accessToken"]
+                destination = stash
+                _replace_claude_cred(full, destination)
+    except Exception:
+        # The server rotated the pair but it never reached disk: it is lost.
+        _claude_log_refresh(account_name, sent, destination, f"write_failed rt_new={rotated}")
+        raise
+    _claude_log_refresh(account_name, sent, destination, f"ok rt_new={rotated}")
     return oa["accessToken"]
 
 
-def _claude_access_token(cred_path, errors):
-    """Use a consistent snapshot and persist every refreshed token pair."""
-    full, account_name = _claude_credential_snapshot(cred_path)
+def _claude_fresh_access(full):
+    """The stored access token while it is outside the expiry margin, else None."""
     oa = full.get("claudeAiOauth") or {}
     access = oa.get("accessToken") or ""
     expires_at = float(oa.get("expiresAt") or 0) / 1000.0  # stored in ms
-    if access and expires_at - time.time() > CLAUDE_EXPIRY_MARGIN:
+    return access if access and expires_at - time.time() > CLAUDE_EXPIRY_MARGIN else None
+
+
+def _claude_is_live(source):
+    return os.path.abspath(source) == os.path.abspath(CLAUDE_CRED)
+
+
+def _claude_access_token(cred_path, errors):
+    """A usable access token, refreshing a stale pair on the route that owns
+    it: a stash under the accounts lock, the live pair under Claude Code's lock
+    as well. A stash that a swap made live while it waited goes to the live
+    route, whose persistence follows the marker either way."""
+    full, _, source = _claude_credential_snapshot(cred_path)
+    access = _claude_fresh_access(full)
+    if access:
         return access
-    refresh = oa.get("refreshToken")
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    if os.path.isdir(directory) and not _claude_is_live(source):
+        access = _claude_refresh_stash(cred_path, errors)
+        if access is not None:
+            return access
+    return _claude_refresh_live(cred_path, errors)
+
+
+def _claude_refresh_live(cred_path, errors):
+    """Refresh the live pair, the one Claude Code itself refreshes, only under
+    Claude Code's own refresh lock and only if the pair re-read under it is
+    still stale: a pair Claude Code rotated meanwhile is used as-is. The
+    accounts lock is held inside it (that order, always) across the POST and
+    persist, so no swap can hand the token being spent to a stash refresh."""
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    with _claude_code_refresh_lock():
+        if not os.path.isdir(directory):
+            full, account_name, source = _claude_credential_snapshot(cred_path)
+            return (_claude_fresh_access(full)
+                    or _claude_refresh_grant(full, cred_path, account_name, source, errors))
+        with _claude_accounts_lock(directory), _lock_heartbeat(os.path.join(directory, ".lock")):
+            full, account_name, source = _claude_snapshot_locked(directory, cred_path)
+            return (_claude_fresh_access(full)
+                    or _claude_refresh_grant(full, cred_path, account_name, source, errors))
+
+
+def _claude_refresh_stash(cred_path, errors):
+    """Refresh a stash with the accounts lock held across re-read, POST and
+    persist, so a contender that waited re-reads the rotated pair instead of
+    spending the consumed refresh token. None when the pair is now live."""
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    with _claude_accounts_lock(directory), _lock_heartbeat(os.path.join(directory, ".lock")):
+        full, account_name, source = _claude_snapshot_locked(directory, cred_path)
+        access = _claude_fresh_access(full)
+        if access:
+            return access
+        if _claude_is_live(source):
+            return None
+        return _claude_refresh_grant(full, cred_path, account_name, source, errors)
+
+
+def _token_fingerprint(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10] if token else "none"
+
+
+def _claude_log_refresh(account_name, sent, destination, outcome):
+    """Append one refresh attempt to accounts/accounts.log in claude_accounts.py's
+    line format; tokens appear only as fingerprints. Without an accounts
+    directory the open fails and nothing is logged; a failed log write never
+    fails the refresh."""
+    directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
+    line = (f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} pid={os.getpid()} "
+            f"op=refresh account={account_name or '?'} rt={_token_fingerprint(sent)} "
+            f"file={destination} outcome={outcome}\n")
+    try:
+        fd = os.open(os.path.join(directory, "accounts.log"),
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _claude_refresh_grant(full, cred_path, account_name, source, errors):
+    """POST the stored refresh token and persist the rotated pair. Every
+    attempt is logged; one that fails without an HTTP status may still have
+    reached the server and spent the token, so it is logged as unknown."""
+    refresh = (full.get("claudeAiOauth") or {}).get("refreshToken")
     if not refresh:
         raise RuntimeError("Claude access token expired and no refreshToken present")
     body = json.dumps({
@@ -585,6 +838,7 @@ def _claude_access_token(cred_path, errors):
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
             resp = json.loads(r.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
+        _claude_log_refresh(account_name, refresh, source, f"http {e.code}")
         detail = ""
         try:
             detail = e.read().decode("utf-8", "replace")[:200]
@@ -594,16 +848,26 @@ def _claude_access_token(cred_path, errors):
             f"Claude token refresh failed (HTTP {e.code}). The harness normally "
             "refreshes this token on its own activity — send Claude a message and "
             f"retry, or re-login if it persists. {detail}") from e
-    return _persist_claude_cred(full, resp, cred_path, account_name, errors)
+    except Exception:
+        _claude_log_refresh(account_name, refresh, source, "unknown")
+        raise
+    return _persist_claude_cred(full, resp, cred_path, account_name, refresh, errors)
 
 
 def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=None):
-    """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?} normalized, or
+    """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?,
+    '_stale_error': str?} normalized, or
     raises. A fresh cache is used as-is; otherwise we fetch live (retrying a
     transient 429). If the live fetch still fails, we fall back to the last cached
-    payload however stale, tagged with '_stale_age' (seconds) so the caller can
-    label it — better a known-old number than an error. Pending swaps use the
-    last cached reading for every Claude account, or raise if none exists."""
+    payload however stale, tagged with '_stale_age' (seconds) and
+    '_stale_error' (the failure, as '<ExceptionType>: <message>', the form
+    `errors` uses) so the caller can label it — better a known-old number than
+    an error. A pending swap, or
+    Claude Code's refresh lock or the accounts lock still held at its 30 s
+    deadline, uses the last cached reading the same way, tagged with
+    '_stale_age' only (no fetch ran, so no '_stale_error'), or raises if none
+    exists. (The storage write lock never gets here: its timeout comes after
+    the grant and is written through, see _write_live_claude_cred.)"""
     cred_path = cred_path or CLAUDE_CRED
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
@@ -621,11 +885,13 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
                 stale = (cdata, int(cage))
     except Exception:
         pass
-    age = 0
+    age, stale_error = 0, None
     if data is None:
         try:
             token = _claude_access_token(cred_path, errors)
-        except _ClaudeSwapPending:
+        except (_ClaudeSwapPending, _LockTimeout):
+            # A pending swap, or Claude Code's refresh lock or the accounts
+            # lock still held at its deadline: no refresh this run, serve the cache.
             if stale is None:
                 raise
             data, age = stale
@@ -636,13 +902,22 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
                     "anthropic-beta": "oauth-2025-04-20",
                 })
                 _write_cache(cache_path, data)
-            except Exception:
+            except Exception as e:
                 if stale is None:
                     raise
                 data, age = stale
+                stale_error = f"{type(e).__name__}: {e}"
     out = {}
+    session_listed = any(str(it.get("group") or "") == "session"
+                         for it in (data.get("limits") or []))
     for key, src in (("five_hour", "five_hour"), ("weekly", "seven_day")):
-        block = data[src]
+        if key == "five_hour" and data.get(src) is None and not session_listed:
+            # Neither source names a session window: the plan has no 5h
+            # limit, so the key stays absent rather than reading as 0%.
+            continue
+        # The API returns a window as null when the account has no usage in it
+        # (seen for five_hour on an idle account); read that as 0% and inactive.
+        block = data[src] or {"utilization": 0, "resets_at": None}
         at, dur = _reset_info(block["resets_at"])
         out[key] = {"pct": float(block["utilization"]),
                     "resets_at": at, "resets_in": dur,
@@ -682,6 +957,8 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=No
         out["_scoped"] = scoped
     if age:
         out["_stale_age"] = age
+    if stale_error:
+        out["_stale_error"] = stale_error
     return out
 
 
@@ -710,11 +987,10 @@ def query_claude_accounts(live_result, errors):
                 path, os.path.join(directory, f".{name}.usage-cache"),
                 CLAUDE_ACCOUNT_CACHE_TTL, errors=errors)
             if reading is not None:
-                accounts[name] = {"live": name == live,
-                                  "five_hour": reading["five_hour"],
-                                  "weekly": reading["weekly"]}
-                if "_scoped" in reading:
-                    accounts[name]["_scoped"] = reading["_scoped"]
+                accounts[name] = {"live": name == live}
+                accounts[name].update((key, reading[key]) for key in
+                                      ("five_hour", "weekly", "_scoped")
+                                      if key in reading)
         except Exception as e:
             errors[f"claude:{name}"] = f"{type(e).__name__}: {e}"
     return accounts
@@ -802,12 +1078,27 @@ def _kimi_access_token():
     valid (no network); otherwise refreshes from the refresh_token AND persists
     the rotated tokens back to the credential file (single-use grant — see module
     docstring), then returns the fresh access token."""
-    with open(KIMI_CRED, encoding="utf-8") as f:
-        cred = json.load(f)
-    access = cred.get("access_token") or ""
-    expires_at = float(cred.get("expires_at") or 0)
-    if access and expires_at - time.time() > KIMI_EXPIRY_MARGIN:
+    def read():
+        with open(KIMI_CRED, encoding="utf-8") as f:
+            cred = json.load(f)
+        access = cred.get("access_token") or ""
+        expires_at = float(cred.get("expires_at") or 0)
+        live = access and expires_at - time.time() > KIMI_EXPIRY_MARGIN
+        return cred, access if live else None
+
+    cred, access = read()
+    if access:
         return access
+    # usage-query's own contenders serialize here and re-read, so a loser
+    # reuses the winner's rotated pair instead of spending the consumed one.
+    lock = KIMI_CRED + ".usage-query.lock"
+    with _exclusive_lock(lock, "Kimi refresh"), _lock_heartbeat(lock):
+        cred, access = read()
+        return access or _kimi_refresh(cred)
+
+
+def _kimi_refresh(cred):
+    """Run the Kimi refresh grant and persist the rotated pair."""
     refresh = cred.get("refresh_token")
     if not refresh:
         raise RuntimeError("Kimi access token expired and no refresh_token present")
@@ -866,14 +1157,16 @@ def _kimi_pct(block):
 
 
 def query_kimi():
-    """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?} normalized, or
+    """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?,
+    '_stale_error': str?} normalized, or
     raises.
 
     5h window = limits[] entry whose window is 300 MINUTE (falls back to the
     first limit); weekly = the top-level `usage` block. Percentages are
     used/limit*100, the same 'how full' utilization sense as the Claude side.
     On a failed live fetch we fall back to the last cached payload (however
-    stale), tagged with '_stale_age' seconds — same as the Claude side."""
+    stale), tagged with '_stale_age' seconds and '_stale_error' — same as the
+    Claude side."""
     _require_configured("Kimi", KIMI_CRED)
     now = time.time()
     data, stale = None, None
@@ -889,16 +1182,17 @@ def query_kimi():
                 stale = (cdata, int(cage))
     except Exception:
         pass
-    age = 0
+    age, stale_error = 0, None
     if data is None:
         token = _kimi_access_token()
         try:
             data = _get(KIMI_URL, {"Authorization": f"Bearer {token}"})
             _write_cache(KIMI_CACHE, data)
-        except Exception:
+        except Exception as e:
             if stale is None:
                 raise
             data, age = stale
+            stale_error = f"{type(e).__name__}: {e}"
 
     limits = data.get("limits") or []
     five = None
@@ -928,6 +1222,8 @@ def query_kimi():
                                                 _kimi_pct(wk))}
     if age:
         out["_stale_age"] = age
+    if stale_error:
+        out["_stale_error"] = stale_error
     return out
 
 
@@ -1212,12 +1508,14 @@ def _normalize_zai(envelope, peak_note):
 
 
 def _cached_fetch(path, fetch, live=True):
-    """(payload, stale_age) through a box-wide cache file: a payload younger
-    than CACHE_TTL answers without a fetch; otherwise `fetch()` runs (only when
-    `live`) and its result is cached; if it raises - or `live` is False - the
-    last cached payload answers however stale, with its age in seconds (0 when
-    fresh). Raises the fetch's error, or LookupError when not `live`, if there
-    is nothing cached at all."""
+    """(payload, stale_age, stale_error) through a box-wide cache file: a
+    payload younger than CACHE_TTL answers without a fetch; otherwise `fetch()`
+    runs (only when `live`) and its result is cached; if it raises - or `live`
+    is False - the last cached payload answers however stale, with its age in
+    seconds (0 when fresh). `stale_error` is the fetch's failure as
+    '<ExceptionType>: <message>', the form `errors` uses; None unless a fetch
+    ran and raised. Raises the fetch's error, or LookupError when not `live`,
+    if there is nothing cached at all."""
     now = time.time()
     stale = None
     try:
@@ -1227,20 +1525,22 @@ def _cached_fetch(path, fetch, live=True):
         cage = now - float(c.get("fetched_at") or 0)
         if cdata is not None:
             if cage < CACHE_TTL:
-                return cdata, 0
+                return cdata, 0, None
             stale = (cdata, int(cage))
     except Exception:
         pass
-    try:
-        if not live:
+    if not live:
+        if stale is None:
             raise LookupError(f"no cached payload in {path}")
+        return (*stale, None)
+    try:
         data = fetch()
         _write_cache(path, data)
-        return data, 0
-    except Exception:
+        return data, 0, None
+    except Exception as e:
         if stale is None:
             raise
-        return stale
+        return (*stale, f"{type(e).__name__}: {e}")
 
 
 def _zai_headers(key):
@@ -1306,7 +1606,7 @@ def _zai_weekly_resets(key, live=True):
         return envelope
 
     try:
-        envelope, age = _cached_fetch(ZAI_RESETS_CACHE, fetch, live)
+        envelope, age, _ = _cached_fetch(ZAI_RESETS_CACHE, fetch, live)
         block = _normalize_zai_weekly_resets(envelope)
     except Exception:
         return None
@@ -1365,15 +1665,15 @@ def _zai_banked_row_note(res):
 def query_zai():
     """{'five_hour': {...}, 'weekly': {...}, '_scoped': [...], '_plan_type': str,
     '_billing': {...}, '_weekly_resets': {...}?, 'banked_resets': {...}?,
-    '_stale_age': int?}
+    '_stale_age': int?, '_stale_error': str?}
     normalized, or raises.
 
     `limits[]` entries carry the window in unit/number, the allowance in
     `usage` (a confusing name - `currentValue` is what was consumed), and
     `percentage` used, with `nextResetTime` in epoch milliseconds. Fresh cache
     wins; on a failed live fetch the last cached payload is used however
-    stale, tagged with '_stale_age' - same as every other provider here.
-    '_weekly_resets' is absent when the reset list could not be read."""
+    stale, tagged with '_stale_age' and '_stale_error' - same as every other
+    provider here. '_weekly_resets' is absent when the reset list could not be read."""
     key = _zai_cred()
     fetched_live = []
 
@@ -1383,7 +1683,7 @@ def query_zai():
         fetched_live.append(True)
         return envelope
 
-    data, age = _cached_fetch(ZAI_CACHE, fetch)
+    data, age, stale_error = _cached_fetch(ZAI_CACHE, fetch)
     # One clock read feeds both: fetched separately, an instant straddling a
     # window boundary would put the _billing entry and the peak_note stamped
     # on every window into different windows.
@@ -1407,6 +1707,8 @@ def query_zai():
             out["banked_resets"] = banked
     if age:
         out["_stale_age"] = age
+    if stale_error:
+        out["_stale_error"] = stale_error
     return out
 
 
@@ -1499,7 +1801,22 @@ def _persist_codex_cred(full, resp):
 
 def _codex_refresh(full):
     """Run codex's refresh grant and persist the rotated set; returns the fresh
-    access token."""
+    access token. usage-query's own contenders serialize on a lock beside
+    auth.json and re-read it: an access token another one rotated in since
+    `full` was read is used instead of spending the consumed refresh token."""
+    lock = CODEX_AUTH + ".usage-query.lock"
+    with _exclusive_lock(lock, "Codex refresh"), _lock_heartbeat(lock):
+        sent = (full.get("tokens") or {}).get("access_token")
+        full = _codex_auth()
+        access = (full.get("tokens") or {}).get("access_token")
+        exp = _jwt_expiry(access or "")
+        if access and access != sent and (
+                exp is None or exp - time.time() > CODEX_EXPIRY_MARGIN):
+            return access
+        return _codex_refresh_locked(full)
+
+
+def _codex_refresh_locked(full):
     refresh = (full.get("tokens") or {}).get("refresh_token")
     if not refresh:
         raise RuntimeError(
@@ -1933,7 +2250,11 @@ def _banked_spend_note(name, route):
 
 
 def query_codex():
-    """Normalized Codex windows, tagging every cached snapshot with its age."""
+    """Normalized Codex windows, tagging every cached snapshot with its age.
+
+    A failed live fetch serves the last cached payload however stale, tagged
+    with '_stale_age' (seconds) and '_stale_error' (the failure, as
+    '<ExceptionType>: <message>', the form `errors` uses); raises if none."""
     now = time.time()
     data, stale = None, None
     cache_age = None
@@ -1950,21 +2271,24 @@ def query_codex():
                 stale = (cached_data, int(age))
     except Exception:
         pass
-    stale_age = 0
+    stale_age, stale_error = 0, None
     if data is None:
         try:
             data = _codex_rate_limits()
             _write_cache(CODEX_CACHE, data)
-        except Exception:
+        except Exception as e:
             if stale is None:
                 raise
             data, stale_age = stale
             cache_age = stale_age
+            stale_error = f"{type(e).__name__}: {e}"
     out = _normalize_codex(data)
     if cache_age is not None:
         out["_cache_age"] = cache_age
     if stale_age:
         out["_stale_age"] = stale_age
+    if stale_error:
+        out["_stale_error"] = stale_error
     return out
 
 
@@ -1978,11 +2302,14 @@ def _table_rows(account, res):
     model/surface-SCOPED cap the payload carries (Claude's _scoped list). Each
     row: pct, pace ceiling (or — when the window length is unknown), the OVER
     PACE flag, reset timestamp (tz note moved to a shared footnote) and
-    time-to-reset, plus the cached-age marker on the account name. Window
+    time-to-reset, plus the cached-age marker on the account name (with
+    `; refresh failed: <error>` after the age when a live fetch raised). Window
     labels are duration-style throughout (5h, 7d, and e.g. 7d:Fable for a
     scoped weekly) so they read consistently."""
     cache_age = res.get("_cache_age", res.get("_stale_age"))
-    name = account + (f" (cached {cache_age}s)" if cache_age is not None else "")
+    failed = res.get("_stale_error")
+    detail = f"cached {cache_age}s" + (f"; refresh failed: {failed}" if failed else "")
+    name = account + (f" ({detail})" if cache_age is not None else "")
     # The banked-resets annotation is one shape for every provider; only its
     # placement differs. z.ai's weekly reset restores the weekly window, so it
     # rides the 7d row; a Codex Full reset restores every window, so it rides

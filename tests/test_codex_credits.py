@@ -212,6 +212,9 @@ def test_codex_expired_cache_age_is_kept_when_refresh_fails(tmp):
         got = mod.query_codex()
     fetch.assert_called_once_with()
     assert got["_cache_age"] == got["_stale_age"] == 905
+    assert got["_stale_error"] == "RuntimeError: offline"
+    text = _main_text(mod, codex=got)
+    assert "Codex (cached 905s; refresh failed: RuntimeError: offline)" in text, text
 
 
 def test_codex_expired_cache_refreshed_from_backend_has_no_cache_age(tmp):
