@@ -461,6 +461,9 @@ def test_codex_cache_avoids_the_fetch_and_stale_payload_survives_failure(tmp):
     the status line's 30 s refresh, so essentially every refresh was a miss."""
     mod = _util.load(USAGE_QUERY, "usage_query_codex_cache")
     mod.CODEX_CACHE = os.path.join(tmp, "codex-usage.json")
+    mod.CODEX_AUTH = os.path.join(tmp, "auth.json")
+    with open(mod.CODEX_AUTH, "w", encoding="utf-8") as f:
+        json.dump({"tokens": {}}, f)
     assert mod.CODEX_CACHE_TTL >= 600, "a Codex miss is too expensive to court"
     payload = _codex_payload()
     fresh = mod.CODEX_CACHE_TTL - 60
@@ -478,6 +481,25 @@ def test_codex_cache_avoids_the_fetch_and_stale_payload_survives_failure(tmp):
         got = mod.query_codex()
     assert got["weekly"]["pct"] == 27
     assert stale - 1 <= got["_stale_age"] <= stale + 1
+
+
+def test_a_removed_codex_install_is_unconfigured_whatever_its_cache_holds(tmp):
+    """Uninstalling Codex leaves its usage cache in the temp dir; neither a
+    fresh nor a stale cached payload may keep reporting the removed install."""
+    mod = _util.load(USAGE_QUERY, "usage_query_codex_removed")
+    mod.CODEX_CACHE = os.path.join(tmp, "codex-usage.json")
+    mod.CODEX_AUTH = os.path.join(tmp, "removed", "auth.json")
+    for age in (60, mod.CODEX_CACHE_TTL + 90):
+        with open(mod.CODEX_CACHE, "w", encoding="utf-8") as f:
+            json.dump({"fetched_at": time.time() - age, "data": _codex_payload()}, f)
+        with mock.patch.object(mod, "_get") as fetch:
+            try:
+                got = mod.query_codex()
+            except mod.ProviderNotConfigured:
+                pass
+            else:
+                raise AssertionError(f"a removed Codex install reported {got} from a {age} s cache")
+        fetch.assert_not_called()
 
 
 def test_codex_flag_queries_only_codex(tmp):

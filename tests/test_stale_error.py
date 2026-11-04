@@ -89,6 +89,7 @@ class _Rig:
             self.ttl = mod.CODEX_CACHE_TTL
             stack.enter_context(mock.patch.object(mod, "CODEX_CACHE",
                                                   self.cache))
+            stack.enter_context(mock.patch.object(mod, "CODEX_AUTH", cred))
         else:
             self.cache = os.path.join(tmp, "zai.cache")
             self.resets_cache = os.path.join(tmp, "zai-resets.cache")

@@ -2254,7 +2254,10 @@ def query_codex():
 
     A failed live fetch serves the last cached payload however stale, tagged
     with '_stale_age' (seconds) and '_stale_error' (the failure, as
-    '<ExceptionType>: <message>', the form `errors` uses); raises if none."""
+    '<ExceptionType>: <message>', the form `errors` uses); raises if none.
+    A machine with no Codex credentials raises ProviderNotConfigured before
+    the cache is read, so a removed install's leftover cache never reports."""
+    _require_configured("Codex", CODEX_AUTH)
     now = time.time()
     data, stale = None, None
     try:
