@@ -143,7 +143,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
 
-__version__ = "1.10.3"
+__version__ = "1.10.4"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
@@ -411,26 +411,41 @@ def _write_cache(path, data):
         pass
 
 
-# Retry the usage GET on a transient 429 (the endpoint is rate-limited under load
-# and usually recovers within a fraction of a second): up to RETRY_ATTEMPTS tries,
-# RETRY_DELAY apart. Non-429 errors are not retried — they re-raise immediately.
-RETRY_ATTEMPTS = 5
-RETRY_DELAY = 0.2
+# After a 429 that survives the retries, no process on the box fetches that
+# account again until the backoff in its cache file expires: BACKOFF_BASE
+# doubling per consecutive 429 up to BACKOFF_CAP, or the server's Retry-After
+# when longer (still capped). A success rewrites the file without it.
+BACKOFF_BASE = 300
+BACKOFF_CAP = 3600
+
+
+def _write_backoff(path, cached, retry_after=None):
+    """Atomically record the next 429 backoff in the cache file, keeping its payload."""
+    record = {k: v for k, v in (cached or {}).items() if k in ("fetched_at", "data")}
+    streak = int(((cached or {}).get("backoff") or {}).get("streak") or 0) + 1
+    delay = min(BACKOFF_CAP, max(BACKOFF_BASE * 2 ** (streak - 1), retry_after or 0))
+    record["backoff"] = {"streak": streak, "until": time.time() + delay}
+    try:
+        tmp = f"{path}.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return record["backoff"]["until"]
+
+
+def _retry_after(error):
+    try:
+        return int((error.headers or {}).get("Retry-After"))
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def _get_retry(url, headers):
-    last = None
-    for attempt in range(RETRY_ATTEMPTS):
-        try:
-            return _get(url, headers)
-        except urllib.error.HTTPError as e:
-            last = e
-            if e.code == 429 and attempt < RETRY_ATTEMPTS - 1:
-                time.sleep(RETRY_DELAY)
-                continue
-            raise
-    assert last is not None
-    raise last  # unreachable: loop always returns or raises
+    """One GET. A 429 is never retried in-run, so usage_query never stalls its
+    caller; the shared backoff in the account's cache file spaces the next try."""
+    return _get(url, headers)
 
 
 def _claude_live_marker(directory):
@@ -859,8 +874,8 @@ def _claude_refresh_grant(full, cred_path, account_name, source, errors):
 def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE_TTL, errors=None):
     """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?,
     '_stale_error': str?} normalized, or
-    raises. A fresh cache is used as-is; otherwise we fetch live (retrying a
-    transient 429). If the live fetch still fails, we fall back to the last cached
+    raises. A fresh cache is used as-is; otherwise we fetch live once, unless a 429
+    backoff in the cache file holds every fetch off. If the live fetch fails, we fall back to the last cached
     payload however stale, tagged with '_stale_age' (seconds) and
     '_stale_error' (the failure, as '<ExceptionType>: <message>', the form
     `errors` uses) so the caller can label it — better a known-old number than
@@ -874,7 +889,7 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
     now = time.time()
-    data, stale = None, None
+    data, stale, c = None, None, {}
     try:
         with open(cache_path, encoding="utf-8") as f:
             c = json.load(f)
@@ -888,6 +903,13 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
     except Exception:
         pass
     age, stale_error = 0, None
+    until = float(((c if isinstance(c, dict) else {}).get("backoff") or {}).get("until") or 0)
+    if data is None and now < until:
+        note = ("HTTPError: HTTP Error 429: backing off until "
+                + time.strftime("%H:%M:%S", time.localtime(until)))
+        if stale is None:
+            raise RuntimeError(note)
+        (data, age), stale_error = stale, note
     if data is None:
         try:
             token = _claude_access_token(cred_path, errors)
@@ -905,6 +927,8 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
                 })
                 _write_cache(cache_path, data)
             except Exception as e:
+                if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+                    _write_backoff(cache_path, c if isinstance(c, dict) else {}, _retry_after(e))
                 if stale is None:
                     raise
                 data, age = stale
