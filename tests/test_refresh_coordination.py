@@ -655,7 +655,7 @@ def test_the_unlocked_fallback_refuses_what_the_locked_write_refuses(tmp):
                     mock.patch.object(mod.time, "monotonic", side_effect=monotonic), \
                     mock.patch.object(mod.time, "sleep", side_effect=sleep):
                 assert mod._claude_access_token(mod.CLAUDE_CRED, errors) == "new-access"
-            assert monotonic() >= mod.CLAUDE_CODE_LOCK_WAIT, case
+            assert monotonic() >= mod.CLAUDE_STORAGE_LOCK_WAIT, case
             if case == "newer":
                 assert live_oauth(mod)["claudeAiOauth"]["refreshToken"] == "other-login-refresh"
             else:
@@ -676,7 +676,7 @@ def test_a_storage_lock_timeout_after_the_post_still_saves_the_rotated_pair(tmp)
                 mock.patch.object(mod.time, "monotonic", side_effect=monotonic), \
                 mock.patch.object(mod.time, "sleep", side_effect=sleep):
             assert mod._claude_access_token(mod.CLAUDE_CRED, errors) == "new-access"
-        assert monotonic() >= mod.CLAUDE_CODE_LOCK_WAIT, "never waited for the storage lock"
+        assert monotonic() >= mod.CLAUDE_STORAGE_LOCK_WAIT, "never waited for the storage lock"
         assert live_oauth(mod)["claudeAiOauth"]["refreshToken"] == "new-refresh", "the rotated pair was lost"
         assert set(errors) == {"claude:alpha"} and "written without it" in errors["claude:alpha"], errors
         assert storage.is_dir(), "removed the other holder's storage lock"

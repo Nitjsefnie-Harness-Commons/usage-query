@@ -484,7 +484,12 @@ LOCK_HEARTBEAT = 5
 # contender reclaims one older than 60 s. After acquiring, Claude Code re-reads
 # the stored credentials and adopts a pair another process rotated in.
 CLAUDE_CODE_LOCK_STALE = 60
-CLAUDE_CODE_LOCK_WAIT = 30
+# Read-path waits are short: a held lock means another process is refreshing,
+# and serving the cached reading beats stalling the caller (maintainer,
+# 2026-11-05). The storage write runs only after a token was spent, so it waits
+# longer rather than clobber Claude Code's own credential write.
+CLAUDE_CODE_LOCK_WAIT = 2
+CLAUDE_STORAGE_LOCK_WAIT = 30
 # Claude Code read-modify-writes .credentials.json (OAuth pair and MCP OAuth
 # tokens alike) under `.storage-write.lock` in the same directory, the same
 # proper-lockfile shape with a 15 s stale age (read from the 2.1.316 binary).
@@ -574,12 +579,12 @@ def _claude_code_refresh_lock():
 def _claude_storage_write_lock():
     """Hold Claude Code's credential-storage write lock (CLAUDE_STORAGE_LOCK_STALE)."""
     path = os.path.join(os.path.dirname(CLAUDE_CRED), ".storage-write.lock")
-    deadline = time.monotonic() + CLAUDE_CODE_LOCK_WAIT
+    deadline = time.monotonic() + CLAUDE_STORAGE_LOCK_WAIT
     while not _mkdir_lock(path, CLAUDE_STORAGE_LOCK_STALE):
         if time.monotonic() >= deadline:
             raise _LockTimeout(
                 f"Claude Code's credential write lock ({path}) was not acquired "
-                f"within {CLAUDE_CODE_LOCK_WAIT} s")
+                f"within {CLAUDE_STORAGE_LOCK_WAIT} s")
         time.sleep(0.1)
     try:
         with _lock_heartbeat(path):
@@ -593,13 +598,14 @@ def _claude_storage_write_lock():
 
 def _claude_accounts_lock(directory):
     """Take the shared accounts lock, reclaiming a stale file once."""
-    return _exclusive_lock(os.path.join(directory, ".lock"), "Claude accounts")
+    return _exclusive_lock(os.path.join(directory, ".lock"), "Claude accounts",
+                           CLAUDE_CODE_LOCK_WAIT)
 
 
 @contextmanager
-def _exclusive_lock(path, what):
-    """Take an O_EXCL lock file, reclaiming one older than 30 s once."""
-    deadline = time.monotonic() + 30
+def _exclusive_lock(path, what, wait=30):
+    """Take an O_EXCL lock file within `wait` s, reclaiming one older than 30 s once."""
+    deadline = time.monotonic() + wait
     removed_stale = False
     while time.monotonic() < deadline:
         try:
@@ -615,7 +621,7 @@ def _exclusive_lock(path, what):
                 continue
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
     else:
-        raise _LockTimeout(f"{what} lock was not acquired within 30 s")
+        raise _LockTimeout(f"{what} lock was not acquired within {wait} s")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(f"{os.getpid()} {time.time()}\n")

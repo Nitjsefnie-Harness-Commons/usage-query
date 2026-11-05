@@ -341,7 +341,7 @@ def test_snapshot_lock_deadline_does_not_refresh(tmp):
             assert rc == 1 and "claude" in got["errors"], raw
             assert "lock" in got["errors"]["claude"].lower()
             assert "claude" not in got["usage"]
-            assert clock[0] >= 30 and sleeps, "lock contention never waited to the deadline"
+            assert clock[0] >= mod.CLAUDE_CODE_LOCK_WAIT and sleeps, "lock contention never waited to the deadline"
             assert child.poll() is None and (accounts / ".lock").exists()
             assert Path(mod.CLAUDE_CRED).read_bytes() == live, "snapshot timeout changed credentials"
             assert {p.name: p.read_bytes() for p in accounts.glob("*.json")} == stashes
