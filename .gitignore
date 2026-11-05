@@ -57,6 +57,7 @@
 !/tests/_util.py
 !/tests/test_banked_resets_display.py
 !/tests/test_claude_absent_five_hour.py
+!/tests/test_claude_backoff.py
 !/tests/test_codex_credits.py
 !/tests/test_claude_accounts.py
 !/tests/test_claude_accounts_lock.py
