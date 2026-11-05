@@ -449,6 +449,58 @@ def _get_retry(url, headers):
     return _get(url, headers)
 
 
+# /api/oauth/usage shares one rate limit with every running Claude Code
+# session, so on a box with many sessions it answers 429 for hours. Every
+# inference response carries the same utilization in its
+# anthropic-ratelimit-unified-* headers; a one-token request reads them.
+CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_PROBE_MODEL = "claude-haiku-5-5"
+
+
+def _claude_header_probe(token):
+    """The usage payload's five_hour/seven_day blocks, from one minimal
+    inference request's rate-limit headers. Raises when none come back."""
+    body = json.dumps({
+        "model": CLAUDE_PROBE_MODEL, "max_tokens": 1,
+        "system": [{"type": "text",
+                    "text": "You are Claude Code, Anthropic's official CLI for Claude."}],
+        "messages": [{"role": "user", "content": "."}]}).encode()
+    req = urllib.request.Request(CLAUDE_MESSAGES_URL, data=body, method="POST", headers={
+        "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
+        "anthropic-version": "2023-06-01", "content-type": "application/json",
+        "User-Agent": CLAUDE_UA})
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        headers = r.headers
+    out = {}
+    for name, window in (("five_hour", "5h"), ("seven_day", "7d")):
+        util = headers.get(f"anthropic-ratelimit-unified-{window}-utilization")
+        if util is None:
+            continue
+        reset = headers.get(f"anthropic-ratelimit-unified-{window}-reset")
+        out[name] = {"utilization": round(float(util) * 100, 1),
+                     "resets_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                time.gmtime(int(reset))) if reset else None}
+    if "seven_day" not in out:
+        raise RuntimeError("no anthropic-ratelimit-unified-7d-utilization header")
+    return out
+
+
+def _write_probed(path, cached, probed):
+    """Cache the probed windows over the last payload, keeping any backoff."""
+    record = {k: v for k, v in (cached or {}).items() if k == "backoff"}
+    data = dict((cached or {}).get("data") or {})
+    data.update(probed)
+    record.update({"fetched_at": time.time(), "data": data})
+    try:
+        tmp = f"{path}.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return data
+
+
 def _claude_live_marker(directory):
     """Read a safe live marker independently of stash existence."""
     marker = os.path.join(directory, "live")
@@ -914,9 +966,13 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
     if data is None and now < until:
         note = ("HTTPError: HTTP Error 429: backing off until "
                 + time.strftime("%H:%M:%S", time.localtime(until)))
-        if stale is None:
-            raise RuntimeError(note)
-        (data, age), stale_error = stale, note
+        try:
+            data = _write_probed(cache_path, c, _claude_header_probe(
+                _claude_access_token(cred_path, errors)))
+        except Exception:
+            if stale is None:
+                raise RuntimeError(note)
+            (data, age), stale_error = stale, note
     if data is None:
         try:
             token = _claude_access_token(cred_path, errors)
@@ -936,10 +992,17 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
             except Exception as e:
                 if getattr(e, "code", None) == 429 and isinstance(e, urllib.error.HTTPError):
                     _write_backoff(cache_path, c if isinstance(c, dict) else {}, _retry_after(e))
-                if stale is None:
-                    raise
-                data, age = stale
-                stale_error = f"{type(e).__name__}: {e}"
+                    try:
+                        with open(cache_path, encoding="utf-8") as f:
+                            backed = json.load(f)
+                        data = _write_probed(cache_path, backed, _claude_header_probe(token))
+                    except Exception:
+                        data = None
+                if data is None:
+                    if stale is None:
+                        raise
+                    data, age = stale
+                    stale_error = f"{type(e).__name__}: {e}"
     out = {}
     session_listed = any(str(it.get("group") or "") == "session"
                          for it in (data.get("limits") or []))
