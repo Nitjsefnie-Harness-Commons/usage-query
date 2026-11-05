@@ -143,7 +143,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
 
-__version__ = "1.10.5"
+__version__ = "1.10.6"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
@@ -969,9 +969,9 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
         try:
             data = _write_probed(cache_path, c, _claude_header_probe(
                 _claude_access_token(cred_path, errors)))
-        except Exception:
+        except Exception as exc:
             if stale is None:
-                raise RuntimeError(note)
+                raise RuntimeError(note) from exc
             (data, age), stale_error = stale, note
     if data is None:
         try:
