@@ -654,7 +654,6 @@ def test_codex_survives_a_reset_credit_summary_with_no_detail(tmp):
     assert got.get("_reset_credits") in (None, [])
 
 
-
 def test_the_live_claude_account_holds_the_account_ttl(tmp):
     """A 60 s status-line refresh outlived the live account's old 30 s TTL, so every
     refresh fetched that token until its usage endpoint answered 429."""
@@ -680,4 +679,3 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

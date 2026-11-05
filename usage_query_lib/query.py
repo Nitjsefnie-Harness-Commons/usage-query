@@ -933,7 +933,7 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
                 })
                 _write_cache(cache_path, data)
             except Exception as e:
-                if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+                if getattr(e, "code", None) == 429 and isinstance(e, urllib.error.HTTPError):
                     _write_backoff(cache_path, c if isinstance(c, dict) else {}, _retry_after(e))
                 if stale is None:
                     raise
