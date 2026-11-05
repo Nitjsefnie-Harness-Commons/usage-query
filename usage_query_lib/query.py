@@ -436,9 +436,10 @@ def _write_backoff(path, cached, retry_after=None):
 
 
 def _retry_after(error):
+    value = (getattr(error, "headers", None) or {}).get("Retry-After")
     try:
-        return int((error.headers or {}).get("Retry-After"))
-    except (TypeError, ValueError, AttributeError):
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
         return None
 
 
