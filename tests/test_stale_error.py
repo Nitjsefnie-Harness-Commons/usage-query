@@ -66,6 +66,7 @@ class _Rig:
                 "five_hour": win, "seven_day": {"utilization": 8,
                                                 "resets_at": None}}
             self.target = "_get_retry"
+            self.ttl = mod.CLAUDE_ACCOUNT_CACHE_TTL
             stack.enter_context(mock.patch.object(mod, "CLAUDE_CRED", cred))
             stack.enter_context(mock.patch.object(mod, "CACHE", self.cache))
             stack.enter_context(mock.patch.object(

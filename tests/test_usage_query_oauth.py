@@ -654,9 +654,30 @@ def test_codex_survives_a_reset_credit_summary_with_no_detail(tmp):
     assert got.get("_reset_credits") in (None, [])
 
 
+
+def test_the_live_claude_account_holds_the_account_ttl(tmp):
+    """A 60 s status-line refresh outlived the live account's old 30 s TTL, so every
+    refresh fetched that token until its usage endpoint answered 429."""
+    mod = _util.load(USAGE_QUERY, "usage_query_claude_live_ttl")
+    assert mod.CLAUDE_ACCOUNT_CACHE_TTL >= 300
+    cache = os.path.join(tmp, "claude-usage.json")
+    payload = {"five_hour": {"utilization": 7, "resets_at": None},
+               "seven_day": {"utilization": 8, "resets_at": None}}
+    with open(cache, "w", encoding="utf-8") as f:
+        json.dump({"fetched_at": time.time() - 120, "data": payload}, f)
+    cred = os.path.join(tmp, "credentials.json")
+    with open(cred, "w", encoding="utf-8") as f:
+        f.write("{}")
+    with mock.patch.object(mod, "CLAUDE_CRED", cred), mock.patch.object(mod, "CACHE", cache), \
+            mock.patch.object(mod, "_get_retry") as fetch:
+        mod.query_claude()
+    fetch.assert_not_called()
+
+
 def main():
     return _util.runner(_util.collect(globals()), "usagequeryoauth_")
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

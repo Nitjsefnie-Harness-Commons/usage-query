@@ -302,6 +302,8 @@ CODEX_CACHE = os.path.join(TEMPDIR, ".codex_usage_cache.json")
 ZAI_CACHE = os.path.join(TEMPDIR, ".zai_usage_cache.json")
 ZAI_RESETS_CACHE = os.path.join(TEMPDIR, ".zai_resets_cache.json")
 CACHE_TTL = 30
+# Every Claude account, the live one included: a 30 s TTL under a 60 s status-line
+# refresh fetched the live token every minute until its usage endpoint answered 429.
 CLAUDE_ACCOUNT_CACHE_TTL = 300
 # Codex gets its own, much longer TTL. A status line refreshing every 30 s and a
 # 30 s TTL expire in lockstep, so essentially every refresh missed and paid for a
@@ -854,7 +856,7 @@ def _claude_refresh_grant(full, cred_path, account_name, source, errors):
     return _persist_claude_cred(full, resp, cred_path, account_name, refresh, errors)
 
 
-def query_claude(cred_path=None, cache_path=None, cache_ttl=CACHE_TTL, errors=None):
+def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE_TTL, errors=None):
     """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?,
     '_stale_error': str?} normalized, or
     raises. A fresh cache is used as-is; otherwise we fetch live (retrying a
