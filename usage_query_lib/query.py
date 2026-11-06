@@ -2346,7 +2346,7 @@ def _banked_spend_note(name, route):
 
 
 def query_codex():
-    """Normalized Codex quota windows, with fresh-cache and stale fallback.
+    """Normalized Codex windows, tagging every cached snapshot with its age.
 
     A failed live fetch serves the last cached payload however stale, tagged
     with '_stale_age' (seconds) and '_stale_error' (the failure, as
@@ -2356,6 +2356,7 @@ def query_codex():
     _require_configured("Codex", CODEX_AUTH)
     now = time.time()
     data, stale = None, None
+    cache_age = None
     try:
         with open(CODEX_CACHE, encoding="utf-8") as f:
             cached = json.load(f)
@@ -2363,6 +2364,7 @@ def query_codex():
         age = now - float(cached.get("fetched_at") or 0)
         if cached_data is not None:
             if age < CODEX_CACHE_TTL:
+                cache_age = max(0, int(age))
                 data = cached_data
             else:
                 stale = (cached_data, int(age))
@@ -2377,8 +2379,11 @@ def query_codex():
             if stale is None:
                 raise
             data, stale_age = stale
+            cache_age = stale_age
             stale_error = f"{type(e).__name__}: {e}"
     out = _normalize_codex(data)
+    if cache_age is not None:
+        out["_cache_age"] = cache_age
     if stale_age:
         out["_stale_age"] = stale_age
     if stale_error:
@@ -2400,10 +2405,10 @@ def _table_rows(account, res):
     `; refresh failed: <error>` after the age when a live fetch raised). Window
     labels are duration-style throughout (5h, 7d, and e.g. 7d:Fable for a
     scoped weekly) so they read consistently."""
-    stale = res.get("_stale_age")
+    cache_age = res.get("_cache_age", res.get("_stale_age"))
     failed = res.get("_stale_error")
-    detail = f"cached {stale}s" + (f"; refresh failed: {failed}" if failed else "")
-    name = account + (f" ({detail})" if stale else "")
+    detail = f"cached {cache_age}s" + (f"; refresh failed: {failed}" if failed else "")
+    name = account + (f" ({detail})" if cache_age is not None else "")
     # The banked-resets annotation is one shape for every provider; only its
     # placement differs. z.ai's weekly reset restores the weekly window, so it
     # rides the 7d row; a Codex Full reset restores every window, so it rides
