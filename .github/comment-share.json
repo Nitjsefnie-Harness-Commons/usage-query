@@ -1,0 +1,74 @@
+{
+  ".github/dependabot.yml": [
+    1102,
+    1476
+  ],
+  ".github/workflows/actionlint.yml": [
+    2038,
+    3276
+  ],
+  ".github/workflows/audit.yml": [
+    2144,
+    3195
+  ],
+  ".github/workflows/codeql.yml": [
+    1619,
+    2413
+  ],
+  ".github/workflows/lint.yml": [
+    575,
+    1635
+  ],
+  ".github/workflows/pr-gate.yml": [
+    427,
+    1095
+  ],
+  ".github/workflows/release.yml": [
+    1102,
+    2393
+  ],
+  ".github/workflows/tag.yml": [
+    2798,
+    5708
+  ],
+  ".github/workflows/tests.yml": [
+    2568,
+    5378
+  ],
+  ".github/workflows/types.yml": [
+    643,
+    1238
+  ],
+  "tests/_util.py": [
+    995,
+    2575
+  ],
+  "tests/test_banked_resets_display.py": [
+    2604,
+    10163
+  ],
+  "tests/test_package_contract.py": [
+    1399,
+    5399
+  ],
+  "tests/test_stale_error.py": [
+    1722,
+    10549
+  ],
+  "tests/test_usage_query_behavior.py": [
+    5512,
+    28981
+  ],
+  "tests/test_zai_weekly_resets.py": [
+    2376,
+    13623
+  ],
+  "usage_query_lib/__init__.py": [
+    217,
+    237
+  ],
+  "usage_query_lib/query.py": [
+    36089,
+    89061
+  ]
+}
