@@ -1,4 +1,4 @@
-"""Pending switch state pauses Claude requests and serves cached readings."""
+"""Pending switch state pauses Claude requests and serves cached readings; each reading stays its own account's."""
 import json
 import sys
 import time
@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 import _util
-from test_claude_accounts import install, run_json, setup
+from test_claude_accounts import credentials, install, run_json, setup
 from test_claude_accounts_lock import assert_new_pair, refreshing, replace_bytes
 
 
@@ -185,6 +185,32 @@ def test_marker_naming_state_file_uses_live_destination(tmp):
         assert errors == {} and got["five_hour"]["pct"] == 25
         assert_new_pair(Path(mod.CLAUDE_CRED))
         assert state.read_text(encoding="utf-8") == "{}", "refresh overwrote switcher state"
+
+
+def test_a_switch_inside_the_ttl_reads_the_new_live_account(tmp):
+    with setup(tmp, {"live-token": 10, "beta-token": 40}) as (mod, accounts, http):
+        install(accounts)
+        assert run_json(mod)[3]["usage"]["claude"]["five_hour"]["pct"] == 10
+        credentials(accounts / "alpha.json", "live-token")  # the switcher stashes alpha, installs beta
+        credentials(Path(mod.CLAUDE_CRED), "beta-token")
+        (accounts / "live").write_text("beta\n", encoding="utf-8")
+        got = run_json(mod)[3]
+        assert got["usage"]["claude"]["five_hour"]["pct"] == 40 and got["claude_accounts"]["beta"] == {"live": True, **got["usage"]["claude"]}
+        assert got["claude_accounts"]["alpha"]["five_hour"]["pct"] == 10
+        assert http.calls[2:] == [("usage", "Bearer beta-token"), ("usage", "Bearer live-token")]
+
+
+def test_without_accounts_the_cache_follows_the_logged_in_account(tmp):
+    with setup(tmp, {"live-token": 10, "other-token": 77}) as (mod, _, http):
+        now = time.time()
+        for uuid, token, later, pct, stale in (("u-1", "live-token", 0, 10, False), ("u-1", "refreshed", 0, 10, False),
+                                               ("u-2", "other-token", 0, 77, False), ("u-2", "refreshed", 301, 77, True)):
+            (Path(tmp) / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": uuid}}), encoding="utf-8")
+            credentials(Path(mod.CLAUDE_CRED), token)
+            with mock.patch.object(mod.time, "time", return_value=now + later):
+                reading = run_json(mod)[3]["usage"]["claude"]
+            assert (reading["five_hour"]["pct"], "_stale_error" in reading) == (pct, stale), (uuid, token, reading)
+        assert http.calls == [("usage", "Bearer live-token"), ("usage", "Bearer other-token"), ("usage", "Bearer refreshed")]
 
 
 if __name__ == "__main__":

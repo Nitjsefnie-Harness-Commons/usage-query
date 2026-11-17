@@ -21,8 +21,8 @@ def _trusted(folder) -> bool:
     return _mine(info) and not info.st_mode & stat.S_IWOTH
 
 
-def read(path, ttl):
-    """(record, fresh data, (stale data, age s)); a file not this user's own is ({}, None, None)."""
+def read(path, ttl, account):
+    """(record, fresh data, (stale data, age s)); a file not this user's own, or another account's, is ({}, None, None)."""
     try:
         if not _trusted(os.path.dirname(path) or "."):
             return {}, None, None
@@ -31,7 +31,7 @@ def read(path, ttl):
             record = json.load(stream) if stat.S_ISREG(info.st_mode) and _mine(info) else None
     except (OSError, ValueError, RecursionError):
         return {}, None, None
-    if not isinstance(record, dict):
+    if not isinstance(record, dict) or record.get("account", account) != account:
         return {}, None, None
     fetched, data = record.get("fetched_at"), record.get("data")
     try:
@@ -43,7 +43,7 @@ def read(path, ttl):
     return (record, data, None) if age < ttl else (record, None, (data, int(age)))
 
 
-def write(path, record) -> None:
+def write(path, record, account) -> None:
     """Replace `path` through a fresh 0600 temp file; a failure never fails a reading."""
     folder = os.path.dirname(path) or "."
     try:
@@ -60,7 +60,7 @@ def write(path, record) -> None:
             os.close(fd)
             raise
         with stream:
-            json.dump(record, stream)
+            json.dump({**record, "account": account}, stream)
         os.replace(tmp, path)
     except OSError:
         pass

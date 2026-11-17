@@ -17,6 +17,7 @@ import sys
 import time
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -58,8 +59,7 @@ class _Rig:
         self.outcome = RuntimeError("refresh boom")
         self.ttl = mod.CACHE_TTL
         cred = os.path.join(tmp, provider + "-cred.json")
-        with open(cred, "w", encoding="utf-8") as fh:
-            fh.write("{}")
+        Path(cred).write_text("{}", encoding="utf-8")
         win = {"utilization": 7, "resets_at": None}
         if provider == "claude":
             self.cache, self.payload = os.path.join(tmp, "claude.cache"), {
@@ -94,8 +94,7 @@ class _Rig:
             self.target = "_get_retry"
             self.error, self.outcome = ZAI_ERROR, ZAI_NO_PLAN
             key_file = os.path.join(tmp, "zai-key")
-            with open(key_file, "w", encoding="utf-8") as fh:
-                fh.write("k" * 49 + "\n")
+            Path(key_file).write_text("k" * 49 + "\n", encoding="utf-8")
             stack.enter_context(_zai_sources(mod, files=(key_file,)))
             stack.enter_context(mock.patch.object(mod, "ZAI_CACHE", self.cache))
             stack.enter_context(mock.patch.object(mod, "ZAI_RESETS_CACHE", self.resets_cache))
@@ -112,12 +111,11 @@ class _Rig:
         return self.outcome
 
     def seed(self, age=STALE_FOR, record=None):
-        with open(self.cache, "w", encoding="utf-8") as fh:
-            json.dump({"fetched_at": NOW - age, "data": self.payload} if record is None else record, fh)
+        Path(self.cache).write_text(json.dumps({"fetched_at": NOW - age, "data": self.payload} if record is None else record), encoding="utf-8")
 
     def unusable(self):
         return [{"fetched_at": at, "data": self.payload} for at in (NOW + 86400, float("inf"), float("-inf"), float("nan"), 10 ** 400, None, "0")] + [
-            {"fetched_at": NOW - 1, "data": [self.payload]}, [self.payload]]
+            {"fetched_at": NOW - 1, "data": [self.payload]}, [self.payload], {"fetched_at": NOW - 1, "data": self.payload, "account": "another"}]
 
     def succeed(self):
         self.outcome = self.payload
@@ -259,8 +257,7 @@ def test_zai_reset_list_read_without_live_carries_no_stale_error(tmp):
                         "recordId": 1, "grantType": "DIRECT",
                         "expireTime": "2026-10-29 00:13:36",
                         "available": True}]}}
-        with open(rig.resets_cache, "w", encoding="utf-8") as fh:
-            json.dump({"fetched_at": NOW - STALE_FOR, "data": envelope}, fh)
+        Path(rig.resets_cache).write_text(json.dumps({"fetched_at": NOW - STALE_FOR, "data": envelope}), encoding="utf-8")
         rc, entry, errors, _ = rig.entry()
         assert rc == 0 and errors == {}, (rc, errors)
         assert entry["_stale_error"] == ZAI_ERROR, entry
@@ -273,25 +270,24 @@ def test_zai_reset_list_read_without_live_carries_no_stale_error(tmp):
 def test_cached_fetch_reports_an_error_only_for_a_fetch_that_raised(tmp):
     mod = _load()
     path = os.path.join(tmp, "cache.json")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"fetched_at": time.time() - 600, "data": {"v": 1}}, fh)
+    Path(path).write_text(json.dumps({"fetched_at": time.time() - 600, "data": {"v": 1}}), encoding="utf-8")
     never = mock.Mock(side_effect=AssertionError("fetched"))
     # live=False: no attempt, so no error to report.
-    assert mod._cached_fetch(path, never, live=False)[0] == {"v": 1}
-    assert mod._cached_fetch(path, never, live=False)[2:] == (None,)
+    assert mod._cached_fetch(path, never, None, live=False)[0] == {"v": 1}
+    assert mod._cached_fetch(path, never, None, live=False)[2:] == (None,)
     never.assert_not_called()
     # live: the attempt raised, so the error is reported in `errors` form.
     failing = mock.Mock(side_effect=ValueError("down"))
-    data, age, error = mod._cached_fetch(path, failing)
+    data, age, error = mod._cached_fetch(path, failing, None)
     assert data == {"v": 1} and 599 <= age <= 700, (data, age)
     assert error == "ValueError: down", error
     # A success is neither stale nor in error.
     ok = mock.Mock(return_value={"v": 2})
-    assert mod._cached_fetch(path, ok) == ({"v": 2}, 0, None)
+    assert mod._cached_fetch(path, ok, None) == ({"v": 2}, 0, None)
     # Nothing cached and no fetch allowed still raises, as before.
     os.remove(path)
     try:
-        mod._cached_fetch(path, never, live=False)
+        mod._cached_fetch(path, never, None, live=False)
     except LookupError:
         pass
     else:

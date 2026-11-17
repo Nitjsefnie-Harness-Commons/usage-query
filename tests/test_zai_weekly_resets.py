@@ -13,6 +13,7 @@ import time
 import urllib.error
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -84,8 +85,7 @@ def _query(mod, tmp, resets, argv=None, resets_cache=None, quota_cache=None):
     """Run query_zai (or main(argv)) against the routed endpoints, with every
     cache and key source pinned inside `tmp`."""
     key_file = os.path.join(tmp, "api-key")
-    with open(key_file, "w", encoding="utf-8") as fh:
-        fh.write("k" * 49 + "\n")
+    Path(key_file).write_text("k" * 49 + "\n", encoding="utf-8")
     endpoints = _Endpoints(mod, resets)
     with _zai_sources(mod, files=(key_file,)), \
             mock.patch.object(mod, "ZAI_CACHE",
@@ -245,8 +245,7 @@ def test_a_failed_reset_fetch_keeps_the_last_good_list(tmp):
     cache = os.path.join(tmp, "resets.json")
     good = _reset_envelope([_entry(2, "2026-10-29 00:13:36")])
     written = time.time() - 600
-    with open(cache, "w", encoding="utf-8") as fh:
-        json.dump({"fetched_at": written, "data": good}, fh)
+    Path(cache).write_text(json.dumps({"fetched_at": written, "data": good}), encoding="utf-8")
     failure = urllib.error.HTTPError(mod.ZAI_RESETS_URL, 502, "bad gateway",
                                      None, None)
     out, endpoints = _query(mod, tmp, failure)
@@ -260,14 +259,12 @@ def test_a_failed_reset_fetch_keeps_the_last_good_list(tmp):
 def test_a_fresh_reset_cache_is_used_without_a_fetch(tmp):
     mod = _load()
     cache = os.path.join(tmp, "resets.json")
-    with open(cache, "w", encoding="utf-8") as fh:
-        json.dump({"fetched_at": time.time(),
-                   "data": _reset_envelope(
-                       [_entry(2, "2026-10-29 00:13:36")] * 3)}, fh)
-    out, endpoints = _query(mod, tmp, AssertionError("fetched past the cache"))
-    assert endpoints.urls() == [mod.ZAI_URL]
-    assert out["_weekly_resets"]["available"] == 3
-    assert "stale_age" not in out["_weekly_resets"]
+    for n, owner in enumerate(({}, {"account": mod._token_fingerprint("k" * 49)})):
+        Path(cache).write_text(json.dumps({"fetched_at": time.time(), "data": _reset_envelope([_entry(2, "2026-10-29 00:13:36")] * 3), **owner}), encoding="utf-8")
+        out, endpoints = _query(mod, tmp, AssertionError("fetched past the cache"), quota_cache=os.path.join(tmp, f"quota{n}.json"))
+        assert endpoints.urls() == [mod.ZAI_URL]
+        assert out["_weekly_resets"]["available"] == 3
+        assert "stale_age" not in out["_weekly_resets"]
 
 
 def test_a_quota_served_stale_does_not_wait_on_the_reset_list(tmp):
@@ -276,12 +273,9 @@ def test_a_quota_served_stale_does_not_wait_on_the_reset_list(tmp):
     only add a second timeout in front of rows that are ready."""
     mod = _load()
     quota_cache = os.path.join(tmp, "quota.json")
-    with open(quota_cache, "w", encoding="utf-8") as fh:
-        json.dump({"fetched_at": time.time() - 600, "data": _zai_envelope()},
-                  fh)
+    Path(quota_cache).write_text(json.dumps({"fetched_at": time.time() - 600, "data": _zai_envelope()}), encoding="utf-8")
     key_file = os.path.join(tmp, "api-key")
-    with open(key_file, "w", encoding="utf-8") as fh:
-        fh.write("k" * 49 + "\n")
+    Path(key_file).write_text("k" * 49 + "\n", encoding="utf-8")
     urls = []
 
     def unreachable(url, headers):
@@ -333,8 +327,7 @@ def test_three_runs_on_a_fresh_quota_cache_ask_for_the_list_once(tmp):
     # With the quota cache already fresh, no run touches the network.
     sub = os.path.join(tmp, "warm")
     os.makedirs(sub)
-    with open(os.path.join(sub, "quota.json"), "w", encoding="utf-8") as fh:
-        json.dump({"fetched_at": time.time(), "data": _zai_envelope()}, fh)
+    Path(sub, "quota.json").write_text(json.dumps({"fetched_at": time.time(), "data": _zai_envelope()}), encoding="utf-8")
     urls = []
     for _ in range(3):
         _, endpoints = _query(mod, sub, TimeoutError("timed out"))
