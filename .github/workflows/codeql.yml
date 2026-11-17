@@ -6,10 +6,11 @@ name: codeql
 # Security tab rather than turning the build red, so a new query shipping
 # upstream cannot block an unrelated push.
 #
-# The weekly cron is not redundant with push: CodeQL's query packs are
-# updated continuously, and a new query only ever runs against code that
-# has changed since it shipped. Without the cron, a rule published today
-# would never be applied to a file last touched last year.
+# The weekly cron is not redundant with push: a push analyses only when one
+# happens, and `paths-ignore` skips pushes that touch nothing but Markdown,
+# LICENSE or .gitignore. The scheduled run analyses the last commit on the
+# default branch, so that branch is re-analysed even after weeks with no
+# qualifying push.
 
 on:
   push:
@@ -62,10 +63,11 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-          # `security-extended` over the default `security` pack: this code parses
-          # untrusted transcript and config files off disk and builds paths
-          # from their contents, which is what the extra precision-medium
-          # queries are good at.
+          # `security-extended` over the default `code-scanning` suite: it is
+          # that suite plus lower severity and precision queries. This code
+          # parses credential and account-state files off disk and builds
+          # paths from names in them, so the extra queries are worth their
+          # extra noise.
           queries: security-extended
 
       - name: Analyze
