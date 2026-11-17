@@ -5,7 +5,7 @@ import sys
 from unittest import mock
 
 import _util
-from test_claude_accounts import Response, install, run, setup
+from test_claude_accounts import Response, install, run, run_json, setup
 
 
 def serving(http, five_hour=None, limits=None, tokens=("live-token", "beta-token")):
@@ -25,8 +25,7 @@ def test_null_five_hour_without_session_limit_is_absent_everywhere(tmp):
         install(accounts)
         weekly_limit = {"group": "weekly", "percent": 11}
         with serving(http, limits=[weekly_limit]):
-            rc, raw, err = run(mod, "--json")
-        got = json.loads(raw)
+            rc, raw, err, got = run_json(mod)
         assert rc == 0 and err == "" and got["errors"] == {}, (rc, raw, err)
         # Absent means the key is omitted, never present as null.
         assert set(got["usage"]["claude"]) == {"weekly"}, got["usage"]["claude"]
@@ -56,8 +55,7 @@ def test_session_window_from_either_source_keeps_five_hour(tmp):
         os.makedirs(home)
         with setup(home, {"live-token": 10}) as (mod, _, http):
             with serving(http, five_hour, limits, tokens=("live-token",)):
-                rc, raw, err = run(mod, "--json")
-            got = json.loads(raw)
+                rc, raw, err, got = run_json(mod)
             assert rc == 0 and err == "", (label, rc, raw, err)
             assert got["usage"]["claude"]["five_hour"]["pct"] == pct, (label, got)
             with serving(http, five_hour, limits, tokens=("live-token",)):

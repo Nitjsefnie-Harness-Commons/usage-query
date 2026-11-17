@@ -84,4 +84,5 @@
 !/usage_query_lib/
 !/usage_query_lib/__init__.py
 !/usage_query_lib/query.py
+!/usage_query_lib/claude_state.py
 !/usage_query_lib/zai_schedule.py

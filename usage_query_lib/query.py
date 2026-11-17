@@ -143,7 +143,7 @@ import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from . import zai_schedule
+from . import claude_state, zai_schedule
 
 __version__ = "1.10.6"
 
@@ -698,12 +698,7 @@ def _claude_credential_snapshot(cred_path):
 
 def _claude_snapshot_locked(directory, cred_path):
     """The snapshot itself; the caller holds the accounts lock."""
-    try:
-        with open(os.path.join(directory, "state.json"), encoding="utf-8") as stream:
-            state = json.load(stream)
-    except FileNotFoundError:
-        state = {}
-    if "pending" in state:
+    if claude_state.swap_pending(os.path.join(directory, "state.json")):
         raise _ClaudeSwapPending("Claude reading paused while an account swap is pending")
     account_name = _claude_account_name(cred_path)
     source = cred_path

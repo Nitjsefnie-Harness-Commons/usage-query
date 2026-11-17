@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import _util
-from test_claude_accounts import credentials, install, run, setup
+from test_claude_accounts import credentials, install, run_json, setup
 
 
 def replace_bytes(path, data):
@@ -336,8 +336,7 @@ def test_snapshot_lock_deadline_does_not_refresh(tmp):
         with held_by_process(accounts / ".lock") as child:
             with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
                     mock.patch.object(mod.time, "sleep", side_effect=sleep):
-                rc, raw, _ = run(mod, "--json")
-            got = json.loads(raw)
+                rc, raw, _, got = run_json(mod)
             assert rc == 1 and "claude" in got["errors"], raw
             assert "lock" in got["errors"]["claude"].lower()
             assert "claude" not in got["usage"]
