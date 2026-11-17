@@ -47,3 +47,14 @@ updates:
       prefix: "ci"
     labels:
       - dependencies
+    # codeql.yml runs github/codeql-action/init and /analyze, and a job whose
+    # two steps sit on different release versions fails at `analyze`. Dependabot
+    # names each sub-action as its own dependency, so without a group it opens
+    # one pull request per sub-action, each of which is red alone. Version
+    # updates only: a group with no `applies-to` covers nothing else, and this
+    # repository has Dependabot security updates off. Turning them on needs a
+    # second group here with `applies-to: security-updates`.
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action/*"
