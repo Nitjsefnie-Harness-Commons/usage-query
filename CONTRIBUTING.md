@@ -18,7 +18,7 @@ A change is proposed as a pull request, with its description filled in from
 The `pr gate` workflow (`.github/workflows/pr-gate.yml`, running
 Nitjsefnie-Actions/pr-gate) checks a non-draft pull request's description and
 its commits' Conventional Commits subjects. A draft is checked when it is
-marked ready, and bot-authored pull requests are not gated, so the format above
+marked ready, and bot-authored pull requests are not gated; the format above
 applies to them all the same.
 
 Review, an external pull request's included, checks that each type and `!`

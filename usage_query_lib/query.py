@@ -116,8 +116,8 @@ Flags:
   --quiet         suppress per-account error lines (still exits non-zero on
                   any requested-account failure)
 
-Exit status: 1 if `errors` is non-empty (HTTP error, bad payload, a flag-named
-provider with absent creds), else 0; a default sweep files those in `unconfigured`.
+Exit status: 2 on bad flags, 1 if `errors` is non-empty (HTTP error, bad payload, a
+flag-named absent provider), else 0; a default sweep puts absent ones in `unconfigured`.
 
 Cross-platform: stdlib urllib only (no curl). Reset timestamps are rendered in
 the machine's own timezone and labelled "machine-local ... no tz conversion" so
@@ -413,8 +413,8 @@ def _write_cache(path, data):
         pass
 
 
-# After a 429 that survives the retries, no process on the box fetches that
-# account again until the backoff in its cache file expires: BACKOFF_BASE
+# After a 429, no process on the box asks that account's usage endpoint
+# again until the backoff in its cache file expires: BACKOFF_BASE
 # doubling per consecutive 429 up to BACKOFF_CAP, or the server's Retry-After
 # when longer (still capped). A success rewrites the file without it.
 BACKOFF_BASE = 300
@@ -934,9 +934,9 @@ def _claude_refresh_grant(full, cred_path, account_name, source, errors):
 
 def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE_TTL, errors=None):
     """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?,
-    '_stale_error': str?} normalized, or raises. A fresh cache answers as-is,
-    else one live fetch; on its 429 (recorded as a cache-file backoff) or
-    in the backoff, _claude_header_probe reads the windows. Failing those, the
+    '_stale_error': str?} normalized, or raises. A fresh cache answers as-is; in
+    a cache-file 429 backoff _claude_header_probe reads the windows; else one
+    live fetch, whose 429 starts it and runs the probe. Failing those, the
     last cache answers however stale, with '_stale_age' (s) and
     '_stale_error' ('<ExceptionType>: <message>', as in `errors`). Outside a
     backoff, a pending swap, or Claude Code's refresh lock or the accounts lock
