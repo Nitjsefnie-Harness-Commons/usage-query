@@ -62,7 +62,7 @@ def test_consecutive_429s_double_the_backoff_up_to_the_cap(tmp):
     assert delays == [min(cap, base * 2 ** n) for n in range(6)], delays
     query(mod, cache, cred, throttled(retry_after=cap * 10))
     assert json.load(open(cache, encoding="utf-8"))["backoff"]["until"] - time.time() <= cap
-    for streak, delay in ((10 ** 12, cap), (float("inf"), base), ("x", base)):  # huge: no 2 ** (streak - 1); not a number: none
+    for streak, delay in ((10 ** 12, cap), (float("inf"), base), ("x", base), (-5, base), (-(10 ** 400), base)):  # huge: no 2 ** (streak - 1); not a number: none
         json.dump({"fetched_at": 0, "data": PAYLOAD, "backoff": {"streak": streak, "until": 0}}, open(cache, "w", encoding="utf-8"))
         query(mod, cache, cred, throttled())
         assert round(json.load(open(cache, encoding="utf-8"))["backoff"]["until"] - time.time(), -1) == delay, streak

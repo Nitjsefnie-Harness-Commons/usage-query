@@ -415,10 +415,10 @@ def _write_backoff(path, cached, account, retry_after=None):
     """Atomically record the next 429 backoff in the cache file, keeping its payload."""
     record = {k: v for k, v in (cached or {}).items() if k in ("fetched_at", "data")}
     try:
-        streak = int(((cached or {}).get("backoff") or {}).get("streak") or 0) + 1
+        streak = min(max(int(((cached or {}).get("backoff") or {}).get("streak") or 0), 0), 16) + 1
     except (TypeError, ValueError, OverflowError):
         streak = 1
-    delay = min(BACKOFF_CAP, max(BACKOFF_BASE * 2 ** min(streak - 1, 16), retry_after or 0))
+    delay = min(BACKOFF_CAP, max(BACKOFF_BASE * 2 ** (streak - 1), retry_after or 0))
     record["backoff"] = {"streak": streak, "until": time.time() + delay}
     cache_store.write(path, record, account)
     return record["backoff"]["until"]
@@ -509,14 +509,14 @@ def _claude_account_name(cred_path):
 
 
 def _claude_cache_account(cred_path):
-    name = _claude_account_name(cred_path)
-    if name or not _claude_is_live(cred_path):
-        return name
+    if not _claude_is_live(cred_path):
+        return _claude_account_name(cred_path)
     try:
         with open(os.path.join(os.path.dirname(os.path.dirname(CLAUDE_CRED)), ".claude.json"), encoding="utf-8") as stream:
-            return json.load(stream)["oauthAccount"]["accountUuid"]
+            uuid = json.load(stream)["oauthAccount"]["accountUuid"]
     except Exception:
-        return None
+        uuid = None
+    return [_claude_account_name(cred_path), uuid]
 
 
 # Seconds between mtime touches of a lock held across a network call, well
@@ -935,6 +935,13 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
     now, account = time.time(), _claude_cache_account(cred_path)
+
+    def access_token():
+        nonlocal cache_path
+        token = _claude_access_token(cred_path, errors)
+        if _claude_cache_account(cred_path) != account:
+            cache_path = None
+        return token
     c, data, stale = cache_store.read(cache_path, cache_ttl, account)
     age, stale_error = 0, None
     until = (c.get("backoff") or {}).get("until")
@@ -943,15 +950,15 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
         note = ("HTTPError: HTTP Error 429: backing off until "
                 + time.strftime("%H:%M:%S", time.localtime(until)))
         try:
-            data = _write_probed(cache_path, c, _claude_header_probe(
-                _claude_access_token(cred_path, errors)), account)
+            token = access_token()
+            data = _write_probed(cache_path, c, _claude_header_probe(token), account)
         except Exception as exc:
             if stale is None:
                 raise RuntimeError(note) from exc
             (data, age), stale_error = stale, note
     if data is None:
         try:
-            token = _claude_access_token(cred_path, errors)
+            token = access_token()
         except (_ClaudeSwapPending, _LockTimeout):
             # A pending swap, or Claude Code's refresh lock or the accounts
             # lock still held at its deadline: no refresh this run, serve the cache.
