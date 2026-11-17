@@ -1,7 +1,7 @@
 {
   ".github/dependabot.yml": [
-    1102,
-    1476
+    998,
+    1537
   ],
   ".github/workflows/actionlint.yml": [
     2038,
@@ -12,8 +12,8 @@
     3195
   ],
   ".github/workflows/codeql.yml": [
-    1619,
-    2413
+    1526,
+    2320
   ],
   ".github/workflows/lint.yml": [
     575,
