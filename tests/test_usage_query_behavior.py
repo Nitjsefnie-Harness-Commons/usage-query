@@ -8,6 +8,7 @@ import sys
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -190,8 +191,7 @@ def test_a_removed_provider_is_not_spoken_for_by_its_leftover_cache(tmp):
     while the provider was installed cannot answer for it afterwards."""
     mod, cache, absent = _load(), os.path.join(tmp, "cache.json"), os.path.join(tmp, "absent.json")
     for age in (1, 10 ** 5):
-        with open(cache, "w", encoding="utf-8") as fh:
-            json.dump({"data": {"limits": []}, "fetched_at": time.time() - age}, fh)
+        Path(cache).write_text(json.dumps({"data": {"limits": []}, "fetched_at": time.time() - age}), encoding="utf-8")
         for query, removed in ((mod.query_kimi, mock.patch.multiple(mod, KIMI_CACHE=cache, KIMI_CRED=absent)),
                                (mod.query_codex, mock.patch.multiple(mod, CODEX_CACHE=cache, CODEX_AUTH=absent)),
                                (mod.query_zai, _zai_sources(mod, cred=absent))):
@@ -317,17 +317,15 @@ def test_zai_human_and_json_output_include_billing_schedule(tmp):
 
 def test_zai_query_reads_the_documented_key_file_and_caches(tmp):
     mod = _load()
-    key_file = os.path.join(tmp, "api-key")
-    with open(key_file, "w", encoding="utf-8") as fh:
-        fh.write("k" * 49 + "\r\n")
-    cache = os.path.join(tmp, "zai-cache.json")
-    with _zai_sources(mod, files=(key_file,)), \
-            mock.patch.object(mod, "ZAI_CACHE", cache), \
-            mock.patch.object(mod, "ZAI_RESETS_CACHE",
-                              os.path.join(tmp, "zai-resets.json")), \
-            mock.patch.object(mod, "_get_retry",
-                              side_effect=lambda *a, **k: _zai_envelope()):
-        out = mod.query_zai()
+    key_file, cache = os.path.join(tmp, "api-key"), os.path.join(tmp, "zai-cache.json")
+    for key, fetched in (("k" * 49, True), ("k" * 49, False), ("j" * 49, True)):  # a changed key is another account
+        Path(key_file).write_text(key + "\r\n", encoding="utf-8")
+        with _zai_sources(mod, files=(key_file,)), mock.patch.object(mod, "ZAI_CACHE", cache), \
+                mock.patch.object(mod, "ZAI_RESETS_CACHE", os.path.join(tmp, "zai-resets.json")), \
+                mock.patch.object(mod, "_get_retry", side_effect=lambda *a, **k: _zai_envelope()) as get:
+            out = mod.query_zai()
+        assert (mod.ZAI_URL, mod._zai_headers(key)) in [c.args for c in get.call_args_list] if fetched else not get.called, key
+        assert key not in Path(cache).read_text(encoding="utf-8"), "the cache stored the key"
     assert out["_plan_type"] == "lite"
     assert out["_billing"]["peak_hours"] == "Mon-Fri 14:00-18:00 UTC+8"
     assert set(out["_billing"]["next_transition"]) == {"state", "at", "in"}
@@ -344,12 +342,9 @@ def test_zai_key_resolution_follows_the_spawn_launchers(tmp):
     override = os.path.join(tmp, "api-key")
     shipped = os.path.join(tmp, "zai-api-key")
     cred = os.path.join(tmp, "auth.json")
-    with open(override, "w", encoding="utf-8") as fh:
-        fh.write("from-override-file\n")
-    with open(shipped, "w", encoding="utf-8") as fh:
-        fh.write("from-shipped-copy\n")
-    with open(cred, "w", encoding="utf-8") as fh:
-        json.dump({"zai": {"type": "api", "key": "from-auth-json"}}, fh)
+    Path(override).write_text("from-override-file\n", encoding="utf-8")
+    Path(shipped).write_text("from-shipped-copy\n", encoding="utf-8")
+    Path(cred).write_text(json.dumps({"zai": {"type": "api", "key": "from-auth-json"}}), encoding="utf-8")
 
     files = (override, shipped)
     with _zai_sources(mod, env="from-environment", files=files, cred=cred):
@@ -363,8 +358,7 @@ def test_zai_key_resolution_follows_the_spawn_launchers(tmp):
 
     # An empty override file is not a key: fall through, do not authenticate
     # with "".
-    with open(override, "w", encoding="utf-8") as fh:
-        fh.write("   \n")
+    Path(override).write_text("   \n", encoding="utf-8")
     with _zai_sources(mod, files=files, cred=cred):
         assert mod._zai_cred() == "from-shipped-copy"
 
@@ -382,8 +376,7 @@ def test_zai_key_resolution_follows_the_spawn_launchers(tmp):
 def test_zai_query_rejects_a_keyless_entry_and_an_error_envelope(tmp):
     mod = _load()
     cred = os.path.join(tmp, "auth.json")
-    with open(cred, "w", encoding="utf-8") as fh:
-        json.dump({"zai": {"type": "api"}}, fh)
+    Path(cred).write_text(json.dumps({"zai": {"type": "api"}}), encoding="utf-8")
     with _zai_sources(mod, cred=cred):
         try:
             mod.query_zai()
@@ -391,8 +384,7 @@ def test_zai_query_rejects_a_keyless_entry_and_an_error_envelope(tmp):
             assert "no API key" in str(exc)
         else:
             raise AssertionError("a keyless zai entry authenticated")
-    with open(cred, "w", encoding="utf-8") as fh:
-        json.dump({"zai": {"type": "api", "key": "k"}}, fh)
+    Path(cred).write_text(json.dumps({"zai": {"type": "api", "key": "k"}}), encoding="utf-8")
     bad = _zai_envelope()
     bad["code"] = 500
     bad["msg"] = "boom"
@@ -675,8 +667,7 @@ def test_zai_query_labels_windows_with_the_campaign_clause(tmp):
     promotions, the label is exactly the bare billing state it always was."""
     mod = _load()
     key_file = os.path.join(tmp, "api-key")
-    with open(key_file, "w", encoding="utf-8") as fh:
-        fh.write("k" * 49 + "\n")
+    Path(key_file).write_text("k" * 49 + "\n", encoding="utf-8")
     label = "off-peak 0.5x · GLM-5.3-Flash 2x active, ends in 8h30m"
     frozen = datetime(2026, 9, 3, 16, 30, tzinfo=timezone.utc)  # 00:30+8
     with _zai_sources(mod, files=(key_file,)), \
@@ -749,8 +740,7 @@ def test_zai_query_reads_the_clock_once_for_billing_and_label(tmp):
     peak_note stamped on every window into different windows."""
     mod = _load()
     key_file = os.path.join(tmp, "api-key")
-    with open(key_file, "w", encoding="utf-8") as fh:
-        fh.write("k" * 49 + "\n")
+    Path(key_file).write_text("k" * 49 + "\n", encoding="utf-8")
     seen = {}
 
     def billing(now=None):

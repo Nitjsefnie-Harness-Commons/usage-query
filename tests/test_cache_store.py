@@ -12,7 +12,7 @@ from unittest import mock
 import _util
 from test_claude_backoff import PAYLOAD, query, rig
 
-RECORD, NOTHING = {"fetched_at": 0, "data": {"v": 1}}, ({}, None, None)
+RECORD, NOTHING = {"fetched_at": 0, "data": {"v": 1}, "account": None}, ({}, None, None)
 
 
 def patched(name, uid=0, mode=0):
@@ -28,31 +28,31 @@ def test_the_caches_are_private_files_in_this_users_home(tmp):
     assert {os.path.dirname(getattr(mod, name)) for name in ("CACHE", "KIMI_CACHE", "CODEX_CACHE", "ZAI_CACHE", "ZAI_RESETS_CACHE")} == {home}
     old = os.umask(0o022)
     try:
-        cache.write(mod.CACHE, RECORD)
+        cache.write(mod.CACHE, RECORD, None)
     finally:
         os.umask(old)
     with mock.patch.object(os, "replace", side_effect=OSError("busy")):
-        cache.write(mod.CACHE, {"fetched_at": 1, "data": {}})
+        cache.write(mod.CACHE, {"fetched_at": 1, "data": {}}, None)
     with mock.patch.object(os, "fdopen", side_effect=OSError("no stream")), mock.patch.object(os, "close", wraps=os.close) as close:
-        cache.write(mod.CACHE, {"fetched_at": 1, "data": {}})
+        cache.write(mod.CACHE, {"fetched_at": 1, "data": {}}, None)
     assert close.call_count == 1, "the temp file's descriptor was left open"
-    assert cache.read(mod.CACHE, 60)[0] == RECORD and os.listdir(home) == [os.path.basename(mod.CACHE)]
+    assert cache.read(mod.CACHE, 60, None)[0] == RECORD and os.listdir(home) == [os.path.basename(mod.CACHE)]
     if not hasattr(os, "geteuid"):
         _util.skip("no uids to own files by on this platform")
     assert (os.stat(home).st_mode & 0o777, os.stat(mod.CACHE).st_mode & 0o777) == (0o700, 0o600)
     with patched("fstat", uid=1):
-        assert cache.read(mod.CACHE, 60) == NOTHING, "another user's file was read"
+        assert cache.read(mod.CACHE, 60, None) == NOTHING, "another user's file was read"
     for uid, mode in ((1, 0), (0, stat.S_IWOTH)):  # the folder another user's, or world-writable
         with patched("stat", uid, mode):
-            assert cache.read(mod.CACHE, 60) == NOTHING, (uid, mode)
-            cache.write(mod.CACHE, {"fetched_at": 2, "data": {}})
+            assert cache.read(mod.CACHE, 60, None) == NOTHING, (uid, mode)
+            cache.write(mod.CACHE, {"fetched_at": 2, "data": {}}, None)
         assert json.loads(Path(mod.CACHE).read_text(encoding="utf-8")) == RECORD, (uid, mode)
     link, fifo, got = os.path.join(home, "link"), os.path.join(home, "fifo"), []
     os.symlink(mod.CACHE, link)
     os.mkfifo(fifo)
 
     def promptly(*paths):
-        reader = threading.Thread(target=lambda: got.extend(cache.read(path, 60) for path in paths), daemon=True)
+        reader = threading.Thread(target=lambda: got.extend(cache.read(path, 60, None) for path in paths), daemon=True)
         reader.start()
         reader.join(10)
     promptly(fifo)
@@ -79,8 +79,9 @@ def test_the_caches_are_private_files_in_this_users_home(tmp):
 
 def test_a_backoff_past_the_cap_or_not_finite_is_ignored(tmp):
     mod, cache, cred = rig(tmp, "uq_store_backoff", cached_age=600)
-    for until, held in ((1e300, False), (10 ** 400, False), (float("inf"), False), (float("nan"), False), (time.time() + mod.BACKOFF_CAP + 60, False), (time.time() + mod.BACKOFF_CAP - 60, True)):
-        Path(cache).write_text(json.dumps({"fetched_at": time.time() - 600, "data": PAYLOAD, "backoff": {"streak": 1, "until": until}}), encoding="utf-8")
+    in_range = time.time() + mod.BACKOFF_CAP - 60
+    for until, held, account in [(until, False, "credentials") for until in (1e300, 10 ** 400, float("inf"), float("nan"), in_range + 120)] + [(in_range, True, "credentials"), (in_range, False, "another")]:
+        Path(cache).write_text(json.dumps({"fetched_at": time.time() - 600, "data": PAYLOAD, "backoff": {"streak": 1, "until": until}, "account": account}), encoding="utf-8")
         got, get = query(mod, cache, cred, lambda *_: PAYLOAD)
         assert get.call_count == (0 if held else 1) and ("backing off" in got.get("_stale_error", "")) is held, (until, got)
 

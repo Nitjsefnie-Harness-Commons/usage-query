@@ -13,18 +13,12 @@ from unittest import mock
 import _util
 
 
-class Response:
+class Response(io.BytesIO):
+    """A urlopen() reply: a context manager whose body is `payload` as JSON."""
+
     def __init__(self, payload):
         self.raw = json.dumps(payload).encode()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def read(self):
-        return self.raw
+        super().__init__(self.raw)
 
 
 def credentials(path, token, stale=False):

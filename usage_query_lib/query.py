@@ -397,10 +397,10 @@ def _get(url, headers):
         return json.loads(r.read().decode("utf-8", errors="replace"))
 
 
-def _write_cache(path, data):
+def _write_cache(path, data, account):
     """Seed the cache on a SUCCESSFUL fetch only. Never called with None, so a
     failed fetch never blanks the cache, and a later run has a stale fallback."""
-    cache_store.write(path, {"fetched_at": time.time(), "data": data})
+    cache_store.write(path, {"fetched_at": time.time(), "data": data}, account)
 
 
 # After a 429, no process of this user asks that account's usage endpoint
@@ -411,13 +411,16 @@ BACKOFF_BASE = 300
 BACKOFF_CAP = 3600
 
 
-def _write_backoff(path, cached, retry_after=None):
+def _write_backoff(path, cached, account, retry_after=None):
     """Atomically record the next 429 backoff in the cache file, keeping its payload."""
     record = {k: v for k, v in (cached or {}).items() if k in ("fetched_at", "data")}
-    streak = int(((cached or {}).get("backoff") or {}).get("streak") or 0) + 1
-    delay = min(BACKOFF_CAP, max(BACKOFF_BASE * 2 ** (streak - 1), retry_after or 0))
+    try:
+        streak = int(((cached or {}).get("backoff") or {}).get("streak") or 0) + 1
+    except (TypeError, ValueError, OverflowError):
+        streak = 1
+    delay = min(BACKOFF_CAP, max(BACKOFF_BASE * 2 ** min(streak - 1, 16), retry_after or 0))
     record["backoff"] = {"streak": streak, "until": time.time() + delay}
-    cache_store.write(path, record)
+    cache_store.write(path, record, account)
     return record["backoff"]["until"]
 
 
@@ -471,13 +474,13 @@ def _claude_header_probe(token):
     return out
 
 
-def _write_probed(path, cached, probed):
+def _write_probed(path, cached, probed, account):
     """Cache the probed windows over the last payload, keeping any backoff."""
     record = {k: v for k, v in (cached or {}).items() if k == "backoff"}
     data = dict((cached or {}).get("data") or {})
     data.update(probed)
     record.update({"fetched_at": time.time(), "data": data})
-    cache_store.write(path, record)
+    cache_store.write(path, record, account)
     return data
 
 
@@ -503,6 +506,17 @@ def _claude_account_name(cred_path):
     directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
     name = _claude_live_marker(directory)
     return name if name and os.path.isfile(os.path.join(directory, name + ".json")) else None
+
+
+def _claude_cache_account(cred_path):
+    name = _claude_account_name(cred_path)
+    if name or not _claude_is_live(cred_path):
+        return name
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(CLAUDE_CRED)), ".claude.json"), encoding="utf-8") as stream:
+            return json.load(stream)["oauthAccount"]["accountUuid"]
+    except Exception:
+        return None
 
 
 # Seconds between mtime touches of a lock held across a network call, well
@@ -920,8 +934,8 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
     cred_path = cred_path or CLAUDE_CRED
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
-    now = time.time()
-    c, data, stale = cache_store.read(cache_path, cache_ttl)
+    now, account = time.time(), _claude_cache_account(cred_path)
+    c, data, stale = cache_store.read(cache_path, cache_ttl, account)
     age, stale_error = 0, None
     until = (c.get("backoff") or {}).get("until")
     # Capped: an `until` farther than BACKOFF_CAP, or not finite, would hold fetches off for good.
@@ -930,7 +944,7 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
                 + time.strftime("%H:%M:%S", time.localtime(until)))
         try:
             data = _write_probed(cache_path, c, _claude_header_probe(
-                _claude_access_token(cred_path, errors)))
+                _claude_access_token(cred_path, errors)), account)
         except Exception as exc:
             if stale is None:
                 raise RuntimeError(note) from exc
@@ -950,13 +964,13 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
                     "Authorization": f"Bearer {token}",
                     "anthropic-beta": "oauth-2025-04-20",
                 })
-                _write_cache(cache_path, data)
+                _write_cache(cache_path, data, account)
             except Exception as e:
                 if getattr(e, "code", None) == 429 and isinstance(e, urllib.error.HTTPError):
-                    _write_backoff(cache_path, c, _retry_after(e))
+                    _write_backoff(cache_path, c, account, _retry_after(e))
                     try:
-                        backed = cache_store.read(cache_path, cache_ttl)[0]
-                        data = _write_probed(cache_path, backed, _claude_header_probe(token))
+                        backed = cache_store.read(cache_path, cache_ttl, account)[0]
+                        data = _write_probed(cache_path, backed, _claude_header_probe(token), account)
                     except Exception:
                         data = None
                 if data is None:
@@ -1225,13 +1239,14 @@ def query_kimi():
     stale), tagged with '_stale_age' seconds and '_stale_error' — same as the
     Claude side."""
     _require_configured("Kimi", KIMI_CRED)
-    _, data, stale = cache_store.read(KIMI_CACHE, CACHE_TTL)
+    # kimi-cli stores no account id
+    _, data, stale = cache_store.read(KIMI_CACHE, CACHE_TTL, None)
     age, stale_error = 0, None
     if data is None:
         token = _kimi_access_token()
         try:
             data = _get(KIMI_URL, {"Authorization": f"Bearer {token}"})
-            _write_cache(KIMI_CACHE, data)
+            _write_cache(KIMI_CACHE, data, None)
         except Exception as e:
             if stale is None:
                 raise
@@ -1551,7 +1566,7 @@ def _normalize_zai(envelope, peak_note):
     return out
 
 
-def _cached_fetch(path, fetch, live=True):
+def _cached_fetch(path, fetch, account, live=True):
     """(payload, stale_age, stale_error) through a cache file: a
     payload younger than CACHE_TTL answers without a fetch; otherwise `fetch()`
     runs (only when `live`) and its result is cached; if it raises - or `live`
@@ -1560,7 +1575,7 @@ def _cached_fetch(path, fetch, live=True):
     '<ExceptionType>: <message>', the form `errors` uses; None unless a fetch
     ran and raised. Raises the fetch's error, or LookupError when not `live`,
     if there is nothing cached at all."""
-    _, fresh, stale = cache_store.read(path, CACHE_TTL)
+    _, fresh, stale = cache_store.read(path, CACHE_TTL, account)
     if fresh is not None:
         return fresh, 0, None
     if not live:
@@ -1569,7 +1584,7 @@ def _cached_fetch(path, fetch, live=True):
         return (*stale, None)
     try:
         data = fetch()
-        _write_cache(path, data)
+        _write_cache(path, data, account)
         return data, 0, None
     except Exception as e:
         if stale is None:
@@ -1640,7 +1655,7 @@ def _zai_weekly_resets(key, live=True):
         return envelope
 
     try:
-        envelope, age, _ = _cached_fetch(ZAI_RESETS_CACHE, fetch, live)
+        envelope, age, _ = _cached_fetch(ZAI_RESETS_CACHE, fetch, _token_fingerprint(key), live)
         block = _normalize_zai_weekly_resets(envelope)
     except Exception:
         return None
@@ -1717,7 +1732,7 @@ def query_zai():
         fetched_live.append(True)
         return envelope
 
-    data, age, stale_error = _cached_fetch(ZAI_CACHE, fetch)
+    data, age, stale_error = _cached_fetch(ZAI_CACHE, fetch, _token_fingerprint(key))
     # One clock read feeds both: fetched separately, an instant straddling a
     # window boundary would put the _billing entry and the peak_note stamped
     # on every window into different windows.
@@ -2292,12 +2307,16 @@ def query_codex():
     A machine with no Codex credentials raises ProviderNotConfigured before
     the cache is read, so a removed install's leftover cache never reports."""
     _require_configured("Codex", CODEX_AUTH)
-    _, data, stale = cache_store.read(CODEX_CACHE, CODEX_CACHE_TTL)
+    try:
+        account = _codex_auth()["tokens"]["account_id"]
+    except Exception:
+        account = None
+    _, data, stale = cache_store.read(CODEX_CACHE, CODEX_CACHE_TTL, account)
     stale_age, stale_error = 0, None
     if data is None:
         try:
             data = _codex_rate_limits()
-            _write_cache(CODEX_CACHE, data)
+            _write_cache(CODEX_CACHE, data, account)
         except Exception as e:
             if stale is None:
                 raise

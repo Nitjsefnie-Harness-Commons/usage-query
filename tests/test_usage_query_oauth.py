@@ -11,34 +11,18 @@ import time
 import urllib.error
 import urllib.parse
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _util  # noqa: E402
-
+from test_claude_accounts import Response as _FakeResponse  # noqa: E402
 
 USAGE_QUERY = os.path.join(_util.SCRIPTS, "query.py")
 
 
-class _FakeResponse:
-    """Minimal urlopen() context manager returning a canned JSON body."""
-
-    def __init__(self, payload):
-        self._raw = json.dumps(payload).encode("utf-8")
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def read(self):
-        return self._raw
-
-
 def _write_kimi_cred(path, cred):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(cred, f)
+    Path(path).write_text(json.dumps(cred), encoding="utf-8")
     os.chmod(path, 0o600)
 
 
@@ -48,12 +32,8 @@ def test_stale_kimi_token_refreshes_and_persists_the_rotated_pair(tmp):
     pair must land on disk or the next refresh (ours or kimi's) hits invalid_grant."""
     mod = _util.load(USAGE_QUERY, "usage_query_kimi_refresh")
     cred = os.path.join(tmp, "kimi-code.json")
-    _write_kimi_cred(cred, {
-        "access_token": "access-token-old",
-        "refresh_token": "refresh-token-old",
-        "expires_at": time.time() - 60,
-        "keep_me": "untouched",
-    })
+    _write_kimi_cred(cred, {"access_token": "access-token-old", "refresh_token": "refresh-token-old",
+                            "expires_at": time.time() - 60, "keep_me": "untouched"})
     mod.KIMI_CRED = cred
     sent = {}
 
@@ -61,10 +41,8 @@ def test_stale_kimi_token_refreshes_and_persists_the_rotated_pair(tmp):
         del timeout
         sent["url"] = req.full_url
         sent["body"] = dict(urllib.parse.parse_qsl(req.data.decode("utf-8")))
-        return _FakeResponse({"access_token": "access-token-new",
-                              "refresh_token": "refresh-token-new",
-                              "expires_in": 900,
-                              "token_type": "Bearer"})
+        return _FakeResponse({"access_token": "access-token-new", "refresh_token": "refresh-token-new",
+                              "expires_in": 900, "token_type": "Bearer"})
 
     with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
             mock.patch.object(mod, "_kimi_client_id", return_value="public-client"):
@@ -89,11 +67,7 @@ def test_stale_kimi_token_refreshes_and_persists_the_rotated_pair(tmp):
 def test_valid_kimi_token_is_used_without_a_refresh(tmp):
     mod = _util.load(USAGE_QUERY, "usage_query_kimi_no_refresh")
     cred = os.path.join(tmp, "kimi-code.json")
-    original = {
-        "access_token": "access-token-live",
-        "refresh_token": "refresh-token-unused",
-        "expires_at": time.time() + 3600,
-    }
+    original = {"access_token": "access-token-live", "refresh_token": "refresh-token-unused", "expires_at": time.time() + 3600}
     _write_kimi_cred(cred, original)
     mod.KIMI_CRED = cred
     with mock.patch("urllib.request.urlopen") as request:
@@ -113,10 +87,8 @@ def test_kimi_client_id_is_read_from_the_installed_cli(tmp):
     os.makedirs(pkg)
     os.makedirs(os.path.join(venv, "bin"))
     launcher = os.path.join(venv, "bin", "kimi")
-    with open(launcher, "w", encoding="utf-8") as f:
-        f.write("#!%s\nprint('kimi')\n" % os.path.join(venv, "bin", "python"))
-    with open(os.path.join(pkg, "oauth.py"), "w", encoding="utf-8") as f:
-        f.write('KIMI_CODE_CLIENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"\n')
+    Path(launcher).write_text("#!%s\nprint('kimi')\n" % os.path.join(venv, "bin", "python"), encoding="utf-8")
+    Path(pkg, "oauth.py").write_text('KIMI_CODE_CLIENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"\n', encoding="utf-8")
     with mock.patch.object(mod.shutil, "which", return_value=launcher):
         assert mod._kimi_client_id() == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     with mock.patch.object(mod.shutil, "which", return_value=None), \
@@ -205,8 +177,7 @@ def _write_codex_auth(path, exp_delta, **overrides):
         "keep_me": "untouched",
     }
     auth.update(overrides)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(auth, f, indent=2)
+    Path(path).write_text(json.dumps(auth, indent=2), encoding="utf-8")
     os.chmod(path, 0o600)
     return auth
 
@@ -418,9 +389,7 @@ def test_codex_without_credentials_is_unconfigured_not_broken(tmp):
 
     # An API-key login HAS credentials, but no subscription quota windows.
     auth = os.path.join(tmp, "auth.json")
-    with open(auth, "w", encoding="utf-8") as f:
-        json.dump({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-placeholder",
-                   "tokens": None}, f)
+    Path(auth).write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-placeholder", "tokens": None}), encoding="utf-8")
     mod.CODEX_AUTH = auth
     try:
         mod._codex_rate_limits()
@@ -428,6 +397,30 @@ def test_codex_without_credentials_is_unconfigured_not_broken(tmp):
         assert "API-key logins" in str(exc)
     else:
         raise AssertionError("an API-key login reported quota windows")
+
+
+def test_codex_serves_a_cached_reading_only_to_the_account_it_was_fetched_for(tmp):
+    """Two CODEX_HOMEs share one cache file; a token refresh keeps the account."""
+    mod, now = _util.load(USAGE_QUERY, "usage_query_codex_account"), time.time()
+    mod.CODEX_CACHE = os.path.join(tmp, "codex.cache")
+
+    def read(account, token, later=0, outage=None):
+        mod.CODEX_AUTH = os.path.join(tmp, account + ".json")
+        _write_codex_auth(mod.CODEX_AUTH, 86400, tokens={"access_token": token, "account_id": account})
+        payload = _codex_payload(now)
+        payload["rateLimits"]["primary"]["usedPercent"] = {"acct-A": 88, "acct-B": 4}[account]
+        with mock.patch.object(mod, "_codex_rate_limits", side_effect=outage or [payload]) as fetch, \
+                mock.patch.object(mod.time, "time", return_value=now + later):
+            return mod.query_codex(), fetch.call_count
+    assert [(got["five_hour"]["pct"], fetches) for got, fetches in (read("acct-A", "a1"), read("acct-B", "b1"), read("acct-B", "b2"))] == [(88, 1), (4, 1), (4, 0)]
+    got, fetches = read("acct-B", "b3", mod.CODEX_CACHE_TTL + 1, RuntimeError("down"))
+    assert (got["five_hour"]["pct"], got["_stale_error"], fetches) == (4, "RuntimeError: down", 1), got
+    try:
+        read("acct-A", "a2", mod.CODEX_CACHE_TTL + 1, RuntimeError("down"))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("acct-B's stale reading was served to acct-A")
 
 
 def test_codex_usage_url_follows_the_configured_base(tmp):

@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import urllib.error
+from pathlib import Path
 from unittest import mock
 
 import _util
@@ -19,10 +20,8 @@ def rig(tmp, name, cached_age):
     mod = _util.load(USAGE_QUERY, name)
     cache = os.path.join(tmp, "claude-usage.json")
     cred = os.path.join(tmp, "credentials.json")
-    with open(cred, "w", encoding="utf-8") as f:
-        f.write("{}")
-    with open(cache, "w", encoding="utf-8") as f:
-        json.dump({"fetched_at": time.time() - cached_age, "data": PAYLOAD}, f)
+    Path(cred).write_text("{}", encoding="utf-8")
+    Path(cache).write_text(json.dumps({"fetched_at": time.time() - cached_age, "data": PAYLOAD}), encoding="utf-8")
     return mod, cache, cred
 
 
@@ -63,6 +62,10 @@ def test_consecutive_429s_double_the_backoff_up_to_the_cap(tmp):
     assert delays == [min(cap, base * 2 ** n) for n in range(6)], delays
     query(mod, cache, cred, throttled(retry_after=cap * 10))
     assert json.load(open(cache, encoding="utf-8"))["backoff"]["until"] - time.time() <= cap
+    for streak, delay in ((10 ** 12, cap), (float("inf"), base), ("x", base)):  # huge: no 2 ** (streak - 1); not a number: none
+        json.dump({"fetched_at": 0, "data": PAYLOAD, "backoff": {"streak": streak, "until": 0}}, open(cache, "w", encoding="utf-8"))
+        query(mod, cache, cred, throttled())
+        assert round(json.load(open(cache, encoding="utf-8"))["backoff"]["until"] - time.time(), -1) == delay, streak
 
 
 def test_a_success_clears_the_backoff(tmp):
