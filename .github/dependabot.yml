@@ -1,13 +1,10 @@
-# The requirements files pin every package they list to an exact version,
-# and the workflows pin every action to a commit SHA, deliberately: a tool
-# or library release must never turn CI red on an unchanged commit. The
-# pip-audit, zizmor and actionlint installs are pinned in their own
-# workflows. Much else floats, for example pip itself, `build` and the
-# `setuptools>=68` build requirement (pyproject.toml). The cost of
-# pinning is that pins go stale silently, and a stale pin is how a fixed
-# CVE stays exploitable. Dependabot pays that cost back for the two
-# ecosystems below — it is the counterpart to audit.yml, which detects
-# the problem but cannot fix it.
+# Dependabot bumps the pins it manages here (the two ecosystems below);
+# not every dependency CI uses is pinned (see the workflows). Pins exist
+# so that a tool or library release does not turn CI red on an unchanged
+# commit. The cost is that pins go stale silently, and a stale pin is how
+# a fixed CVE stays exploitable. Dependabot pays that cost back — it is
+# the counterpart to audit.yml, which detects the problem but cannot
+# fix it.
 #
 # Dependabot PRs are built like any other PR: lint, types, tests, audit and
 # codeql run on every `pull_request`, and actionlint on those that touch
