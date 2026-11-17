@@ -1,4 +1,4 @@
-"""A 429 that outlives the retries backs every process off that account, doubling to a cap."""
+"""A 429 keeps later runs off that account's usage endpoint until the backoff expires, doubling to a cap; the header probe still runs."""
 import io
 import json
 import os
