@@ -1578,7 +1578,8 @@ def _zai_billing_note(status):
         f"z.ai billing: {status['state']} {status['multiplier']:g}x now; "
         f"peak {status['peak_hours']}; off-peak {status['off_peak_hours']}; "
         f"next {transition['state']} starts "
-        f"{at.strftime('%Y-%m-%d %H:%M')} UTC+8 (in {transition['in']})"
+        f"{at.strftime('%Y-%m-%d %H:%M')} {_zai_zone_label()} "
+        f"(in {transition['in']})"
     )
     # A status dict from before the promotions existed (or a caller-built
     # one) simply carries no clause: .get, not [], keeps the old shape

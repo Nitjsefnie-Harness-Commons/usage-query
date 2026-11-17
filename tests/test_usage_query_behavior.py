@@ -474,7 +474,8 @@ def test_zai_printed_zone_follows_the_peak_zone(tmp):
     """The printed zone is UTC, the sign and the hours of ZAI_TZ's offset,
     plus ':MM' only when the minutes are non-zero, and ZAI_TZ is also the zone
     the state is decided in. Each moment is one where the patched zone and
-    UTC+8 disagree on peak, so the state pins the zone it was decided in."""
+    UTC+8 disagree on peak, so the state pins the zone it was decided in, and
+    the billing line labels the next-transition time with the same zone."""
     del tmp
     mod = _load()
     cases = [
@@ -483,28 +484,43 @@ def test_zai_printed_zone_follows_the_peak_zone(tmp):
          "Mon-Fri 14:00-18:00 UTC+5:30",
          "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+5:30; all day Sat-Sun",
          "off-peak", {"state": "peak", "at": "2026-01-05T14:00:00+05:30",
-                      "in": "2h30m"}),
+                      "in": "2h30m"},
+         "z.ai billing: off-peak 0.5x now; peak Mon-Fri 14:00-18:00 "
+         "UTC+5:30; off-peak Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+5:30; "
+         "all day Sat-Sun; next peak starts 2026-01-05 14:00 UTC+5:30 "
+         "(in 2h30m)."),
         # 18:00 UTC Monday is 14:30 at -3:30 (peak), 02:00 Tuesday at +8.
         (timezone(-timedelta(hours=3, minutes=30)), (1, 5, 18, 0),
          "Mon-Fri 14:00-18:00 UTC-3:30",
          "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC-3:30; all day Sat-Sun",
          "peak", {"state": "off-peak", "at": "2026-01-05T18:00:00-03:30",
-                  "in": "3h30m"}),
+                  "in": "3h30m"},
+         "z.ai billing: peak 1x now; peak Mon-Fri 14:00-18:00 UTC-3:30; "
+         "off-peak Mon-Fri 00:00-14:00 and 18:00-24:00 UTC-3:30; "
+         "all day Sat-Sun; next off-peak starts 2026-01-05 18:00 UTC-3:30 "
+         "(in 3h30m)."),
         # 15:00 UTC Monday is peak at +0, 23:00 (off-peak) at +8.
         (timezone.utc, (1, 5, 15, 0),
          "Mon-Fri 14:00-18:00 UTC+0",
          "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+0; all day Sat-Sun",
          "peak", {"state": "off-peak", "at": "2026-01-05T18:00:00+00:00",
-                  "in": "3h00m"}),
+                  "in": "3h00m"},
+         "z.ai billing: peak 1x now; peak Mon-Fri 14:00-18:00 UTC+0; "
+         "off-peak Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+0; "
+         "all day Sat-Sun; next off-peak starts 2026-01-05 18:00 UTC+0 "
+         "(in 3h00m)."),
     ]
-    for zone, (month, day, hour, minute), peak, off_peak, state, nxt in cases:
+    for zone, (month, day, hour, minute), peak, off_peak, state, nxt, line \
+            in cases:
         moment = datetime(2026, month, day, hour, minute, tzinfo=timezone.utc)
         with mock.patch.object(mod, "ZAI_TZ", zone):
             status = mod._zai_billing_status(moment)
+            note = mod._zai_billing_note(status)
         assert status["peak_hours"] == peak, status["peak_hours"]
         assert status["off_peak_hours"] == off_peak, status["off_peak_hours"]
         assert status["state"] == state, (zone, status["state"])
         assert status["next_transition"] == nxt, status["next_transition"]
+        assert note == line, note
 
 
 def test_zai_human_and_json_output_include_billing_schedule(tmp):
