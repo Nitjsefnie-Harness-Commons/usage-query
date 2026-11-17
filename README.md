@@ -21,10 +21,10 @@ version with `--version`.
 
 With `--json` the output is one object: `usage` holds each provider's reading,
 `errors` each failure, and `unconfigured` each provider a default sweep found
-absent from this machine, as `ProviderNotConfigured: <message>`. A
-provider is absent when its credentials are: `~/.claude/.credentials.json`,
-`~/.kimi-code/credentials/kimi-code.json` or `$CODEX_HOME/auth.json` does not
-exist, or no z.ai key is found in any of the places listed below. In a default
+absent from this machine, as `ProviderNotConfigured: <message>`. A provider is
+absent when its credential file is missing (`~/.claude/.credentials.json`,
+`~/.kimi-code/credentials/kimi-code.json` or `$CODEX_HOME/auth.json`) or, for
+z.ai, when no key is found in any of the places listed below. In a default
 sweep an absent provider goes under `unconfigured`, not `errors`, prints
 nothing in the table, and does not by itself make the command exit nonzero;
 asked for by name with `--claude`, `--kimi`, `--codex` or `--zai`, it is
@@ -39,8 +39,7 @@ does this. The table marks such an account `(cached Ns)` or
 `(cached Ns; refresh failed: <error>)`. Outside a 429 backoff, Claude serves
 its cache with `_stale_age` alone when a pending swap, or Claude Code's
 refresh lock or the accounts lock still held at its wait, stopped the query
-before any request (both below). Entries under `claude_accounts` carry
-neither key.
+before any request (both below).
 
 Claude reads the live account from `~/.claude/.credentials.json` as usual.
 When `~/.claude/accounts/live` names an installed `*.json` stash in that
@@ -95,21 +94,19 @@ Code's credential write lock (`~/.claude/.storage-write.lock`, waiting up to 30
 seconds and reclaimed after 15 seconds), re-reads the file under it, and
 replaces only its `claudeAiOauth` entry, so keys another writer saved
 meanwhile (MCP OAuth tokens, for one) are kept. Like Claude Code's own save,
-it writes only while the `claudeAiOauth`
-entry exists and its refresh token is empty or the one this refresh sent. A
-newer pair (a `/login` to another account, say), a removed entry or a removed
-file (a `/logout`) is left as it is, and the rotated pair is saved to the
-posting account's stash instead, or `write_skipped_newer` is logged when no
-stash knows the account. The query also takes a brief lock to read the
-account name and credentials together before HTTP. Accounts-lock acquisition
-retries for up to 2 seconds and reclaims a lock whose modification time is
-older than 30 seconds; a held lock's modification time is touched every 5
-seconds. A timeout on Claude Code's refresh lock or on the accounts lock (and
-only those) stops the query before a refresh grant and serves the last cached
-reading, labelled stale. A
-storage-write-lock timeout comes after the grant, so the rotated pair is still
-written, without that lock but with the same checks, and an account error is
-recorded.
+it writes only while the `claudeAiOauth` entry exists and its refresh token is
+empty or the one this refresh sent. A newer pair (a `/login` to another
+account, say), a removed entry or a removed file (a `/logout`) is left as it
+is, and the rotated pair is saved to the posting account's stash instead, or
+`write_skipped_newer` is logged when no stash knows the account. The query also
+takes a brief lock to read the account name and credentials together before
+HTTP. Accounts-lock acquisition retries for up to 2 seconds and reclaims a lock
+whose modification time is older than 30 seconds; a held lock's modification
+time is touched every 5 seconds. A timeout on Claude Code's refresh lock or on
+the accounts lock (and only those) stops the query before a refresh grant and
+serves the last cached reading, labelled stale. A storage-write-lock timeout
+comes after the grant, so the rotated pair is still written, without that lock
+but with the same checks, and an account error is recorded.
 An unidentified live account's refreshed pair goes to `.credentials.json`.
 Every Claude refresh attempt appends one line to `accounts/accounts.log` when
 the accounts directory exists, in the switcher's format: UTC time, pid,
