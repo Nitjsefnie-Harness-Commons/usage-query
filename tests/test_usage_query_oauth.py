@@ -49,14 +49,11 @@ def test_stale_kimi_token_refreshes_and_persists_the_rotated_pair(tmp):
         assert mod._kimi_access_token() == "access-token-new"
 
     assert sent["url"] == mod.KIMI_OAUTH_TOKEN_URL
-    assert sent["body"] == {"client_id": "public-client",
-                            "grant_type": "refresh_token",
-                            "refresh_token": "refresh-token-old"}
+    assert sent["body"] == {"client_id": "public-client", "grant_type": "refresh_token", "refresh_token": "refresh-token-old"}
     with open(cred, encoding="utf-8") as f:
         stored = json.load(f)
     assert stored["access_token"] == "access-token-new"
-    assert stored["refresh_token"] == "refresh-token-new", (
-        "the consumed refresh_token was left on disk")
+    assert stored["refresh_token"] == "refresh-token-new", "the consumed refresh_token was left on disk"
     assert stored["expires_at"] > time.time() + 800
     assert stored["keep_me"] == "untouched"
     if os.name != "nt":
@@ -234,8 +231,7 @@ def test_codex_valid_token_is_used_without_a_refresh(tmp):
         got = mod._codex_rate_limits()
     opened.assert_not_called()
     assert seen["url"] == "https://chatgpt.com/backend-api/wham/usage"
-    assert seen["headers"]["Authorization"] == (
-        "Bearer " + original["tokens"]["access_token"])
+    assert seen["headers"]["Authorization"] == "Bearer " + original["tokens"]["access_token"]
     assert seen["headers"]["ChatGPT-Account-Id"] == "account-123"
     assert got["rateLimits"]["primary"]["usedPercent"] == 95.0
     with open(auth, encoding="utf-8") as f:
@@ -267,16 +263,13 @@ def test_codex_stale_token_refreshes_and_persists_the_rotated_set(tmp):
         got = mod._codex_rate_limits()
 
     assert sent["url"] == mod.CODEX_OAUTH_TOKEN_URL
-    assert sent["body"] == {"client_id": mod.CODEX_OAUTH_CLIENT_ID,
-                            "grant_type": "refresh_token",
-                            "refresh_token": "refresh-token-old"}
+    assert sent["body"] == {"client_id": mod.CODEX_OAUTH_CLIENT_ID, "grant_type": "refresh_token", "refresh_token": "refresh-token-old"}
     assert seen["headers"]["Authorization"] == "Bearer access-token-new"
     assert got["rateLimits"]["planType"] == "pro"
     with open(auth, encoding="utf-8") as f:
         stored = json.load(f)
     assert stored["tokens"]["access_token"] == "access-token-new"
-    assert stored["tokens"]["refresh_token"] == "refresh-token-new", (
-        "the consumed refresh_token was left on disk")
+    assert stored["tokens"]["refresh_token"] == "refresh-token-new", "the consumed refresh_token was left on disk"
     assert stored["tokens"]["id_token"] == "id-token-new"
     assert stored["tokens"]["account_id"] == "account-123"
     assert stored["auth_mode"] == "chatgpt"
@@ -449,13 +442,9 @@ def _codex_credit_detail(expires="2026-10-05T06:19:12Z"):
     return {
         "available_count": 1,
         "credits": [{
-            "id": "RateLimitResetCredit_abc",
-            "reset_type": "codexRateLimits",
-            "status": "available",
-            "granted_at": "2026-09-05T06:19:12Z",
-            "expires_at": expires,
-            "title": "Full reset",
-            "description": "One free rate limit reset.",
+            "id": "RateLimitResetCredit_abc", "reset_type": "codexRateLimits", "status": "available",
+            "granted_at": "2026-09-05T06:19:12Z", "expires_at": expires,
+            "title": "Full reset", "description": "One free rate limit reset.",
         }],
     }
 
@@ -492,8 +481,7 @@ def test_codex_names_the_banked_resets_from_the_credit_endpoint(tmp):
     })
     with mock.patch.object(mod, "_get_retry", side_effect=fake):
         got = mod._codex_rate_limits()
-    assert calls == ["https://chatgpt.com/backend-api/wham/usage",
-                     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"]
+    assert calls == ["https://chatgpt.com/backend-api/wham/usage", "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"]
     banked = got["rateLimitResetCredits"]["credits"]
     assert [c["id"] for c in banked] == ["RateLimitResetCredit_abc"]
     # Stored in the app-server spelling: the wire's snake_case stops here, so
