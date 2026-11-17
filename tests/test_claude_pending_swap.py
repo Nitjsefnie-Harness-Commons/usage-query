@@ -34,11 +34,11 @@ def beta_setup(tmp):
 
 
 def beta_cases(tmp, values):
-    """One isolated home per value, with a stale beta stash installed."""
     for index, value in enumerate(values):
         home = Path(tmp) / f"case{index}"
         home.mkdir()
         with beta_setup(str(home)) as (mod, accounts, http):
+            assert Path(mod.claude_state.__file__).samefile(_util.script("claude_state.py")), "not this checkout's claude_state"
             install(accounts, beta_stale=True)
             yield value, mod, accounts, http
 
@@ -83,16 +83,16 @@ def test_pending_swap_without_cache_does_not_query_a_fresh_stash(tmp):
 
 
 def test_unreadable_state_is_pending_and_serves_the_cache(tmp):
-    for content, mod, accounts, http in beta_cases(tmp, (b'{"pending": ', b"\xff\xfe{", None)):
+    for content, mod, accounts, http in beta_cases(tmp, (b'{"pending": ', b"\xff\xfe{", b"[" * 100000, None)):
         seed_cache(Path(mod.CACHE), 10, age=0)
         seed_cache(accounts / ".beta.usage-cache", 42)
-        state = accounts / "state.json"
         if content is None:
-            state.mkdir()
+            (accounts / "state.json").mkdir()
         else:
-            state.write_bytes(content)
-        assert run_json(mod)[3]["claude_accounts"]["beta"]["five_hour"]["pct"] == 42
-        assert http.calls == [], f"unreadable state made a request: {content!r}"
+            (accounts / "state.json").write_bytes(content)
+        rc, raw, _, got = run_json(mod)
+        assert rc == 0 and got["errors"] == {}, raw
+        assert got["claude_accounts"]["beta"]["five_hour"]["pct"] == 42 and http.calls == [], raw
 
 
 def test_state_without_pending_allows_refresh_and_is_not_an_account(tmp):

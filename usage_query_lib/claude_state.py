@@ -8,6 +8,6 @@ def swap_pending(path) -> bool:
             state = json.load(stream)
     except FileNotFoundError:
         return False
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return True
     return isinstance(state, dict) and "pending" in state

@@ -123,8 +123,9 @@ behavior.
 While `accounts/state.json` has a `pending` key, every Claude account, including
 the live one, uses its last cached reading, even when stale, or reports an
 account error if none exists. No Claude refresh or usage request is made during
-that pending swap. Without a `pending` key, live queries behave normally.
-`state.json` is switcher metadata and is not an account.
+that pending swap. A `state.json` that cannot be read or parsed counts as a pending swap;
+one that is not a JSON object has no `pending` key, and without a `pending` key live
+queries behave normally. `state.json` is switcher metadata and is not an account.
 
 Their readings have separate five-minute caches
 beside the stashes (`.<name>.usage-cache`); the live account keeps its existing
