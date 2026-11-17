@@ -46,10 +46,13 @@ updates:
       - dependencies
     # codeql.yml's init and analyze steps must sit on the same release or
     # `analyze` fails, so one group keeps their bumps in one pull request.
-    # Version updates only: this repository has Dependabot security updates
-    # off, and turning them on needs a second group here with `applies-to:
-    # security-updates`.
+    # A group applies to one update kind, so there is one group for each.
     groups:
       codeql-action:
+        applies-to: version-updates
+        patterns:
+          - "github/codeql-action/*"
+      codeql-action-security:
+        applies-to: security-updates
         patterns:
           - "github/codeql-action/*"
