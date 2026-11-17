@@ -434,7 +434,8 @@ def test_zai_printed_days_follow_the_peak_days(tmp):
          "UTC+8; off-peak Mon-Wed,Fri 00:00-14:00 and 18:00-24:00 UTC+8; "
          "all day Thu,Sat-Sun; next peak starts 2026-01-09 14:00 UTC+8 "
          "(in 23h00m)."),
-        # A single-day run at each end, both sides: Sunday 15:00 is peak.
+        # A single-day peak run at each end of the week (the off-peak side
+        # opens with a single day): Sunday 15:00 is peak.
         ((0, 2, 3, 6), (1, 11, 15),
          "Mon,Wed-Thu,Sun 14:00-18:00 UTC+8",
          "Mon,Wed-Thu,Sun 00:00-14:00 and 18:00-24:00 UTC+8; "
@@ -443,6 +444,16 @@ def test_zai_printed_days_follow_the_peak_days(tmp):
          "UTC+8; off-peak Mon,Wed-Thu,Sun 00:00-14:00 and 18:00-24:00 "
          "UTC+8; all day Tue,Fri-Sat; next off-peak starts 2026-01-11 "
          "18:00 UTC+8 (in 3h00m)."),
+        # Monday off-peak: the off-peak days are a single day at each end of
+        # the week, Mon and Sun, kept apart (no wrap). Monday 15:00 is
+        # off-peak and Tuesday's window is next.
+        ((1, 2, 3, 4, 5), (1, 5, 15),
+         "Tue-Sat 14:00-18:00 UTC+8",
+         "Tue-Sat 00:00-14:00 and 18:00-24:00 UTC+8; all day Mon,Sun",
+         "z.ai billing: off-peak 0.5x now; peak Tue-Sat 14:00-18:00 UTC+8; "
+         "off-peak Tue-Sat 00:00-14:00 and 18:00-24:00 UTC+8; "
+         "all day Mon,Sun; next peak starts 2026-01-06 14:00 UTC+8 "
+         "(in 23h00m)."),
         # Unsorted, with Monday twice: read as Mon,Sat-Sun. Tuesday 12:00
         # is off-peak and peak starts at 14:00 on a day with no peak.
         ((6, 0, 5, 0), (1, 6, 12),
