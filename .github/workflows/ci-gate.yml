@@ -43,6 +43,8 @@ jobs:
           BEFORE: ${{ github.event.before }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # Docs-only names the paths that are not code, never the code: a new
+        # top-level code directory would silently skip under an allow-list.
         run: |
           full_run() {
             echo "$1: running every leg"
@@ -125,7 +127,7 @@ jobs:
             || { echo "needs carries no classify entry" >&2; exit 1; }
           docs_only="$(jq -r '.classify.outputs.docs_only // ""' <<< "$NEEDS")"
           workflows="$(jq -r '.classify.outputs.workflows // ""' <<< "$NEEDS")"
-          legs="$(jq -r 'to_entries[] | "\(.key)\t\(.value.result // "")"' <<< "$NEEDS")"
+          legs="$(jq -r 'to_entries[] | "\(.key)\t\(.value.result // "")"' <<< "$NEEDS")" || exit 1
           failed=0
           printf '| leg | result | verdict |\n| --- | --- | --- |\n' >> "$GITHUB_STEP_SUMMARY"
           while IFS=$'\t' read -r leg result; do
