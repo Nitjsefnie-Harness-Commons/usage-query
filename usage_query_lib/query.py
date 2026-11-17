@@ -204,9 +204,6 @@ ZAI_TZ = timezone(timedelta(hours=8))  # China: no DST, fixed offset is exact
 ZAI_PEAK_DAYS = (0, 1, 2, 3, 4)  # Monday..Friday, datetime.weekday() (Mon=0)
 ZAI_PEAK_START_MIN = 14 * 60
 ZAI_PEAK_END_MIN = 18 * 60  # end exclusive: 18:00:00 is already off-peak
-ZAI_PEAK_HOURS = "Mon-Fri 14:00-18:00 UTC+8"
-ZAI_OFF_PEAK_HOURS = (
-    "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; all day Sat-Sun")
 # Time-limited promotions published on the same pricing page as the window
 # above (read 2026-09-22). Frozen history, not config: an expired window
 # stays here because it records what was billed when, and the logic in
@@ -1510,11 +1507,16 @@ def _zai_billing_status(now=None):
             while transition.weekday() not in ZAI_PEAK_DAYS:
                 transition += timedelta(days=1)
         next_state = "peak"
+    # The printed hours, derived here (not at import) so they cannot drift
+    # from the minute constants the state above was decided from.
+    start = f"{ZAI_PEAK_START_MIN // 60:02d}:{ZAI_PEAK_START_MIN % 60:02d}"
+    end = f"{ZAI_PEAK_END_MIN // 60:02d}:{ZAI_PEAK_END_MIN % 60:02d}"
     return {
         "state": "peak" if peak else "off-peak",
         "multiplier": 1.0 if peak else 0.5,
-        "peak_hours": ZAI_PEAK_HOURS,
-        "off_peak_hours": ZAI_OFF_PEAK_HOURS,
+        "peak_hours": f"Mon-Fri {start}-{end} UTC+8",
+        "off_peak_hours": (f"Mon-Fri 00:00-{start} and {end}-24:00 UTC+8;"
+                           " all day Sat-Sun"),
         "next_transition": {
             "state": next_state,
             "at": transition.isoformat(timespec="seconds"),
