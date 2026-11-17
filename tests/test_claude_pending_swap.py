@@ -91,8 +91,8 @@ def test_unreadable_state_is_pending_and_serves_the_cache(tmp):
         else:
             (accounts / "state.json").write_bytes(content)
         rc, raw, _, got = run_json(mod)
-        assert rc == 0 and got["errors"] == {}, raw
-        assert got["claude_accounts"]["beta"]["five_hour"]["pct"] == 42 and http.calls == [], raw
+        assert rc == 0 and got["errors"] == {}, (content and content[:12], raw)
+        assert got["claude_accounts"]["beta"]["five_hour"]["pct"] == 42 and http.calls == [], (content and content[:12], raw)
 
 
 def test_state_without_pending_allows_refresh_and_is_not_an_account(tmp):
@@ -188,7 +188,7 @@ def test_marker_naming_state_file_uses_live_destination(tmp):
 
 
 def test_a_switch_inside_the_ttl_reads_the_new_live_account(tmp):
-    with setup(tmp, {"live-token": 10, "beta-token": 40}) as (mod, accounts, http):
+    with setup(tmp, {"live-token": 10, "beta-token": 40, "other-token": 77}) as (mod, accounts, http):
         install(accounts)
         assert run_json(mod)[3]["usage"]["claude"]["five_hour"]["pct"] == 10
         credentials(accounts / "alpha.json", "live-token")  # the switcher stashes alpha, installs beta
@@ -198,6 +198,9 @@ def test_a_switch_inside_the_ttl_reads_the_new_live_account(tmp):
         assert got["usage"]["claude"]["five_hour"]["pct"] == 40 and got["claude_accounts"]["beta"] == {"live": True, **got["usage"]["claude"]}
         assert got["claude_accounts"]["alpha"]["five_hour"]["pct"] == 10
         assert http.calls[2:] == [("usage", "Bearer beta-token"), ("usage", "Bearer live-token")]
+        (Path(tmp) / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "u-2"}}), encoding="utf-8")
+        credentials(Path(mod.CLAUDE_CRED), "other-token")  # a /login past the switcher keeps the marker
+        assert run_json(mod)[3]["usage"]["claude"]["five_hour"]["pct"] == 77 and http.calls[4:] == [("usage", "Bearer other-token")]
 
 
 def test_without_accounts_the_cache_follows_the_logged_in_account(tmp):
