@@ -1479,8 +1479,8 @@ def _zai_billing_status(now=None):
     window constants at the top of this module encode IS the source of truth,
     and they carry the provenance needed to re-verify it when the policy
     moves. `now` is a UTC datetime by convention; the real clock is the default.
-    End-exclusive means 18:00:00 itself is off-peak and the next peak begins on
-    the next weekday. The all-day off-peak promotion suppresses peak entirely
+    End-exclusive means the end minute itself is off-peak and the next peak
+    begins on the next weekday. The all-day off-peak promotion suppresses peak entirely
     while it runs - including in the next-transition scan, which must never
     report a would-be peak the promotion bills at 0.5x - and reports itself in
     the `promotion` entry (present year-round, `active` or not) so the notes
@@ -1492,11 +1492,12 @@ def _zai_billing_status(now=None):
             and moment.weekday() in ZAI_PEAK_DAYS
             and ZAI_PEAK_START_MIN <= moment.hour * 60 + moment.minute
             < ZAI_PEAK_END_MIN)
+    midnight = moment.replace(hour=0, minute=0, second=0, microsecond=0)
     if peak:
-        transition = moment.replace(hour=18, minute=0, second=0, microsecond=0)
+        transition = midnight + timedelta(minutes=ZAI_PEAK_END_MIN)
         next_state = "off-peak"
     else:
-        transition = moment.replace(hour=14, minute=0, second=0, microsecond=0)
+        transition = midnight + timedelta(minutes=ZAI_PEAK_START_MIN)
         if (moment.weekday() not in ZAI_PEAK_DAYS
                 or transition <= moment):
             transition += timedelta(days=1)

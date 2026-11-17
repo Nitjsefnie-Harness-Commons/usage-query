@@ -312,6 +312,65 @@ def test_zai_billing_status_names_hours_and_next_transition(tmp):
         }, moment.isoformat()
 
 
+def test_zai_next_transition_follows_a_window_off_the_hour(tmp):
+    """The next transition is built from ZAI_PEAK_START_MIN/ZAI_PEAK_END_MIN,
+    the constants that decide the state: moved to 14:30-18:45, every reported
+    peak starts at 14:30 and every off-peak at 18:45, not at 14:00/18:00."""
+    del tmp
+    mod = _load()
+
+    def at(month, day, hour, minute):
+        return datetime(2026, month, day, hour, minute, tzinfo=mod.ZAI_TZ)
+
+    cases = [
+        # Monday 2026-01-05, inside the moved window past the old 18:00 end.
+        (at(1, 5, 18, 15), "peak", "off-peak", "2026-01-05T18:45:00+08:00",
+         "30m"),
+        # Past the old 14:00 start but before the moved one: peak is today.
+        (at(1, 5, 14, 15), "off-peak", "peak", "2026-01-05T14:30:00+08:00",
+         "15m"),
+        # After the moved end: the next weekday's moved start.
+        (at(1, 5, 19, 0), "off-peak", "peak", "2026-01-06T14:30:00+08:00",
+         "19h30m"),
+        # Friday evening and Saturday roll over to Monday's moved start.
+        (at(1, 9, 19, 0), "off-peak", "peak", "2026-01-12T14:30:00+08:00",
+         "2d19h"),
+        (at(1, 10, 12, 0), "off-peak", "peak", "2026-01-12T14:30:00+08:00",
+         "2d2h"),
+        # Boundaries with their one-minute near misses: the start is peak,
+        # the end is off-peak (end exclusive).
+        (at(1, 5, 14, 29), "off-peak", "peak", "2026-01-05T14:30:00+08:00",
+         "1m"),
+        (at(1, 5, 14, 30), "peak", "off-peak", "2026-01-05T18:45:00+08:00",
+         "4h15m"),
+        (at(1, 5, 14, 31), "peak", "off-peak", "2026-01-05T18:45:00+08:00",
+         "4h14m"),
+        (at(1, 5, 18, 44), "peak", "off-peak", "2026-01-05T18:45:00+08:00",
+         "1m"),
+        (at(1, 5, 18, 45), "off-peak", "peak", "2026-01-06T14:30:00+08:00",
+         "19h45m"),
+        (at(1, 5, 18, 46), "off-peak", "peak", "2026-01-06T14:30:00+08:00",
+         "19h44m"),
+        # Thursday evening before the all-day off-peak promotion, and inside
+        # it: the would-be peaks it covers are skipped to the moved start on
+        # the first weekday after it, Thursday 2026-10-08.
+        (at(9, 24, 19, 0), "off-peak", "peak", "2026-10-08T14:30:00+08:00",
+         "13d19h"),
+        (at(9, 28, 15, 0), "off-peak", "peak", "2026-10-08T14:30:00+08:00",
+         "9d23h"),
+    ]
+    with mock.patch.object(mod, "ZAI_PEAK_START_MIN", 14 * 60 + 30), \
+            mock.patch.object(mod, "ZAI_PEAK_END_MIN", 18 * 60 + 45):
+        for moment, state, next_state, next_at, next_in in cases:
+            status = mod._zai_billing_status(moment)
+            assert status["state"] == state, moment.isoformat()
+            assert status["next_transition"] == {
+                "state": next_state,
+                "at": next_at,
+                "in": next_in,
+            }, (moment.isoformat(), status["next_transition"])
+
+
 def test_zai_human_and_json_output_include_billing_schedule(tmp):
     del tmp
     mod = _load()
