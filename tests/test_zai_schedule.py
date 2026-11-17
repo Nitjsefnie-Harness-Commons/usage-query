@@ -6,6 +6,7 @@ from unittest import mock
 import _util
 
 MOVED = {"ZAI_PEAK_START_MIN": 14 * 60 + 30, "ZAI_PEAK_END_MIN": 18 * 60 + 45}
+HOURS = ("Mon-Fri 14:00-18:00 UTC+8", "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; all day Sat-Sun")
 MOVED_HOURS = ("Mon-Fri 14:30-18:45 UTC+8", "Mon-Fri 00:00-14:30 and 18:45-24:00 UTC+8; all day Sat-Sun")
 PROMO = "; all-day off-peak promotion until 2026-10-08 00:00 UTC+8"
 IST = {"ZAI_TZ": timezone(timedelta(hours=5, minutes=30))}
@@ -14,6 +15,18 @@ IST_HOURS = ("Mon-Fri 14:00-18:00 UTC+5:30", "Mon-Fri 00:00-14:00 and 18:00-24:0
 # Patches, moment, state, (peak, off-peak) hours, next at and in, promo clause;
 # the campaign clause, pinned in the behaviour suite, is kept off every line.
 CASES = [
+    ({}, "2026-01-05T05:00+00:00", "off-peak", HOURS, "2026-01-05T14:00:00+08:00", "1h00m", ""),
+    ({}, "2026-01-05T06:00+00:00", "peak", HOURS, "2026-01-05T18:00:00+08:00", "4h00m", ""),
+    ({}, "2026-01-05T10:00+00:00", "off-peak", HOURS, "2026-01-06T14:00:00+08:00", "20h00m", ""),
+    ({}, "2026-01-09T10:00+00:00", "off-peak", HOURS, "2026-01-12T14:00:00+08:00", "2d20h", ""),
+    ({}, "2026-01-10T15:00+00:00", "off-peak", HOURS, "2026-01-12T14:00:00+08:00", "1d15h", ""),
+    # The promotion [2026-09-25, 2026-10-08) UTC+8 bills 0.5x and hides peaks.
+    ({}, "2026-09-24T07:00+00:00", "peak", HOURS, "2026-09-24T18:00:00+08:00", "3h00m", ""),
+    ({}, "2026-09-24T10:00+00:00", "off-peak", HOURS, "2026-10-08T14:00:00+08:00", "13d20h", ""),
+    ({}, "2026-09-25T07:00+00:00", "off-peak", HOURS, "2026-10-08T14:00:00+08:00", "12d23h", PROMO),
+    ({}, "2026-09-28T07:00+00:00", "off-peak", HOURS, "2026-10-08T14:00:00+08:00", "9d23h", PROMO),
+    ({}, "2026-10-07T15:59:59+00:00", "off-peak", HOURS, "2026-10-08T14:00:00+08:00", "14h00m", PROMO),
+    ({}, "2026-10-08T06:00+00:00", "peak", HOURS, "2026-10-08T18:00:00+08:00", "4h00m", ""),
     # A window off the hour, each boundary with its near misses.
     (MOVED, "2026-01-05T18:15+08:00", "peak", MOVED_HOURS, "2026-01-05T18:45:00+08:00", "30m", ""),
     (MOVED, "2026-01-05T14:15+08:00", "off-peak", MOVED_HOURS, "2026-01-05T14:30:00+08:00", "15m", ""),

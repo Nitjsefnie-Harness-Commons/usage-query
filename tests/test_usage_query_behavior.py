@@ -283,35 +283,6 @@ def test_zai_peak_note_follows_the_published_window(tmp):
             assert mod._zai_peak_note() == expected, moment.isoformat()
 
 
-def test_zai_billing_status_names_hours_and_next_transition(tmp):
-    del tmp
-    mod = _load()
-    cases = [
-        (datetime(2026, 1, 5, 5, 0, tzinfo=timezone.utc),
-         "off-peak", 0.5, "peak", "2026-01-05T14:00:00+08:00", "1h00m"),
-        (datetime(2026, 1, 5, 6, 0, tzinfo=timezone.utc),
-         "peak", 1.0, "off-peak", "2026-01-05T18:00:00+08:00", "4h00m"),
-        (datetime(2026, 1, 5, 10, 0, tzinfo=timezone.utc),
-         "off-peak", 0.5, "peak", "2026-01-06T14:00:00+08:00", "20h00m"),
-        (datetime(2026, 1, 9, 10, 0, tzinfo=timezone.utc),
-         "off-peak", 0.5, "peak", "2026-01-12T14:00:00+08:00", "2d20h"),
-        (datetime(2026, 1, 10, 15, 0, tzinfo=timezone.utc),
-         "off-peak", 0.5, "peak", "2026-01-12T14:00:00+08:00", "1d15h"),
-    ]
-    for moment, state, multiplier, next_state, next_at, next_in in cases:
-        status = mod._zai_billing_status(moment)
-        assert status["state"] == state, moment.isoformat()
-        assert status["multiplier"] == multiplier, moment.isoformat()
-        assert status["peak_hours"] == "Mon-Fri 14:00-18:00 UTC+8"
-        assert status["off_peak_hours"] == (
-            "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+8; all day Sat-Sun")
-        assert status["next_transition"] == {
-            "state": next_state,
-            "at": next_at,
-            "in": next_in,
-        }, moment.isoformat()
-
-
 def test_zai_human_and_json_output_include_billing_schedule(tmp):
     del tmp
     mod = _load()
@@ -499,58 +470,6 @@ def test_no_banked_reset_note_when_none_are_available(tmp):
             rc = mod.main([])
     assert rc == 0
     assert "banked reset" not in out.getvalue()
-
-
-def test_zai_offpeak_promo_bills_every_hour_at_half_rate(tmp):
-    """'From September 25 to October 7, 2026, all-day usage will be charged
-    at the off-peak rate': even the weekday 14:00-18:00 window bills 0.5x
-    between 2026-09-25 00:00 and 2026-10-08 00:00 UTC+8 (end exclusive)."""
-    del tmp
-    mod = _load()
-    cases = [
-        # 15:00 UTC+8 the day before the promo: still an ordinary peak hour.
-        (datetime(2026, 9, 24, 7, 0, tzinfo=timezone.utc), "peak", 1.0),
-        # The promo's first minute swallows what would be Thursday peak.
-        (datetime(2026, 9, 25, 7, 0, tzinfo=timezone.utc), "off-peak", 0.5),
-        # The promo's last second, 2026-10-07 23:59:59 UTC+8.
-        (datetime(2026, 10, 7, 15, 59, 59, tzinfo=timezone.utc),
-         "off-peak", 0.5),
-        # The first peak after the promo, Thursday 2026-10-08 14:00 UTC+8.
-        (datetime(2026, 10, 8, 6, 0, tzinfo=timezone.utc), "peak", 1.0),
-    ]
-    for moment, state, multiplier in cases:
-        status = mod._zai_billing_status(moment)
-        assert status["state"] == state, moment.isoformat()
-        assert status["multiplier"] == multiplier, moment.isoformat()
-
-
-def test_zai_promo_suppresses_peak_in_the_next_transition(tmp):
-    """No peak may be reported inside the all-day off-peak promotion: from
-    inside it - and from the evening before it starts - the next peak is the
-    first after the window, Thursday 2026-10-08 14:00 UTC+8."""
-    del tmp
-    mod = _load()
-    cases = [
-        # Inside the promo on what would be a peak Monday afternoon.
-        (datetime(2026, 9, 28, 7, 0, tzinfo=timezone.utc),
-         "off-peak", 0.5, "2026-10-08T14:00:00+08:00", "9d23h"),
-        # The promo's final second still points past the window.
-        (datetime(2026, 10, 7, 15, 59, 59, tzinfo=timezone.utc),
-         "off-peak", 0.5, "2026-10-08T14:00:00+08:00", "14h00m"),
-        # The evening before the promo: the Friday 14:00 would-be peak is
-        # inside the window, so the next real peak is past its end.
-        (datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc),
-         "off-peak", 0.5, "2026-10-08T14:00:00+08:00", "13d20h"),
-    ]
-    for moment, state, multiplier, next_at, next_in in cases:
-        status = mod._zai_billing_status(moment)
-        assert status["state"] == state, moment.isoformat()
-        assert status["multiplier"] == multiplier, moment.isoformat()
-        assert status["next_transition"] == {
-            "state": "peak",
-            "at": next_at,
-            "in": next_in,
-        }, moment.isoformat()
 
 
 def test_zai_campaign_windows_nightly_2300_to_0900(tmp):
