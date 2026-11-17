@@ -118,9 +118,13 @@ class _Rig:
             raise self.outcome
         return self.outcome
 
-    def seed(self, age=STALE_FOR):
+    def seed(self, age=STALE_FOR, record=None):
         with open(self.cache, "w", encoding="utf-8") as fh:
-            json.dump({"fetched_at": NOW - age, "data": self.payload}, fh)
+            json.dump({"fetched_at": NOW - age, "data": self.payload} if record is None else record, fh)
+
+    def unusable(self):
+        return [{"fetched_at": at, "data": self.payload} for at in (NOW + 86400, float("inf"), float("nan"), None, "0")] + [
+            {"fetched_at": NOW - 1, "data": [self.payload]}, [self.payload]]
 
     def succeed(self):
         self.outcome = self.payload
@@ -143,10 +147,6 @@ class _Rig:
         return rc, text.splitlines()[1].split("  ")[0], text, err
 
 
-def _rig(tmp, provider, stack):
-    return _Rig(_load(), tmp, provider, stack)
-
-
 def _each(tmp, check):
     """Run `check(rig)` for every provider, each in its own directory."""
     for provider in PROVIDERS:
@@ -155,21 +155,22 @@ def _each(tmp, check):
         with mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}):
             with ExitStack() as stack:
                 try:
-                    check(_rig(home, provider, stack))
+                    check(_Rig(_load(), home, provider, stack))
                 except AssertionError as exc:
                     raise AssertionError(f"{provider}: {exc}") from exc
 
 
-def _assert_failed_fetch_is_labelled(tmp, provider):
-    with mock.patch.dict(os.environ, {"HOME": tmp, "USERPROFILE": tmp}), \
-            ExitStack() as stack:
-        rig = _rig(tmp, provider, stack)
+def test_a_failed_fetch_served_from_cache_carries_the_error(tmp):
+    def check(rig):
         # With nothing cached the same failure is an error: this pins the
         # "<ExceptionType>: <message>" form `_stale_error` has to repeat.
-        rc, raw, _ = rig.main("--json")
-        got = json.loads(raw)
-        assert rc == 1 and got["errors"] == {provider: rig.error}, got
-        assert got["usage"] == {}, got
+        for record in (None, *rig.unusable()):
+            if record is not None:
+                rig.seed(record=record)
+            rc, raw, _ = rig.main("--json")
+            got = json.loads(raw)
+            assert rc == 1 and got["errors"] == {rig.provider: rig.error}, (record, got)
+            assert got["usage"] == {}, got
 
         rig.seed()
         rc, entry, errors, err = rig.entry()
@@ -182,40 +183,29 @@ def _assert_failed_fetch_is_labelled(tmp, provider):
                         f"refresh failed: {rig.error})"), cell
         assert rc == 0 and err == "", (rc, err)
 
-
-def test_claude_failed_fetch_served_from_cache_carries_the_error(tmp):
-    _assert_failed_fetch_is_labelled(tmp, "claude")
-
-
-def test_kimi_failed_fetch_served_from_cache_carries_the_error(tmp):
-    _assert_failed_fetch_is_labelled(tmp, "kimi")
-
-
-def test_codex_failed_fetch_served_from_cache_carries_the_error(tmp):
-    _assert_failed_fetch_is_labelled(tmp, "codex")
-
-
-def test_zai_failed_fetch_served_from_cache_carries_the_error(tmp):
-    _assert_failed_fetch_is_labelled(tmp, "zai")
+    _each(tmp, check)
 
 
 def test_a_fresh_live_read_carries_neither_stale_field(tmp):
     def check(rig):
-        rig.seed(rig.ttl + 1)
         rig.succeed()
-        rc, entry, errors, _ = rig.entry()
-        assert rc == 0 and errors == {}, (rc, errors)
-        assert rig.fetch.call_count >= 1
-        assert "_stale_age" not in entry and "_stale_error" not in entry, entry
-        rc, cell, text, _ = rig.cell()
-        assert cell == rig.display, cell
-        assert "refresh failed" not in text and "cached" not in text, text
+        for record in (None, *rig.unusable()):
+            rig.seed(rig.ttl + 1, record)
+            rig.fetch.reset_mock()
+            rc, entry, errors, _ = rig.entry()
+            assert rc == 0 and errors == {}, (record, rc, errors)
+            assert rig.fetch.call_count >= 1, record
+            assert "_stale_age" not in entry and "_stale_error" not in entry, entry
+            rc, cell, text, _ = rig.cell()
+            assert cell == rig.display, cell
+            assert "refresh failed" not in text and "cached" not in text, text
 
     _each(tmp, check)
 
 
 def test_a_cache_hit_inside_the_ttl_makes_no_fetch_and_no_stale_error(tmp):
     def check(rig):
+        assert rig.ttl >= {"claude": 300, "codex": 600}.get(rig.provider, rig.ttl), "a miss there is too expensive to court"
         rig.seed(rig.ttl - 1)
         rc, entry, errors, _ = rig.entry()
         assert rc == 0 and errors == {}, (rc, errors)
@@ -248,7 +238,7 @@ def test_claude_lock_timeout_and_pending_swap_fallbacks_carry_no_error(tmp):
         os.makedirs(home)
         with mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}), \
                 ExitStack() as stack:
-            rig = _rig(home, "claude", stack)
+            rig = _Rig(_load(), home, "claude", stack)
             stack.enter_context(mock.patch.object(
                 rig.mod, "_claude_access_token",
                 side_effect=getattr(rig.mod, exc_name)("held")))
@@ -269,7 +259,7 @@ def test_zai_reset_list_read_without_live_carries_no_stale_error(tmp):
     failure that belongs to the quota call alone."""
     with mock.patch.dict(os.environ, {"HOME": tmp, "USERPROFILE": tmp}), \
             ExitStack() as stack:
-        rig = _rig(tmp, "zai", stack)
+        rig = _Rig(_load(), tmp, "zai", stack)
         rig.seed()
         envelope = {"code": 200, "msg": "ok", "success": True,
                     "data": {"weekResets": [{

@@ -188,27 +188,19 @@ def test_naming_an_uninstalled_provider_is_still_an_error(tmp):
 def test_a_removed_provider_is_not_spoken_for_by_its_leftover_cache(tmp):
     """The credential check runs before the cache read, so a cache written
     while the provider was installed cannot answer for it afterwards."""
-    mod = _load()
-    cache = os.path.join(tmp, "kimi-cache.json")
-    with open(cache, "w", encoding="utf-8") as fh:
-        json.dump({"data": {"limits": []}, "fetched_at": 2 ** 31}, fh)
-    with mock.patch.object(mod, "KIMI_CACHE", cache), \
-            mock.patch.object(mod, "KIMI_CRED",
-                              os.path.join(tmp, "absent.json")):
-        try:
-            mod.query_kimi()
-        except mod.ProviderNotConfigured:
-            pass
-        else:
-            raise AssertionError("a leftover cache answered for a removed provider")
-    with mock.patch.object(mod, "ZAI_CACHE", os.path.join(tmp, "zai-cache.json")), \
-            _zai_sources(mod, cred=os.path.join(tmp, "zai-absent.json")):
-        try:
-            mod.query_zai()
-        except mod.ProviderNotConfigured:
-            pass
-        else:
-            raise AssertionError("a leftover cache answered for a removed provider")
+    mod, cache, absent = _load(), os.path.join(tmp, "cache.json"), os.path.join(tmp, "absent.json")
+    for age in (60, 10 ** 5):
+        with open(cache, "w", encoding="utf-8") as fh:
+            json.dump({"data": {"limits": []}, "fetched_at": time.time() - age}, fh)
+        for query, removed in ((mod.query_kimi, mock.patch.multiple(mod, KIMI_CACHE=cache, KIMI_CRED=absent)),
+                               (mod.query_codex, mock.patch.multiple(mod, CODEX_CACHE=cache, CODEX_AUTH=absent)),
+                               (mod.query_zai, _zai_sources(mod, cred=absent))):
+            with removed, mock.patch.object(mod, "ZAI_CACHE", cache), mock.patch.object(mod, "_get", side_effect=AssertionError("fetched")):
+                try:
+                    query()
+                except mod.ProviderNotConfigured:
+                    continue
+            raise AssertionError(f"a {age} s leftover cache answered for {query.__name__}")
 
 
 def test_version_flag_prints_the_tool_version_without_querying(tmp):

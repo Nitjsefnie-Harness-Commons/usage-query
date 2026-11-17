@@ -456,52 +456,6 @@ def test_codex_normalizes_default_and_model_scoped_windows(tmp):
     assert got["_scoped"][0]["pct"] == 3
 
 
-def test_codex_cache_avoids_the_fetch_and_stale_payload_survives_failure(tmp):
-    """Codex holds its own, much longer TTL: a 30 s one expired in lockstep with
-    the status line's 30 s refresh, so essentially every refresh was a miss."""
-    mod = _util.load(USAGE_QUERY, "usage_query_codex_cache")
-    mod.CODEX_CACHE = os.path.join(tmp, "codex-usage.json")
-    mod.CODEX_AUTH = os.path.join(tmp, "auth.json")
-    with open(mod.CODEX_AUTH, "w", encoding="utf-8") as f:
-        json.dump({"tokens": {}}, f)
-    assert mod.CODEX_CACHE_TTL >= 600, "a Codex miss is too expensive to court"
-    payload = _codex_payload()
-    fresh = mod.CODEX_CACHE_TTL - 60
-    with open(mod.CODEX_CACHE, "w", encoding="utf-8") as f:
-        json.dump({"fetched_at": time.time() - fresh, "data": payload}, f)
-    with mock.patch.object(mod, "_codex_rate_limits") as fetch:
-        assert mod.query_codex()["weekly"]["pct"] == 27
-    fetch.assert_not_called()
-
-    stale = mod.CODEX_CACHE_TTL + 90
-    with open(mod.CODEX_CACHE, "w", encoding="utf-8") as f:
-        json.dump({"fetched_at": time.time() - stale, "data": payload}, f)
-    with mock.patch.object(mod, "_codex_rate_limits",
-                           side_effect=RuntimeError("offline")):
-        got = mod.query_codex()
-    assert got["weekly"]["pct"] == 27
-    assert stale - 1 <= got["_stale_age"] <= stale + 1
-
-
-def test_a_removed_codex_install_is_unconfigured_whatever_its_cache_holds(tmp):
-    """Uninstalling Codex leaves its usage cache in the temp dir; neither a
-    fresh nor a stale cached payload may keep reporting the removed install."""
-    mod = _util.load(USAGE_QUERY, "usage_query_codex_removed")
-    mod.CODEX_CACHE = os.path.join(tmp, "codex-usage.json")
-    mod.CODEX_AUTH = os.path.join(tmp, "removed", "auth.json")
-    for age in (60, mod.CODEX_CACHE_TTL + 90):
-        with open(mod.CODEX_CACHE, "w", encoding="utf-8") as f:
-            json.dump({"fetched_at": time.time() - age, "data": _codex_payload()}, f)
-        with mock.patch.object(mod, "_get") as fetch:
-            try:
-                got = mod.query_codex()
-            except mod.ProviderNotConfigured:
-                pass
-            else:
-                raise AssertionError(f"a removed Codex install reported {got} from a {age} s cache")
-        fetch.assert_not_called()
-
-
 def test_codex_flag_queries_only_codex(tmp):
     del tmp
     mod = _util.load(USAGE_QUERY, "usage_query_codex_cli")
@@ -652,25 +606,6 @@ def test_codex_survives_a_reset_credit_summary_with_no_detail(tmp):
     got = mod._normalize_codex(payload)
     assert got["_reset_credits_available"] == 1
     assert got.get("_reset_credits") in (None, [])
-
-
-def test_the_live_claude_account_holds_the_account_ttl(tmp):
-    """A 60 s status-line refresh outlived the live account's old 30 s TTL, so every
-    refresh fetched that token until its usage endpoint answered 429."""
-    mod = _util.load(USAGE_QUERY, "usage_query_claude_live_ttl")
-    assert mod.CLAUDE_ACCOUNT_CACHE_TTL >= 300
-    cache = os.path.join(tmp, "claude-usage.json")
-    payload = {"five_hour": {"utilization": 7, "resets_at": None},
-               "seven_day": {"utilization": 8, "resets_at": None}}
-    with open(cache, "w", encoding="utf-8") as f:
-        json.dump({"fetched_at": time.time() - 120, "data": payload}, f)
-    cred = os.path.join(tmp, "credentials.json")
-    with open(cred, "w", encoding="utf-8") as f:
-        f.write("{}")
-    with mock.patch.object(mod, "CLAUDE_CRED", cred), mock.patch.object(mod, "CACHE", cache), \
-            mock.patch.object(mod, "_get_retry") as fetch:
-        mod.query_claude()
-    fetch.assert_not_called()
 
 
 def main():

@@ -143,7 +143,7 @@ import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from . import claude_state, zai_schedule
+from . import cache_store, claude_state, zai_schedule
 
 __version__ = "1.10.6"
 
@@ -292,14 +292,14 @@ KIMI_EXPIRY_MARGIN = 120
 # treat it as a fixed 7 days; _kimi_window_secs of a real `window` (if upstream
 # ever adds one) takes precedence over this default.
 KIMI_WEEKLY_SECS = 7 * 86400
-# Shared cache files written by usage-monitor.py; reused here to avoid a
-# network round-trip when the hook has already fetched data recently.
-TEMPDIR = tempfile.gettempdir()
-CACHE = os.path.join(TEMPDIR, ".claude_usage_cache.json")
-KIMI_CACHE = os.path.join(TEMPDIR, ".claude_kimi_usage_cache.json")
-CODEX_CACHE = os.path.join(TEMPDIR, ".codex_usage_cache.json")
-ZAI_CACHE = os.path.join(TEMPDIR, ".zai_usage_cache.json")
-ZAI_RESETS_CACHE = os.path.join(TEMPDIR, ".zai_resets_cache.json")
+# This user's own cache files (cache_store): a recent reading answers without
+# a network round-trip, and no other local user can supply or read one.
+CACHE_DIR = os.path.expanduser("~/.cache/usage-query")
+CACHE = os.path.join(CACHE_DIR, ".claude_usage_cache.json")
+KIMI_CACHE = os.path.join(CACHE_DIR, ".claude_kimi_usage_cache.json")
+CODEX_CACHE = os.path.join(CACHE_DIR, ".codex_usage_cache.json")
+ZAI_CACHE = os.path.join(CACHE_DIR, ".zai_usage_cache.json")
+ZAI_RESETS_CACHE = os.path.join(CACHE_DIR, ".zai_resets_cache.json")
 CACHE_TTL = 30
 # Every Claude account, the live one included: a 30 s TTL under a 60 s status-line
 # refresh fetched the live token every minute until its usage endpoint answered 429.
@@ -396,21 +396,12 @@ def _get(url, headers):
 
 
 def _write_cache(path, data):
-    """Atomically seed the shared box-wide cache (temp + os.replace) on a
-    SUCCESSFUL fetch only — same file the usage-monitor hook reads/writes. Never
-    called with None, so a failed fetch never blanks the cache. This lets a
-    standalone `usage_query.py` run populate its own stale-fallback source instead
-    of depending entirely on the hook having fetched recently."""
-    try:
-        tmp = f"{path}.{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"fetched_at": time.time(), "data": data}, f)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    """Seed the cache on a SUCCESSFUL fetch only. Never called with None, so a
+    failed fetch never blanks the cache, and a later run has a stale fallback."""
+    cache_store.write(path, {"fetched_at": time.time(), "data": data})
 
 
-# After a 429, no process on the box asks that account's usage endpoint
+# After a 429, no process of this user asks that account's usage endpoint
 # again until the backoff in its cache file expires: BACKOFF_BASE
 # doubling per consecutive 429 up to BACKOFF_CAP, or the server's Retry-After
 # when longer (still capped). A success rewrites the file without it.
@@ -424,13 +415,7 @@ def _write_backoff(path, cached, retry_after=None):
     streak = int(((cached or {}).get("backoff") or {}).get("streak") or 0) + 1
     delay = min(BACKOFF_CAP, max(BACKOFF_BASE * 2 ** (streak - 1), retry_after or 0))
     record["backoff"] = {"streak": streak, "until": time.time() + delay}
-    try:
-        tmp = f"{path}.{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(record, f)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    cache_store.write(path, record)
     return record["backoff"]["until"]
 
 
@@ -490,13 +475,7 @@ def _write_probed(path, cached, probed):
     data = dict((cached or {}).get("data") or {})
     data.update(probed)
     record.update({"fetched_at": time.time(), "data": data})
-    try:
-        tmp = f"{path}.{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(record, f)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    cache_store.write(path, record)
     return data
 
 
@@ -940,22 +919,11 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
     now = time.time()
-    data, stale, c = None, None, {}
-    try:
-        with open(cache_path, encoding="utf-8") as f:
-            c = json.load(f)
-        cdata = c.get("data")
-        cage = now - float(c.get("fetched_at") or 0)
-        if cdata is not None:
-            if cage < cache_ttl:
-                data = cdata
-            else:
-                stale = (cdata, int(cage))
-    except Exception:
-        pass
+    c, data, stale = cache_store.read(cache_path, cache_ttl)
     age, stale_error = 0, None
-    until = float(((c if isinstance(c, dict) else {}).get("backoff") or {}).get("until") or 0)
-    if data is None and now < until:
+    until = (c.get("backoff") or {}).get("until")
+    # Capped: an `until` farther than BACKOFF_CAP, or not finite, would hold fetches off for good.
+    if data is None and isinstance(until, (int, float)) and now < until <= now + BACKOFF_CAP:
         note = ("HTTPError: HTTP Error 429: backing off until "
                 + time.strftime("%H:%M:%S", time.localtime(until)))
         try:
@@ -983,10 +951,9 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
                 _write_cache(cache_path, data)
             except Exception as e:
                 if getattr(e, "code", None) == 429 and isinstance(e, urllib.error.HTTPError):
-                    _write_backoff(cache_path, c if isinstance(c, dict) else {}, _retry_after(e))
+                    _write_backoff(cache_path, c, _retry_after(e))
                     try:
-                        with open(cache_path, encoding="utf-8") as f:
-                            backed = json.load(f)
+                        backed = cache_store.read(cache_path, cache_ttl)[0]
                         data = _write_probed(cache_path, backed, _claude_header_probe(token))
                     except Exception:
                         data = None
@@ -1256,20 +1223,7 @@ def query_kimi():
     stale), tagged with '_stale_age' seconds and '_stale_error' — same as the
     Claude side."""
     _require_configured("Kimi", KIMI_CRED)
-    now = time.time()
-    data, stale = None, None
-    try:
-        with open(KIMI_CACHE, encoding="utf-8") as f:
-            c = json.load(f)
-        cdata = c.get("data")
-        cage = now - float(c.get("fetched_at") or 0)
-        if cdata is not None:
-            if cage < CACHE_TTL:
-                data = cdata
-            else:
-                stale = (cdata, int(cage))
-    except Exception:
-        pass
+    _, data, stale = cache_store.read(KIMI_CACHE, CACHE_TTL)
     age, stale_error = 0, None
     if data is None:
         token = _kimi_access_token()
@@ -1596,7 +1550,7 @@ def _normalize_zai(envelope, peak_note):
 
 
 def _cached_fetch(path, fetch, live=True):
-    """(payload, stale_age, stale_error) through a box-wide cache file: a
+    """(payload, stale_age, stale_error) through a cache file: a
     payload younger than CACHE_TTL answers without a fetch; otherwise `fetch()`
     runs (only when `live`) and its result is cached; if it raises - or `live`
     is False - the last cached payload answers however stale, with its age in
@@ -1604,19 +1558,9 @@ def _cached_fetch(path, fetch, live=True):
     '<ExceptionType>: <message>', the form `errors` uses; None unless a fetch
     ran and raised. Raises the fetch's error, or LookupError when not `live`,
     if there is nothing cached at all."""
-    now = time.time()
-    stale = None
-    try:
-        with open(path, encoding="utf-8") as f:
-            c = json.load(f)
-        cdata = c.get("data")
-        cage = now - float(c.get("fetched_at") or 0)
-        if cdata is not None:
-            if cage < CACHE_TTL:
-                return cdata, 0, None
-            stale = (cdata, int(cage))
-    except Exception:
-        pass
+    _, fresh, stale = cache_store.read(path, CACHE_TTL)
+    if fresh is not None:
+        return fresh, 0, None
     if not live:
         if stale is None:
             raise LookupError(f"no cached payload in {path}")
@@ -1992,7 +1936,7 @@ def _codex_rpc_shape(payload):
     Mirrors codex-rs backend-client rate_limit_snapshots_from_payload: one
     snapshot under limit_id "codex" built from `rate_limit`, then one per
     `additional_rate_limits` entry keyed by its metered_feature and labelled with
-    its limit_name. Keeping the RPC shape is what lets the shared cache file, the
+    its limit_name. Keeping the RPC shape is what lets the cache file, the
     normalizer and every downstream consumer stay exactly as they were.
     """
     plan = payload.get("plan_type")
@@ -2346,20 +2290,7 @@ def query_codex():
     A machine with no Codex credentials raises ProviderNotConfigured before
     the cache is read, so a removed install's leftover cache never reports."""
     _require_configured("Codex", CODEX_AUTH)
-    now = time.time()
-    data, stale = None, None
-    try:
-        with open(CODEX_CACHE, encoding="utf-8") as f:
-            cached = json.load(f)
-        cached_data = cached.get("data")
-        age = now - float(cached.get("fetched_at") or 0)
-        if cached_data is not None:
-            if age < CODEX_CACHE_TTL:
-                data = cached_data
-            else:
-                stale = (cached_data, int(age))
-    except Exception:
-        pass
+    _, data, stale = cache_store.read(CODEX_CACHE, CODEX_CACHE_TTL)
     stale_age, stale_error = 0, None
     if data is None:
         try:
