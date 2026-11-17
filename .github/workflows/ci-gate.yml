@@ -55,11 +55,11 @@ jobs:
           }
           if [ "$EVENT" = pull_request ] && [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
             range="$BASE_SHA...$HEAD_SHA"
-          elif [ "$EVENT" = push ] && [ -n "$DEFAULT_BRANCH" ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+          elif [ "$EVENT" = push ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
             git rev-parse --verify --quiet "$BEFORE^{commit}" > /dev/null \
               || full_run "before $BEFORE is not in the fetched history"
             range="$BEFORE..$SHA"
-          elif [ "$EVENT" = push ] && [ -n "$DEFAULT_BRANCH" ] && [[ "$REF" == refs/heads/* ]]; then
+          elif [ "$EVENT" = push ] && [[ "$REF" == refs/heads/* ]]; then
             range="refs/remotes/origin/$DEFAULT_BRANCH...$SHA"
           else
             full_run "$EVENT on $REF has no diff to classify"
