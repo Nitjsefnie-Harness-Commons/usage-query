@@ -742,15 +742,16 @@ def test_zai_campaign_clause_names_the_window_in_machine_local_time(tmp):
     del tmp
     if not hasattr(time, "tzset"):
         _util.skip("time.tzset is POSIX-only")
+    # Keep the optional POSIX lookup analyzable by the Windows linter too.
     mod = _load()
     try:
         with mock.patch.dict(os.environ, {"TZ": "Europe/Prague"}):
-            time.tzset()
+            getattr(time, "tzset")()
             status = mod._zai_billing_status(
                 datetime(2026, 9, 29, 7, 0, tzinfo=timezone.utc))
             clause = mod._zai_campaign_clause(status["campaign"])
     finally:
-        time.tzset()
+        getattr(time, "tzset")()
     assert status["campaign"]["hours_local"] == "17:00-03:00"
     assert clause == (
         "GLM-5.3-Flash 2x quota nightly 23:00-09:00 UTC+8 (17:00-03:00 local)"

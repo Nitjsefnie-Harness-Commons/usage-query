@@ -207,9 +207,13 @@ def test_a_fresh_live_read_carries_neither_stale_field(tmp):
         assert rc == 0 and errors == {}, (rc, errors)
         assert rig.fetch.call_count >= 1
         assert "_stale_age" not in entry and "_stale_error" not in entry, entry
+        assert "_cache_age" not in entry, entry
+        # The text run must fetch too, not read the JSON run's new snapshot.
+        os.remove(rig.cache)
         rc, cell, text, _ = rig.cell()
         assert cell == rig.display, cell
         assert "refresh failed" not in text and "cached" not in text, text
+        assert rig.fetch.call_count >= 2
 
     _each(tmp, check)
 
@@ -221,7 +225,13 @@ def test_a_cache_hit_inside_the_ttl_makes_no_fetch_and_no_stale_error(tmp):
         assert rc == 0 and errors == {}, (rc, errors)
         assert "_stale_age" not in entry and "_stale_error" not in entry, entry
         rc, cell, text, _ = rig.cell()
-        assert cell == rig.display and "refresh failed" not in text, text
+        expected = rig.display
+        if rig.provider == "codex":
+            assert entry["_cache_age"] == rig.ttl - 1, entry
+            expected += f" (cached {rig.ttl - 1}s)"
+        else:
+            assert "_cache_age" not in entry, entry
+        assert cell == expected and "refresh failed" not in text, text
         assert rig.fetch.call_count == 0, rig.fetch.call_args_list
 
     _each(tmp, check)
