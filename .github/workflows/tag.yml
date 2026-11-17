@@ -114,8 +114,8 @@ jobs:
           REPO: ${{ github.repository }}
         # Three details that are each a way this can be wrong:
         #   - it excludes ITSELF, or it would wait on a job waiting on it;
-        #   - it requires at least one other check to exist, so it cannot
-        #     race ahead and tag before CI has even been scheduled;
+        #   - it requires the `aggregate` check to exist, so it cannot tag
+        #     before ci gate has scheduled the legs `aggregate` waits on;
         #   - `cancelled` counts as failure. A cancelled run means a newer
         #     push superseded this SHA, which is not a commit to release.
         run: |
@@ -129,6 +129,12 @@ jobs:
 
             if [ -z "$runs" ]; then
               echo "no other check runs reported yet, waiting..."
+              sleep 20
+              continue
+            fi
+
+            if [ -z "$(echo "$runs" | awk -F'\t' '$3 == "aggregate"')" ]; then
+              echo "no aggregate check run reported yet, waiting..."
               sleep 20
               continue
             fi
