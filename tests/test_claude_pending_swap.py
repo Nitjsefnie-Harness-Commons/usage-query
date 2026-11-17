@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 import _util
-from test_claude_accounts import install, run, setup
+from test_claude_accounts import install, run_json, setup
 from test_claude_accounts_lock import assert_new_pair, refreshing, replace_bytes
 
 
@@ -33,6 +33,16 @@ def beta_setup(tmp):
     })
 
 
+def beta_cases(tmp, values):
+    """One isolated home per value, with a stale beta stash installed."""
+    for index, value in enumerate(values):
+        home = Path(tmp) / f"case{index}"
+        home.mkdir()
+        with beta_setup(str(home)) as (mod, accounts, http):
+            install(accounts, beta_stale=True)
+            yield value, mod, accounts, http
+
+
 def test_pending_swap_uses_stale_cached_stash_without_refresh(tmp):
     with beta_setup(tmp) as (mod, accounts, http):
         install(accounts, beta_stale=True)
@@ -40,8 +50,7 @@ def test_pending_swap_uses_stale_cached_stash_without_refresh(tmp):
         pending_state(accounts, {"from": "alpha", "to": "beta"})
         seed_cache(accounts / ".beta.usage-cache", 42)
         old = (accounts / "beta.json").read_bytes()
-        rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+        rc, raw, _, got = run_json(mod)
         assert rc == 0 and got["errors"] == {}, raw
         assert set(got["claude_accounts"]) == {"alpha", "beta"}
         assert got["claude_accounts"]["beta"]["five_hour"]["pct"] == 42
@@ -51,21 +60,16 @@ def test_pending_swap_uses_stale_cached_stash_without_refresh(tmp):
 
 
 def test_pending_key_without_cache_records_error_and_skips_stash(tmp):
-    for index, value in enumerate((None, False, {})):
-        home = Path(tmp) / f"case{index}"
-        home.mkdir()
-        with beta_setup(str(home)) as (mod, accounts, http):
-            install(accounts, beta_stale=True)
-            seed_cache(Path(mod.CACHE), 10, age=0)
-            pending_state(accounts, value)
-            old = (accounts / "beta.json").read_bytes()
-            rc, raw, _ = run(mod, "--json")
-            got = json.loads(raw)
-            assert rc == 1 and set(got["errors"]) == {"claude:beta"}, raw
-            assert "pending" in got["errors"]["claude:beta"].lower()
-            assert set(got["claude_accounts"]) == {"alpha"}
-            assert (accounts / "beta.json").read_bytes() == old
-            assert http.calls == []
+    for value, mod, accounts, http in beta_cases(tmp, (None, False, {})):
+        seed_cache(Path(mod.CACHE), 10, age=0)
+        pending_state(accounts, value)
+        old = (accounts / "beta.json").read_bytes()
+        rc, raw, _, got = run_json(mod)
+        assert rc == 1 and set(got["errors"]) == {"claude:beta"}, raw
+        assert "pending" in got["errors"]["claude:beta"].lower()
+        assert set(got["claude_accounts"]) == {"alpha"}
+        assert (accounts / "beta.json").read_bytes() == old
+        assert http.calls == []
 
 
 def test_pending_swap_without_cache_does_not_query_a_fresh_stash(tmp):
@@ -73,18 +77,28 @@ def test_pending_swap_without_cache_does_not_query_a_fresh_stash(tmp):
         install(accounts)
         seed_cache(Path(mod.CACHE), 10, age=0)
         pending_state(accounts)
-        rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+        rc, raw, _, got = run_json(mod)
         assert rc == 1 and set(got["errors"]) == {"claude:beta"}, raw
         assert http.calls == []
 
 
+def test_unreadable_state_is_pending_and_serves_the_cache(tmp):
+    for content, mod, accounts, http in beta_cases(tmp, (b'{"pending": ', b"\xff\xfe{", None)):
+        seed_cache(Path(mod.CACHE), 10, age=0)
+        seed_cache(accounts / ".beta.usage-cache", 42)
+        state = accounts / "state.json"
+        if content is None:
+            state.mkdir()
+        else:
+            state.write_bytes(content)
+        assert run_json(mod)[3]["claude_accounts"]["beta"]["five_hour"]["pct"] == 42
+        assert http.calls == [], f"unreadable state made a request: {content!r}"
+
+
 def test_state_without_pending_allows_refresh_and_is_not_an_account(tmp):
-    with beta_setup(tmp) as (mod, accounts, http):
-        install(accounts, beta_stale=True)
-        (accounts / "state.json").write_text("{}", encoding="utf-8")
-        rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+    for text, mod, accounts, http in beta_cases(tmp, ("{}", '"no pending swap"', "5", "[]", "null")):
+        (accounts / "state.json").write_text(text, encoding="utf-8")
+        rc, raw, _, got = run_json(mod)
         assert rc == 0 and got["errors"] == {}, raw
         assert set(got["claude_accounts"]) == {"alpha", "beta"}
         assert got["claude_accounts"]["beta"]["five_hour"]["pct"] == 55
@@ -96,8 +110,7 @@ def test_pending_swap_reports_error_for_uncached_live_reading(tmp):
     with refreshing(tmp) as (mod, accounts, http):
         pending_state(accounts)
         before = home_files(tmp)
-        rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+        rc, raw, _, got = run_json(mod)
         assert rc == 1 and set(got["errors"]) == {"claude", "claude:beta"}, raw
         assert "pending" in got["errors"]["claude"].lower()
         assert got["usage"] == {} and got["claude_accounts"] == {}
@@ -110,8 +123,7 @@ def test_pending_swap_reports_stale_cached_live_reading(tmp):
         pending_state(accounts)
         seed_cache(Path(mod.CACHE), 17)
         before = home_files(tmp)
-        rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+        rc, raw, _, got = run_json(mod)
         assert rc == 1 and set(got["errors"]) == {"claude:beta"}, raw
         assert got["usage"]["claude"]["five_hour"]["pct"] == 17
         assert got["usage"]["claude"]["weekly"]["pct"] == 18
@@ -142,8 +154,7 @@ def test_pending_recovery_during_live_refresh_cannot_spend_shared_pair(tmp):
             return answer
 
         with mock.patch("urllib.request.urlopen", side_effect=request):
-            rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+            rc, raw, _, got = run_json(mod)
         assert http.calls == [], "pending recovery race spent the shared refresh token"
         assert recovered == [], "recovery callback ran during a forbidden refresh"
         assert home_files(tmp) == before, "pending recovery race changed credentials or marker"
@@ -153,8 +164,7 @@ def test_pending_recovery_during_live_refresh_cannot_spend_shared_pair(tmp):
 def test_state_without_pending_allows_live_refresh(tmp):
     with refreshing(tmp) as (mod, accounts, http):
         (accounts / "state.json").write_text("{}", encoding="utf-8")
-        rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+        rc, raw, _, got = run_json(mod)
         assert rc == 0 and got["errors"] == {}, raw
         assert got["usage"]["claude"]["five_hour"]["pct"] == 25
         assert_new_pair(Path(mod.CLAUDE_CRED))

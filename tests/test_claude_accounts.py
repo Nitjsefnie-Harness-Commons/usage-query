@@ -106,9 +106,13 @@ def run(mod, *flags):
     return rc, out.getvalue(), err.getvalue()
 
 
-def assert_legacy(mod):
+def run_json(mod):
     rc, raw, err = run(mod, "--json")
-    got = json.loads(raw)
+    return rc, raw, err, json.loads(raw)
+
+
+def assert_legacy(mod):
+    rc, raw, err, got = run_json(mod)
     assert rc == 0 and err == "", (rc, raw, err)
     assert set(got) == {"usage", "errors", "unconfigured"}, got
     assert set(got["usage"]) == {"claude"}
@@ -159,8 +163,7 @@ def test_fresh_inactive_account_uses_its_token_and_live_is_reused(tmp):
         install(accounts)
         (accounts / "ignored.txt").write_text("not json", encoding="utf-8")
         (accounts / "ignored.json").mkdir()
-        rc, raw, err = run(mod, "--json")
-        got = json.loads(raw)
+        rc, raw, err, got = run_json(mod)
         assert rc == 0 and err == "", (rc, raw, err)
         assert set(got["usage"]) == {"claude"}
         assert set(got["claude_accounts"]) == {"alpha", "beta"}
@@ -196,8 +199,7 @@ def test_null_window_on_inactive_account_reads_as_inactive(tmp):
                 return Response(payload)
 
             with mock.patch("urllib.request.urlopen", side_effect=request):
-                rc, raw, err = run(mod, "--json")
-            got = json.loads(raw)
+                rc, raw, err, got = run_json(mod)
             assert rc == 0 and err == "" and got["errors"] == {}, (src, rc, raw, err)
             beta = got["claude_accounts"]["beta"]
             assert beta[key] == inactive, (src, beta)
@@ -225,8 +227,7 @@ def scoped_accounts(tmp):
 
 def test_inactive_scoped_weekly_limits_are_in_account_json(tmp):
     with scoped_accounts(tmp) as (mod, http):
-        rc, raw, err = run(mod, "--json")
-        got = json.loads(raw)
+        rc, raw, err, got = run_json(mod)
         assert rc == 0 and err == "", (rc, raw, err)
         beta = got["claude_accounts"]["beta"]
         assert beta.get("_scoped") == [
@@ -270,8 +271,7 @@ def test_stale_inactive_account_refreshes_only_its_stash(tmp):
         install(accounts, beta_stale=True)
         live = Path(mod.CLAUDE_CRED).read_bytes()
         alpha = (accounts / "alpha.json").read_bytes()
-        rc, raw, err = run(mod, "--json")
-        got = json.loads(raw)
+        rc, raw, err, got = run_json(mod)
         assert rc == 0 and err == "", (rc, raw, err)
         assert got["claude_accounts"]["beta"]["five_hour"]["pct"] == 50
         assert http.calls == [("usage", "Bearer live-token"),
@@ -297,8 +297,7 @@ def test_refresh_failure_omits_only_failed_account(tmp):
         install(accounts, beta_stale=True)
         old = (accounts / "beta.json").read_bytes()
         credentials(accounts / "gamma.json", "gamma-token")
-        rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+        rc, _, _, got = run_json(mod)
         assert rc == 1
         assert set(got["claude_accounts"]) == {"alpha", "gamma"}
         assert got["claude_accounts"]["gamma"]["five_hour"]["pct"] == 60
@@ -314,8 +313,7 @@ def test_unreadable_stash_is_named_and_other_accounts_report(tmp):
         install(accounts)
         (accounts / "beta.json").write_text("broken json", encoding="utf-8")
         credentials(accounts / "gamma.json", "gamma-token")
-        rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+        rc, _, _, got = run_json(mod)
         assert rc == 1
         assert set(got["claude_accounts"]) == {"alpha", "gamma"}
         assert set(got["errors"]) == {"claude:beta"}
@@ -395,8 +393,7 @@ def test_stale_live_token_still_refreshes_live_credentials(tmp):
         install(accounts)
         alpha = (accounts / "alpha.json").read_bytes()
         credentials(Path(mod.CLAUDE_CRED), "live-token", stale=True)
-        rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+        rc, _, _, got = run_json(mod)
         assert rc == 0 and got["usage"]["claude"]["five_hour"]["pct"] == 20
         assert got["claude_accounts"]["alpha"]["five_hour"]["pct"] == 20
         assert json.loads(Path(mod.CLAUDE_CRED).read_text(encoding="utf-8"))["claudeAiOauth"]["refreshToken"] == "live-refresh-new"
@@ -422,8 +419,7 @@ def test_live_failure_still_reports_inactive_account(tmp):
     with setup(tmp, {"beta-token": 40}) as (mod, accounts, _):
         install(accounts)
         Path(mod.CLAUDE_CRED).write_text("broken json", encoding="utf-8")
-        rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+        rc, _, _, got = run_json(mod)
         assert rc == 1 and got["usage"] == {}
         assert set(got["claude_accounts"]) == {"beta"}
         assert set(got["errors"]) == {"claude"}
@@ -464,8 +460,7 @@ def test_live_entry_preserves_scoped_limits_and_omits_cache_metadata(tmp):
             return original_query(*args, **kwargs) if args else live
 
         with mock.patch.object(mod, "query_claude", side_effect=query):
-            rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+            rc, _, _, got = run_json(mod)
         assert rc == 0 and got["usage"]["claude"] == live
         assert got["claude_accounts"]["alpha"] == {
             "live": True, "five_hour": window, "weekly": window,
@@ -477,8 +472,7 @@ def test_accounts_directory_read_failure_preserves_live_output(tmp):
     with setup(tmp) as (mod, accounts, _):
         install(accounts)
         with mock.patch.object(mod.os, "listdir", side_effect=PermissionError("directory unreadable")):
-            rc, raw, _ = run(mod, "--json")
-        got = json.loads(raw)
+            rc, _, _, got = run_json(mod)
         assert rc == 1 and "claude_accounts" not in got
         assert got["usage"]["claude"]["five_hour"]["pct"] == 10
         assert set(got["errors"]) == {"claude_accounts"}
@@ -496,8 +490,7 @@ def test_marker_read_failure_is_reported_in_json_and_text(tmp):
             return real_open(path, *args, **kwargs)
 
         with mock.patch("builtins.open", side_effect=opened):
-            rc, raw, _ = run(mod, "--json")
-            got = json.loads(raw)
+            rc, _, _, got = run_json(mod)
             assert rc == 1 and "claude_accounts" not in got
             assert got["usage"]["claude"]["five_hour"]["pct"] == 10
             assert set(got["errors"]) == {"claude_accounts"}
