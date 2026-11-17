@@ -34,8 +34,11 @@ def read(path, ttl):
     if not isinstance(record, dict):
         return {}, None, None
     fetched, data = record.get("fetched_at"), record.get("data")
-    age = time.time() - fetched if isinstance(fetched, (int, float)) and math.isfinite(fetched) else -1
-    if not isinstance(data, dict) or age < 0:
+    try:
+        age = time.time() - float(fetched) if isinstance(fetched, (int, float)) else math.nan
+    except OverflowError:
+        age = math.nan
+    if not isinstance(data, dict) or not 0 <= age < math.inf:
         return record, None, None
     return (record, data, None) if age < ttl else (record, None, (data, int(age)))
 
@@ -51,7 +54,12 @@ def write(path, record) -> None:
     except OSError:
         return
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        try:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+        except Exception:
+            os.close(fd)
+            raise
+        with stream:
             json.dump(record, stream)
         os.replace(tmp, path)
     except OSError:
@@ -59,3 +67,12 @@ def write(path, record) -> None:
     finally:
         with suppress(OSError):
             os.remove(tmp)
+
+
+def retire(paths) -> None:
+    """Remove this user's own regular files at `paths` (POSIX)."""
+    for path in paths if hasattr(os, "geteuid") else ():
+        with suppress(OSError):
+            info = os.lstat(path)
+            if stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid():
+                os.remove(path)

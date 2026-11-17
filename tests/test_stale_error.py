@@ -69,8 +69,7 @@ class _Rig:
             self.ttl = mod.CLAUDE_ACCOUNT_CACHE_TTL
             stack.enter_context(mock.patch.object(mod, "CLAUDE_CRED", cred))
             stack.enter_context(mock.patch.object(mod, "CACHE", self.cache))
-            stack.enter_context(mock.patch.object(
-                mod, "_claude_access_token", return_value="token"))
+            stack.enter_context(mock.patch.object(mod, "_claude_access_token", return_value="token"))
         elif provider == "kimi":
             block = {"limit": "100", "remaining": "60",
                      "resetTime": "2026-09-01T00:00:00Z"}
@@ -79,17 +78,14 @@ class _Rig:
                             "detail": block}], "usage": block}
             self.target = "_get"
             stack.enter_context(mock.patch.object(mod, "KIMI_CRED", cred))
-            stack.enter_context(mock.patch.object(mod, "KIMI_CACHE",
-                                                  self.cache))
-            stack.enter_context(mock.patch.object(
-                mod, "_kimi_access_token", return_value="token"))
+            stack.enter_context(mock.patch.object(mod, "KIMI_CACHE", self.cache))
+            stack.enter_context(mock.patch.object(mod, "_kimi_access_token", return_value="token"))
         elif provider == "codex":
             self.cache = os.path.join(tmp, "codex.cache")
             self.payload = _codex_payload(now=NOW)
             self.target = "_codex_rate_limits"
             self.ttl = mod.CODEX_CACHE_TTL
-            stack.enter_context(mock.patch.object(mod, "CODEX_CACHE",
-                                                  self.cache))
+            stack.enter_context(mock.patch.object(mod, "CODEX_CACHE", self.cache))
             stack.enter_context(mock.patch.object(mod, "CODEX_AUTH", cred))
         else:
             self.cache = os.path.join(tmp, "zai.cache")
@@ -101,14 +97,11 @@ class _Rig:
             with open(key_file, "w", encoding="utf-8") as fh:
                 fh.write("k" * 49 + "\n")
             stack.enter_context(_zai_sources(mod, files=(key_file,)))
-            stack.enter_context(mock.patch.object(mod, "ZAI_CACHE",
-                                                  self.cache))
-            stack.enter_context(mock.patch.object(mod, "ZAI_RESETS_CACHE",
-                                                  self.resets_cache))
+            stack.enter_context(mock.patch.object(mod, "ZAI_CACHE", self.cache))
+            stack.enter_context(mock.patch.object(mod, "ZAI_RESETS_CACHE", self.resets_cache))
         self.fetch = mock.Mock(side_effect=self._answer)
         stack.enter_context(mock.patch.object(mod, self.target, self.fetch))
-        stack.enter_context(mock.patch.object(mod.time, "time",
-                                              return_value=NOW))
+        stack.enter_context(mock.patch.object(mod.time, "time", return_value=NOW))
         stack.enter_context(_frozen_clock(mod, MOMENT))
 
     def _answer(self, url=None, headers=None):
@@ -123,7 +116,7 @@ class _Rig:
             json.dump({"fetched_at": NOW - age, "data": self.payload} if record is None else record, fh)
 
     def unusable(self):
-        return [{"fetched_at": at, "data": self.payload} for at in (NOW + 86400, float("inf"), float("nan"), None, "0")] + [
+        return [{"fetched_at": at, "data": self.payload} for at in (NOW + 86400, float("inf"), float("-inf"), float("nan"), 10 ** 400, None, "0")] + [
             {"fetched_at": NOW - 1, "data": [self.payload]}, [self.payload]]
 
     def succeed(self):
