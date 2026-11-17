@@ -48,7 +48,7 @@ CASES = [
     ({"ZAI_PEAK_DAYS": (1, 2, 3, 4, 5)}, "2026-01-05T15:00+08:00", "off-peak", ("Tue-Sat 14:00-18:00 UTC+8", "Tue-Sat 00:00-14:00 and 18:00-24:00 UTC+8; all day Mon,Sun"), "2026-01-06T14:00:00+08:00", "23h00m", ""),
     ({"ZAI_PEAK_DAYS": (6, 0, 5, 0)}, "2026-01-06T12:00+08:00", "off-peak", ("Mon,Sat-Sun 14:00-18:00 UTC+8", "Mon,Sat-Sun 00:00-14:00 and 18:00-24:00 UTC+8; all day Tue-Fri"), "2026-01-10T14:00:00+08:00", "4d2h", ""),
     ({"ZAI_PEAK_DAYS": (0, 1, 2, 3, 4, 5, 6)}, "2026-01-11T15:00+08:00", "peak", ("Mon-Sun 14:00-18:00 UTC+8", "Mon-Sun 00:00-14:00 and 18:00-24:00 UTC+8"), "2026-01-11T18:00:00+08:00", "3h00m", ""),
-    # Zones: each moment is peak in one of the patched zone and UTC+8 only.
+    # Zones: 1-3 are peak in it or UTC+8, not both; 4 pins the promo end.
     (IST, "2026-01-05T06:00+00:00", "off-peak", IST_HOURS, "2026-01-05T14:00:00+05:30", "2h30m", ""),
     ({"ZAI_TZ": timezone(-timedelta(hours=3, minutes=30))}, "2026-01-05T18:00+00:00", "peak", ("Mon-Fri 14:00-18:00 UTC-3:30", "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC-3:30; all day Sat-Sun"), "2026-01-05T18:00:00-03:30", "3h30m", ""),
     ({"ZAI_TZ": timezone.utc}, "2026-01-05T15:00+00:00", "peak", ("Mon-Fri 14:00-18:00 UTC+0", "Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+0; all day Sat-Sun"), "2026-01-05T18:00:00+00:00", "3h00m", ""),
