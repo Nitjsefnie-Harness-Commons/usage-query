@@ -17,12 +17,9 @@
 # Git will not look inside a directory it has ignored, so each directory below
 # is re-opened before its files are named back.
 #
-# Regenerate after adding files:
-#   python3 <this script's path> <repo>
-#
-# Forgetting to regenerate does not silently drop a file from the release:
-# install.py walks the payload on disk and refuses to install when it finds a
-# file `git ls-files` does not list.
+# Name each new shipped path back by hand, in its directory's block below.
+# `git check-ignore -v <path>` names the rule hiding a file; the README's
+# `.gitignore` paragraph says the same.
 
 *
 
@@ -42,6 +39,10 @@
 # ─── .github/workflows ───
 !/.github/
 !/.github/workflows/
+!/.github/ISSUE_TEMPLATE/
+/.github/ISSUE_TEMPLATE/*
+!/.github/ISSUE_TEMPLATE/issue.md
+!/.github/PULL_REQUEST_TEMPLATE.md
 !/.github/dependabot.yml
 !/.github/comment-share.json
 !/.github/size-baseline.json
