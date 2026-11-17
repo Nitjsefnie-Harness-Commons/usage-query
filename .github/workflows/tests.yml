@@ -10,14 +10,7 @@ name: tests
 # its wrapper from hooks on every tool call.
 
 on:
-  push:
-    # Deny-list rather than an allow-list: a new top-level code directory
-    # would silently stop being tested under an allow-list.
-    paths-ignore:
-      - '**/*.md'
-      - 'LICENSE'
-      - '.gitignore'
-  pull_request:
+  workflow_call:
   workflow_dispatch:
 
 # Least privilege: this job only reads the tree. Without an explicit
@@ -27,7 +20,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: tests-${{ github.ref }}
+  group: ${{ github.workflow == 'tests' && format('tests-{0}', github.ref) || format('tests-called-{0}', github.run_id) }}
   cancel-in-progress: true
 
 jobs:

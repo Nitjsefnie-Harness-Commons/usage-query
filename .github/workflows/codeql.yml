@@ -7,22 +7,17 @@ name: codeql
 # request, GitHub's separate "Code scanning results" check does fail by
 # default on a finding of error, critical or high severity.
 #
-# The weekly cron is not redundant with push: a push analyses only when one
-# happens, and `paths-ignore` skips pushes that touch nothing but Markdown,
+# The weekly cron is not redundant with ci-gate.yml, which calls this per
+# push or pull request and skips a change touching nothing but Markdown,
 # LICENSE or .gitignore. The scheduled run analyses the last commit on the
 # default branch, so that branch is re-analysed even after weeks with no
-# push to it that `paths-ignore` lets through. GitHub gives the reason for
-# scanning on a schedule: it informs you about the latest vulnerabilities
-# and errors that GitHub, security researchers and the community discover,
-# even when developers aren't actively maintaining the repository.
+# code change pushed to it. GitHub gives the reason for scanning on a
+# schedule: it informs you about the latest vulnerabilities and errors that
+# GitHub, security researchers and the community discover, even when
+# developers aren't actively maintaining the repository.
 
 on:
-  push:
-    paths-ignore:
-      - '**/*.md'
-      - 'LICENSE'
-      - '.gitignore'
-  pull_request:
+  workflow_call:
   schedule:
     # Wednesday 03:47 UTC. Off the hour and off Monday deliberately: the top
     # of the hour is when every cron on GitHub fires at once and jobs queue.
@@ -30,7 +25,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: codeql-${{ github.ref }}
+  group: ${{ github.workflow == 'codeql' && format('codeql-{0}', github.ref) || format('codeql-called-{0}', github.run_id) }}
   cancel-in-progress: true
 
 jobs:

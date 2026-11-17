@@ -1,0 +1,146 @@
+name: ci gate
+
+# One workflow calls every gate so one check, `aggregate`, can be required:
+# a gate with its own path filter reports nothing on a commit it skips.
+# classify skips every leg for a Markdown/LICENSE/.gitignore-only change and
+# actionlint unless a workflow or dependabot.yml changed; any event or
+# history it cannot read runs every leg.
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer pull request run replaces the older; each pushed ref and SHA
+  # pair keeps its own run.
+  group: ci-gate-${{ github.event.pull_request.number || (github.event_name == 'push' && format('{0}-{1}', github.ref, github.sha)) || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      workflows: ${{ steps.classify.outputs.workflows }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify the changed paths
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          full_run() {
+            echo "$1: running every leg"
+            echo 'docs_only=false' >> "$GITHUB_OUTPUT"
+            echo 'workflows=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          if [ "$EVENT" = pull_request ] && [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
+            range="$BASE_SHA...$HEAD_SHA"
+          elif [ "$EVENT" = push ] && [[ "$REF" == refs/heads/* ]]; then
+            git rev-parse --verify --quiet "$BEFORE^{commit}" > /dev/null \
+              || full_run "before $BEFORE is not in the fetched history"
+            range="$BEFORE..$SHA"
+          else
+            full_run "$EVENT on $REF has no diff to classify"
+          fi
+          list="$RUNNER_TEMP/changed-paths"
+          git diff --name-only --no-renames -z "$range" > "$list" \
+            || full_run "git diff $range failed"
+          mapfile -d '' -t paths < "$list"
+          [ "${#paths[@]}" -gt 0 ] || full_run "git diff $range listed no paths"
+          docs_only=true
+          workflows=false
+          for path in "${paths[@]}"; do
+            echo "changed: $path"
+            case "$path" in *.md|LICENSE|.gitignore) ;; *) docs_only=false ;; esac
+            case "$path" in .github/workflows/*|.github/dependabot.yml) workflows=true ;; esac
+          done
+          echo "docs_only=$docs_only workflows=$workflows"
+          { echo "docs_only=$docs_only"; echo "workflows=$workflows"; } >> "$GITHUB_OUTPUT"
+
+  lint:
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    uses: ./.github/workflows/lint.yml
+
+  types:
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    uses: ./.github/workflows/types.yml
+
+  tests:
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    uses: ./.github/workflows/tests.yml
+
+  audit:
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    uses: ./.github/workflows/audit.yml
+
+  codeql:
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    uses: ./.github/workflows/codeql.yml
+
+  actionlint:
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true' && needs.classify.outputs.workflows == 'true'
+    uses: ./.github/workflows/actionlint.yml
+
+  aggregate:
+    # always(): a cancelled or failed leg must turn this red, not skip it,
+    # since a skipped required check counts as passing.
+    if: always()
+    needs: [classify, lint, types, tests, audit, codeql, actionlint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Fold every leg's result
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -e 'has("classify")' <<< "$NEEDS" > /dev/null \
+            || { echo "needs carries no classify entry" >&2; exit 1; }
+          docs_only="$(jq -r '.classify.outputs.docs_only // ""' <<< "$NEEDS")"
+          workflows="$(jq -r '.classify.outputs.workflows // ""' <<< "$NEEDS")"
+          legs="$(jq -r 'to_entries[] | "\(.key)\t\(.value.result // "")"' <<< "$NEEDS")"
+          failed=0
+          printf '| leg | result | verdict |\n| --- | --- | --- |\n' >> "$GITHUB_STEP_SUMMARY"
+          while IFS=$'\t' read -r leg result; do
+            verdict=fail
+            if [ "$result" = success ]; then
+              verdict=pass
+            elif [ "$leg" != classify ] && [ "$result" = skipped ] \
+              && { [ "$docs_only" = true ] || { [ "$leg" = actionlint ] && [ "$workflows" = false ]; }; }; then
+              verdict=pass
+            fi
+            [ "$verdict" = pass ] || failed=$((failed + 1))
+            echo "$leg: ${result:-<empty>} -> $verdict"
+            echo "| $leg | ${result:-<empty>} | $verdict |" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$legs"
+          if [ "$failed" -gt 0 ]; then
+            echo "$failed leg(s) did not pass" >&2
+            exit 1
+          fi

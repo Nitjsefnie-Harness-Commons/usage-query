@@ -15,13 +15,14 @@ name: audit
 # linter drags in a dependency tree of its own, and that is where an
 # advisory lands.
 #
-# WHY THE CRON IS THE IMPORTANT TRIGGER. Every other gate in this repo
-# answers "did this commit break something", so push is the natural trigger.
+# WHY THE CRON IS THE IMPORTANT TRIGGER. Every other gate answers
+# "did this commit break something", so push is the natural trigger.
 # This one answers "is a version we froze months ago still safe", and that
 # answer changes when a stranger publishes an advisory, with no commit here
 # to hang it on. A push-only audit would report clean forever on an
-# abandoned branch. The push trigger is the lesser half: it catches a bad
-# pin at the moment it is introduced, while the diff is on screen.
+# abandoned branch. The call from ci-gate.yml is the lesser half: it
+# catches a bad pin at the moment it is introduced, while the diff is on
+# screen.
 #
 # This gate FAILS the build rather than filing an advisory, which is the
 # same stance as lint and types: a red gate that a human must look at beats
@@ -30,12 +31,7 @@ name: audit
 # saying why and what would clear it — never silence the whole gate.
 
 on:
-  push:
-    paths-ignore:
-      - '**/*.md'
-      - 'LICENSE'
-      - '.gitignore'
-  pull_request:
+  workflow_call:
   schedule:
     - cron: '12 4 * * *'
   workflow_dispatch:
@@ -44,7 +40,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: audit-${{ github.ref }}
+  group: ${{ github.workflow == 'audit' && format('audit-{0}', github.ref) || format('audit-called-{0}', github.run_id) }}
   cancel-in-progress: true
 
 jobs:
