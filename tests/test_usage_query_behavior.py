@@ -938,6 +938,33 @@ def test_zai_billing_note_names_the_promotion_while_in_force(tmp):
             "(in 3h00m).")
 
 
+def test_zai_promotion_end_follows_the_peak_zone(tmp):
+    """The promotion clause names its end in ZAI_TZ and labels it like the
+    rest of the line: with the zone moved to UTC+5:30, the end instant
+    2026-10-08 00:00 UTC+8 reads 2026-10-07 21:30 UTC+5:30, so one billing
+    line carries one zone label. The campaign is moved before the moment so
+    its clause, which keeps its own UTC+8 wording, stays off the line."""
+    del tmp
+    mod = _load()
+    # Monday 2026-09-28 07:00 UTC is 12:30 at +5:30, inside the promotion;
+    # the first peak past it is Thursday 2026-10-08 14:00 at +5:30.
+    moment = datetime(2026, 9, 28, 7, 0, tzinfo=timezone.utc)
+    with mock.patch.object(mod, "ZAI_TZ",
+                           timezone(timedelta(hours=5, minutes=30))), \
+            mock.patch.object(mod, "ZAI_CAMPAIGN_LAST_NIGHT",
+                              date(2026, 9, 3)):
+        status = mod._zai_billing_status(moment)
+        note = mod._zai_billing_note(status)
+    assert status["promotion"]["active"] is True
+    assert note == (
+        "z.ai billing: off-peak 0.5x now; "
+        "peak Mon-Fri 14:00-18:00 UTC+5:30; "
+        "off-peak Mon-Fri 00:00-14:00 and 18:00-24:00 UTC+5:30; "
+        "all day Sat-Sun; "
+        "next peak starts 2026-10-08 14:00 UTC+5:30 (in 10d1h); "
+        "all-day off-peak promotion until 2026-10-07 21:30 UTC+5:30."), note
+
+
 def test_zai_billing_line_carries_the_campaign_next_window_form_in_full(tmp):
     """Inside the campaign period between windows, outside the promotion:
     the billing line ends with the next-window clause, spelled out whole."""
