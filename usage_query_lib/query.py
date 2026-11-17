@@ -1467,6 +1467,29 @@ def _zai_campaign_label(campaign):
     return ""
 
 
+def _zai_day_runs(days):
+    """Weekday numbers (datetime.weekday(), Mon=0) as 'Mon-Wed,Fri': each
+    maximal run of consecutive days reads First-Last, a single day alone."""
+    names = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    runs = []
+    for day in sorted(set(days)):
+        if runs and runs[-1][1] == day - 1:
+            runs[-1][1] = day
+        else:
+            runs.append([day, day])
+    return ",".join(names[first] if first == last
+                    else f"{names[first]}-{names[last]}"
+                    for first, last in runs)
+
+
+def _zai_zone_label():
+    """ZAI_TZ as 'UTC+8', or 'UTC+5:30' when its offset has minutes."""
+    offset = int(ZAI_TZ.utcoffset(None).total_seconds()) // 60
+    hours, minutes = divmod(abs(offset), 60)
+    sign = "-" if offset < 0 else "+"
+    return f"UTC{sign}{hours}" + (f":{minutes:02d}" if minutes else "")
+
+
 def _zai_billing_status(now=None):
     """Current z.ai billing state, published hours, next transition, and the
     promotion and campaign entries.
@@ -1507,16 +1530,19 @@ def _zai_billing_status(now=None):
             while transition.weekday() not in ZAI_PEAK_DAYS:
                 transition += timedelta(days=1)
         next_state = "peak"
-    # The printed hours, derived here (not at import) so they cannot drift
-    # from the minute constants the state above was decided from.
+    # The printed schedule, derived here (not at import) so it cannot drift
+    # from the constants the state above was decided from.
     start = f"{ZAI_PEAK_START_MIN // 60:02d}:{ZAI_PEAK_START_MIN % 60:02d}"
     end = f"{ZAI_PEAK_END_MIN // 60:02d}:{ZAI_PEAK_END_MIN % 60:02d}"
+    days = _zai_day_runs(ZAI_PEAK_DAYS)
+    off_days = _zai_day_runs(set(range(7)) - set(ZAI_PEAK_DAYS))
+    zone = _zai_zone_label()
     return {
         "state": "peak" if peak else "off-peak",
         "multiplier": 1.0 if peak else 0.5,
-        "peak_hours": f"Mon-Fri {start}-{end} UTC+8",
-        "off_peak_hours": (f"Mon-Fri 00:00-{start} and {end}-24:00 UTC+8;"
-                           " all day Sat-Sun"),
+        "peak_hours": f"{days} {start}-{end} {zone}",
+        "off_peak_hours": (f"{days} 00:00-{start} and {end}-24:00 {zone}"
+                           + (f"; all day {off_days}" if off_days else "")),
         "next_transition": {
             "state": next_state,
             "at": transition.isoformat(timespec="seconds"),
