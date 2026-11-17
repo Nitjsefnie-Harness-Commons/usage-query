@@ -102,15 +102,12 @@ def _codex_payload(now=None):
     now = int(time.time() if now is None else now)
     default = {
         "limitId": "codex", "limitName": None, "planType": "pro",
-        "primary": {"usedPercent": 20, "windowDurationMins": 300,
-                    "resetsAt": now + 4 * 3600},
-        "secondary": {"usedPercent": 27, "windowDurationMins": 10080,
-                      "resetsAt": now + 6 * 86400},
+        "primary": {"usedPercent": 20, "windowDurationMins": 300, "resetsAt": now + 4 * 3600},
+        "secondary": {"usedPercent": 27, "windowDurationMins": 10080, "resetsAt": now + 6 * 86400},
     }
     spark = {
         "limitId": "codex_bengalfox", "limitName": "GPT-Codex-Spark",
-        "primary": {"usedPercent": 3, "windowDurationMins": 10080,
-                    "resetsAt": now + 6 * 86400},
+        "primary": {"usedPercent": 3, "windowDurationMins": 10080, "resetsAt": now + 6 * 86400},
         "secondary": None,
     }
     return {
@@ -127,28 +124,18 @@ def _wham_payload(now=None):
     return {
         "plan_type": "pro",
         "rate_limit": {
-            "allowed": True,
-            "limit_reached": False,
-            "primary_window": {"used_percent": 95,
-                               "limit_window_seconds": 604800,
-                               "reset_after_seconds": 401797,
-                               "reset_at": now + 401797},
+            "allowed": True, "limit_reached": False,
+            "primary_window": {"used_percent": 95, "limit_window_seconds": 604800, "reset_after_seconds": 401797, "reset_at": now + 401797},
             "secondary_window": None,
         },
         "additional_rate_limits": [{
-            "limit_name": "GPT-Codex-Spark",
-            "metered_feature": "codex_bengalfox",
+            "limit_name": "GPT-Codex-Spark", "metered_feature": "codex_bengalfox",
             "rate_limit": {
-                "primary_window": {"used_percent": 0,
-                                   "limit_window_seconds": 18000,
-                                   "reset_at": now + 18000},
-                "secondary_window": {"used_percent": 4,
-                                     "limit_window_seconds": 604800,
-                                     "reset_at": now + 604800},
+                "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": now + 18000},
+                "secondary_window": {"used_percent": 4, "limit_window_seconds": 604800, "reset_at": now + 604800},
             },
         }],
-        "rate_limit_reset_credits": {"available_count": 1,
-                                     "applicable_available_count": 1},
+        "rate_limit_reset_credits": {"available_count": 1, "applicable_available_count": 1},
     }
 
 
@@ -165,16 +152,12 @@ def _fake_jwt(exp):
 def _write_codex_auth(path, exp_delta, **overrides):
     """A ~/.codex/auth.json in the shape codex writes (read off a live file)."""
     auth = {
-        "auth_mode": "chatgpt",
-        "OPENAI_API_KEY": None,
+        "auth_mode": "chatgpt", "OPENAI_API_KEY": None,
         "tokens": {
-            "id_token": _fake_jwt(time.time() + 86400),
-            "access_token": _fake_jwt(time.time() + exp_delta),
-            "refresh_token": "refresh-token-old",
-            "account_id": "account-123",
+            "id_token": _fake_jwt(time.time() + 86400), "access_token": _fake_jwt(time.time() + exp_delta),
+            "refresh_token": "refresh-token-old", "account_id": "account-123",
         },
-        "last_refresh": "2026-01-01T00:00:00.000000Z",
-        "keep_me": "untouched",
+        "last_refresh": "2026-01-01T00:00:00.000000Z", "keep_me": "untouched",
     }
     auth.update(overrides)
     Path(path).write_text(json.dumps(auth, indent=2), encoding="utf-8")
@@ -224,9 +207,7 @@ def test_codex_maps_the_backend_payload_into_the_rpc_shape(tmp):
     assert got["rateLimits"]["limitId"] == "codex"
     assert got["rateLimits"]["limitName"] is None
     assert got["rateLimits"]["planType"] == "pro"
-    assert got["rateLimits"]["primary"] == {"usedPercent": 95.0,
-                                            "windowDurationMins": 10080,
-                                            "resetsAt": now + 401797}
+    assert got["rateLimits"]["primary"] == {"usedPercent": 95.0, "windowDurationMins": 10080, "resetsAt": now + 401797}
     assert got["rateLimits"]["secondary"] is None
     spark = got["rateLimitsByLimitId"]["codex_bengalfox"]
     assert spark["limitName"] == "GPT-Codex-Spark"
@@ -238,8 +219,7 @@ def test_codex_maps_the_backend_payload_into_the_rpc_shape(tmp):
     assert out["weekly"]["pct"] == 95
     assert out["_plan_type"] == "pro"
     assert out["_reset_credits_available"] == 1
-    assert [row["label"] for row in out["_scoped"]] == [
-        "5h:GPT-Codex-Spark", "7d:GPT-Codex-Spark"]
+    assert [row["label"] for row in out["_scoped"]] == ["5h:GPT-Codex-Spark", "7d:GPT-Codex-Spark"]
 
 
 def test_codex_valid_token_is_used_without_a_refresh(tmp):
@@ -426,14 +406,11 @@ def test_codex_serves_a_cached_reading_only_to_the_account_it_was_fetched_for(tm
 def test_codex_usage_url_follows_the_configured_base(tmp):
     del tmp
     mod = _util.load(USAGE_QUERY, "usage_query_codex_url")
-    assert mod._codex_usage_url() == (
-        "https://chatgpt.com/backend-api/wham/usage")
+    assert mod._codex_usage_url() == "https://chatgpt.com/backend-api/wham/usage"
     mod.CODEX_BASE_URL = "https://chatgpt.com/"
-    assert mod._codex_usage_url() == (
-        "https://chatgpt.com/backend-api/wham/usage")
+    assert mod._codex_usage_url() == "https://chatgpt.com/backend-api/wham/usage"
     mod.CODEX_BASE_URL = "https://codex.example.test"
-    assert mod._codex_usage_url() == (
-        "https://codex.example.test/api/codex/usage")
+    assert mod._codex_usage_url() == "https://codex.example.test/api/codex/usage"
 
 
 def test_codex_normalizes_default_and_model_scoped_windows(tmp):

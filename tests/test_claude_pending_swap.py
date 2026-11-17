@@ -213,5 +213,30 @@ def test_without_accounts_the_cache_follows_the_logged_in_account(tmp):
         assert http.calls == [("usage", "Bearer live-token"), ("usage", "Bearer other-token"), ("usage", "Bearer refreshed")]
 
 
+def test_a_switch_during_the_token_read_files_no_reading_under_the_wrong_account(tmp):
+    with setup(tmp, {"live-token": 10, "beta-token": 40, "other-token": 77}) as (mod, accounts, http):
+        install(accounts)
+        real = mod._claude_access_token
+
+        def switch(name, token):
+            credentials(Path(mod.CLAUDE_CRED), token)
+            (accounts / "live").write_text(name + "\n", encoding="utf-8")
+        with mock.patch.object(mod, "_claude_access_token", side_effect=lambda *a: switch("beta", "beta-token") or real(*a)):
+            assert mod.query_claude(errors={})["five_hour"]["pct"] == 40  # the switcher lands after the identity read
+        switch("alpha", "live-token")
+        assert mod.query_claude(errors={})["five_hour"]["pct"] == 10
+        (Path(tmp) / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "u-2"}}), encoding="utf-8")
+        switch("alpha", "other-token")  # a /login past the switcher keeps the marker
+        assert mod.query_claude(errors={})["five_hour"]["pct"] == 77
+        record = json.loads(Path(mod.CACHE).read_text(encoding="utf-8"))
+        Path(mod.CACHE).write_text(json.dumps({**record, "fetched_at": 0, "backoff": {"streak": 1, "until": time.time() + 60}}), encoding="utf-8")
+        before = Path(mod.CACHE).read_bytes()
+        with mock.patch.object(mod, "_claude_access_token", side_effect=lambda *a: switch("beta", "beta-token") or real(*a)), \
+                mock.patch.object(mod, "_claude_header_probe", return_value={"seven_day": {"utilization": 33.0, "resets_at": None}}):
+            got = mod.query_claude(errors={})  # inside a 429 backoff the probe reads the windows
+        assert got["weekly"]["pct"] == 33.0 and "_stale_error" not in got and Path(mod.CACHE).read_bytes() == before
+        assert http.calls == [("usage", "Bearer beta-token"), ("usage", "Bearer live-token"), ("usage", "Bearer other-token")]
+
+
 if __name__ == "__main__":
     sys.exit(_util.runner(_util.collect(globals()), "claudependingswap_"))
