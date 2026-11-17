@@ -2,15 +2,19 @@ name: codeql
 
 # Static security analysis (advanced setup, not the repo-settings "default
 # setup" — the config lives here so it is reviewable in a diff like every
-# other gate). Free on this public repository; findings land in the
-# Security tab rather than turning the build red, so a new query shipping
-# upstream cannot block an unrelated push.
+# other gate). Free on this public repository; findings are uploaded to the
+# Security tab and this job is not configured to fail on them. On a pull
+# request, GitHub's separate "Code scanning results" check does fail by
+# default on a finding of error, critical or high severity.
 #
 # The weekly cron is not redundant with push: a push analyses only when one
 # happens, and `paths-ignore` skips pushes that touch nothing but Markdown,
 # LICENSE or .gitignore. The scheduled run analyses the last commit on the
 # default branch, so that branch is re-analysed even after weeks with no
-# qualifying push.
+# push to it that `paths-ignore` lets through. GitHub gives the reason for
+# scanning on a schedule: it informs you about the latest vulnerabilities
+# and errors that GitHub, security researchers and the community discover,
+# even when developers aren't actively maintaining the repository.
 
 on:
   push:
