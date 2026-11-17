@@ -27,6 +27,7 @@
 # ─── root ───
 !/.gitignore
 !/.pylintrc
+!/CONTRIBUTING.md
 !/LICENSE
 !/README.md
 !/pyproject.toml
