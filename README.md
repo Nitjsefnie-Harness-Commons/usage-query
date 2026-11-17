@@ -257,7 +257,12 @@ never lower it to turn a build green.
 | `lint` / `types` | pylint + pycodestyle, and pyright. |
 | `codeql` | Security analysis (Python only — no JS here). Findings go to the Security tab, never the build. Weekly cron on top of push, because a query published today would otherwise only ever run against files touched after it shipped. |
 | `audit` | `pip-audit` over both requirements files, resolving the full transitive tree. **Daily** cron: this answers "is a version we froze months ago still safe", and that answer changes with no commit here to hang it on. |
-| `actionlint` | `actionlint` + `zizmor` over the workflow YAML. A broken workflow does not go red, it silently stops running. |
+| `actionlint` | `actionlint` + `zizmor` over the workflow YAML. A broken workflow does not go red, it silently stops running. The actionlint build is Nitjsefnie-OSC/actionlint's, which accepts the `queue: max` key `claim` sets. |
+| `claim` | `Nitjsefnie-Actions/claim`: `/claim`, `/unclaim` and `/release` comments assign or unassign the commenter on an issue, with per-role claim caps and a 7-day claim expiry. |
+| `pr gate` | `Nitjsefnie-Actions/pr-gate`: checks a non-draft pull request's description against `.github/PULL_REQUEST_TEMPLATE.md` and its assigned issues, and its commits' attribution and Conventional Commits subjects. |
+| `pin test screen` | `Nitjsefnie-Actions/pin-guard`: lists a pull request's test lines that may assert on a pinned dependency version, as review comments. Not a gate. |
+| `comment share` | `Nitjsefnie-Actions/comment-ratchet`: gates each tracked source file's comment share against a 15% target, with per-file records in `.github/comment-share.json` that only tighten. A push to `main` commits the tightened records itself. |
+| `size baseline` | `Nitjsefnie-Actions/size-ratchet`: gates each file's line count against its type's ceiling or its record in `.github/size-baseline.json`, and budgets the `tests/` tree's total; only a `feat` commit may raise that budget. A push to `main` commits the tightened records itself. |
 | `tag` | Watches `usage_query_lib/__init__.py`. When `__version__` changes on `main`, it waits for every other check on that commit and then pushes `v<version>`. |
 | `release` | Fires on that tag: runs every suite, builds the wheel, and publishes `SHA256SUMS` beside it. |
 
