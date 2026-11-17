@@ -1480,11 +1480,11 @@ def _zai_billing_status(now=None):
     and they carry the provenance needed to re-verify it when the policy
     moves. `now` is a UTC datetime by convention; the real clock is the default.
     End-exclusive means the end minute itself is off-peak and the next peak
-    begins on the next weekday. The all-day off-peak promotion suppresses peak entirely
-    while it runs - including in the next-transition scan, which must never
-    report a would-be peak the promotion bills at 0.5x - and reports itself in
-    the `promotion` entry (present year-round, `active` or not) so the notes
-    can say when it is in force and when it ends.
+    begins on the next weekday. The all-day off-peak promotion suppresses peak
+    entirely while it runs - including in the next-transition scan, which must
+    never report a would-be peak the promotion bills at 0.5x - and reports
+    itself in the `promotion` entry (present year-round, `active` or not) so the
+    notes can say when it is in force and when it ends.
     """
     moment = (now or datetime.now(timezone.utc)).astimezone(ZAI_TZ)
     promo = ZAI_OFFPEAK_PROMO_START <= moment < ZAI_OFFPEAK_PROMO_END
