@@ -255,7 +255,7 @@ never lower it to turn a build green.
 | --- | --- |
 | `tests` | `run_tests.py` across 3 OSes × 5 Pythons, plus a single-run coverage job — the matrix would otherwise report the same coverage number fifteen times. |
 | `lint` / `types` | pylint + pycodestyle, and pyright. |
-| `codeql` | Security analysis (Python only — no JS here). Findings go to the Security tab, never the build. Weekly cron on top of push, so the default branch is re-analysed even after weeks with no qualifying push. |
+| `codeql` | Security analysis (Python only — no JS here). Findings go to the Security tab and the workflow is not set to fail on them; on a pull request GitHub's separate *Code scanning results* check does fail by default on an error, critical or high severity finding. Weekly cron on top of push, so the default branch is re-analysed and newly discovered vulnerabilities are reported even after weeks with no push that touches more than Markdown, `LICENSE` or `.gitignore`. |
 | `audit` | `pip-audit` over both requirements files, resolving the full transitive tree. **Daily** cron: this answers "is a version we froze months ago still safe", and that answer changes with no commit here to hang it on. |
 | `actionlint` | `actionlint` + `zizmor` over the workflow YAML. A broken workflow does not go red, it silently stops running. The actionlint build is Nitjsefnie-OSC/actionlint's, which accepts the `queue: max` key `claim` sets. |
 | `claim` | `Nitjsefnie-Actions/claim`: `/claim`, `/unclaim` and `/release` comments assign or unassign the commenter on an issue, with per-role claim caps and a 7-day claim expiry. |
