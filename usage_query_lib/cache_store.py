@@ -24,7 +24,7 @@ def _trusted(folder) -> bool:
 def read(path, ttl, account):
     """(record, fresh data, (stale data, age s)); a file not this user's own, or another account's, is ({}, None, None)."""
     try:
-        if path is None or not _trusted(os.path.dirname(path) or "."):
+        if not _trusted(os.path.dirname(path) or "."):
             return {}, None, None
         with os.fdopen(os.open(path, os.O_RDONLY | _OPEN_FLAGS), encoding="utf-8") as stream:
             info = os.fstat(stream.fileno())
@@ -44,9 +44,7 @@ def read(path, ttl, account):
 
 
 def write(path, record, account) -> None:
-    """Replace `path` (None: no cache) through a fresh 0600 temp file; a failure never fails a reading."""
-    if path is None:
-        return
+    """Replace `path` through a fresh 0600 temp file; a failure never fails a reading."""
     folder = os.path.dirname(path) or "."
     try:
         os.makedirs(folder, mode=0o700, exist_ok=True)
