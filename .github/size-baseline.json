@@ -1,0 +1,13 @@
+{
+  "trees": {
+    "tests/": 5255
+  },
+  "schema_version": 1,
+  "baseline": {
+    "tests/test_claude_accounts.py": 511,
+    "tests/test_refresh_coordination.py": 817,
+    "tests/test_usage_query_behavior.py": 873,
+    "tests/test_usage_query_oauth.py": 681,
+    "usage_query_lib/query.py": 2593
+  }
+}
