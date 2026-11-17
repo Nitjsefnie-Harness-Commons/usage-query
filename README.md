@@ -28,7 +28,8 @@ exist, or no z.ai key is found in any of the places listed below. In a default
 sweep an absent provider goes under `unconfigured`, not `errors`, prints
 nothing in the table, and does not by itself make the command exit nonzero;
 asked for by name with `--claude`, `--kimi`, `--codex` or `--zai`, it is
-reported under `errors` like any other failure. The command exits 1 whenever
+reported under `errors` like any other failure. The command exits 2 on an
+unknown or conflicting flag (argparse's usage error), otherwise 1 whenever
 `errors` is non-empty, else 0.
 
 A reading under `usage` served from an old cache carries `_stale_age`, the
@@ -92,8 +93,9 @@ that lock it re-reads the credentials and uses a pair Claude Code rotated
 meanwhile instead of refreshing. Every write to `.credentials.json` takes Claude
 Code's credential write lock (`~/.claude/.storage-write.lock`, waiting up to 30
 seconds and reclaimed after 15 seconds), re-reads the file under it, and
-replaces only its `claudeAiOauth` entry, so keys another writer saved meanwhile (MCP OAuth tokens, for one) are
-kept. Like Claude Code's own save, it writes only while the `claudeAiOauth`
+replaces only its `claudeAiOauth` entry, so keys another writer saved
+meanwhile (MCP OAuth tokens, for one) are kept. Like Claude Code's own save,
+it writes only while the `claudeAiOauth`
 entry exists and its refresh token is empty or the one this refresh sent. A
 newer pair (a `/login` to another account, say), a removed entry or a removed
 file (a `/logout`) is left as it is, and the rotated pair is saved to the
@@ -143,7 +145,7 @@ since the last successful usage read, doubling with each further one up to
 3600 seconds, or the response's `Retry-After` seconds when longer (still capped
 at 3600). Until it expires this command does not ask the usage endpoint for
 that account. Instead, right after the 429 and on every run during the backoff
-whose cache is older than its five-minute TTL, it sends
+whose cache holds no reading or one older than its five-minute TTL, it sends
 `POST https://api.anthropic.com/v1/messages` with the account's OAuth access
 token, model `claude-haiku-5-5` (`CLAUDE_PROBE_MODEL`) and `max_tokens` 1, and
 takes the 5h and 7d windows from the response's

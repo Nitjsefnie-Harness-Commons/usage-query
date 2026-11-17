@@ -37,7 +37,7 @@
 !/run_tests.py
 !/setup.cfg
 
-# ─── .github/workflows ───
+# ─── .github ───
 !/.github/
 !/.github/workflows/
 !/.github/ISSUE_TEMPLATE/
