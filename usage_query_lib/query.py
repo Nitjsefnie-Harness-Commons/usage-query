@@ -141,7 +141,7 @@ import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-
+from . import zai_schedule
 
 __version__ = "1.10.6"
 
@@ -1467,29 +1467,6 @@ def _zai_campaign_label(campaign):
     return ""
 
 
-def _zai_day_runs(days):
-    """Weekday numbers (datetime.weekday(), Mon=0) as 'Mon-Wed,Fri': each
-    maximal run of consecutive days reads First-Last, a single day alone."""
-    names = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-    runs = []
-    for day in sorted(set(days)):
-        if runs and runs[-1][1] == day - 1:
-            runs[-1][1] = day
-        else:
-            runs.append([day, day])
-    return ",".join(names[first] if first == last
-                    else f"{names[first]}-{names[last]}"
-                    for first, last in runs)
-
-
-def _zai_zone_label():
-    """ZAI_TZ as 'UTC+8', or 'UTC+5:30' when its offset has minutes."""
-    offset = int(ZAI_TZ.utcoffset(None).total_seconds()) // 60
-    hours, minutes = divmod(abs(offset), 60)
-    sign = "-" if offset < 0 else "+"
-    return f"UTC{sign}{hours}" + (f":{minutes:02d}" if minutes else "")
-
-
 def _zai_billing_status(now=None):
     """Current z.ai billing state, published hours, next transition, and the
     promotion and campaign entries.
@@ -1530,19 +1507,11 @@ def _zai_billing_status(now=None):
             while transition.weekday() not in ZAI_PEAK_DAYS:
                 transition += timedelta(days=1)
         next_state = "peak"
-    # The printed schedule, derived here (not at import) so it cannot drift
-    # from the constants the state above was decided from.
-    start = f"{ZAI_PEAK_START_MIN // 60:02d}:{ZAI_PEAK_START_MIN % 60:02d}"
-    end = f"{ZAI_PEAK_END_MIN // 60:02d}:{ZAI_PEAK_END_MIN % 60:02d}"
-    days = _zai_day_runs(ZAI_PEAK_DAYS)
-    off_days = _zai_day_runs(set(range(7)) - set(ZAI_PEAK_DAYS))
-    zone = _zai_zone_label()
     return {
         "state": "peak" if peak else "off-peak",
         "multiplier": 1.0 if peak else 0.5,
-        "peak_hours": f"{days} {start}-{end} {zone}",
-        "off_peak_hours": (f"{days} 00:00-{start} and {end}-24:00 {zone}"
-                           + (f"; all day {off_days}" if off_days else "")),
+        # Per call, not at import: the text follows the constants decided on.
+        **zai_schedule.hours(ZAI_PEAK_DAYS, ZAI_PEAK_START_MIN, ZAI_PEAK_END_MIN, ZAI_TZ),
         "next_transition": {
             "state": next_state,
             "at": transition.isoformat(timespec="seconds"),
@@ -1578,17 +1547,15 @@ def _zai_billing_note(status):
         f"z.ai billing: {status['state']} {status['multiplier']:g}x now; "
         f"peak {status['peak_hours']}; off-peak {status['off_peak_hours']}; "
         f"next {transition['state']} starts "
-        f"{at.strftime('%Y-%m-%d %H:%M')} {_zai_zone_label()} "
-        f"(in {transition['in']})"
+        f"{zai_schedule.zone_time(at, ZAI_TZ)} (in {transition['in']})"
     )
     # A status dict from before the promotions existed (or a caller-built
     # one) simply carries no clause: .get, not [], keeps the old shape
     # renderable.
     promotion = status.get("promotion") or {}
     if promotion.get("active"):
-        promo_end = ZAI_OFFPEAK_PROMO_END.astimezone(ZAI_TZ)
         note += (f"; {ZAI_OFFPEAK_PROMO_NAME} until "
-                 f"{promo_end.strftime('%Y-%m-%d %H:%M')} {_zai_zone_label()}")
+                 f"{zai_schedule.zone_time(ZAI_OFFPEAK_PROMO_END, ZAI_TZ)}")
     clause = _zai_campaign_clause(status.get("campaign") or {})
     if clause:
         note += f"; {clause}"

@@ -8,8 +8,10 @@ test failure.
 """
 import importlib.util
 import os
+import sys
 import tempfile
 import traceback
+import types
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +20,8 @@ SCRIPTS = str(_PROJECT_ROOT / "usage_query_lib")
 """The package directory. The suites load the tool by path rather than by
 import so that a broken `__init__` cannot mask a module defect as an
 ImportError."""
+_PACKAGE = sys.modules.setdefault("usage_query_lib_by_path", types.ModuleType("usage_query_lib_by_path"))
+_PACKAGE.__path__ = [SCRIPTS]  # a loaded module's relative imports: this checkout's
 
 
 def script(name):
@@ -28,7 +32,7 @@ def load(path, name=None):
     """Import the usage-query module by path without running its CLI block."""
     name = name or ("mod_" + os.path.splitext(os.path.basename(path))[0]
                     .replace("-", "_"))
-    spec = importlib.util.spec_from_file_location(name, path)
+    spec = importlib.util.spec_from_file_location(f"{_PACKAGE.__name__}.{name}", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
