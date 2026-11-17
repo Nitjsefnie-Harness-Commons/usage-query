@@ -295,6 +295,7 @@ never lower it to turn a build green.
 
 | Workflow | What it does |
 | --- | --- |
+| `ci gate` | Runs on every pull request and push, classifies the changed paths, and calls `lint`, `types`, `tests`, `audit`, `codeql` and `actionlint` as reusable workflows: a documentation-only change skips them all, and `actionlint` runs only when a workflow file or `.github/dependabot.yml` changes. Its `aggregate` job fails when any leg fails, is cancelled, or is skipped without that classification. |
 | `tests` | `run_tests.py` across 3 OSes × 5 Pythons, plus a single-run coverage job — the matrix would otherwise report the same coverage number fifteen times. |
 | `lint` / `types` | pylint + pycodestyle, and pyright. |
 | `codeql` | Security analysis (Python only — no JS here). Findings go to the Security tab and the workflow is not set to fail on them; on a pull request GitHub's separate *Code scanning results* check does fail by default on an error, critical or high severity finding. Weekly cron on top of push: it re-analyses the default branch even after weeks with no push that touches more than Markdown, `LICENSE` or `.gitignore`, and GitHub's docs say scanning on a schedule informs you about the latest vulnerabilities and errors that GitHub, security researchers and the community discover, even when developers aren't actively maintaining the repository. |
