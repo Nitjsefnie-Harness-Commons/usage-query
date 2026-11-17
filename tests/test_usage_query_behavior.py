@@ -375,23 +375,37 @@ def test_zai_printed_hours_follow_a_window_off_the_hour(tmp):
     """The printed peak and off-peak hours are built from the same
     ZAI_PEAK_START_MIN/ZAI_PEAK_END_MIN that decide the state: moved to
     14:30-18:45, the status entries and the billing line name 14:30 and 18:45,
-    not a fixed 14:00-18:00."""
+    not a fixed 14:00-18:00; moved to 09:05-09:50, both hours keep their
+    leading zero."""
     del tmp
     mod = _load()
-    # Monday 18:15, inside the moved window and past the old 18:00 end.
-    moment = datetime(2026, 1, 5, 18, 15, tzinfo=mod.ZAI_TZ)
-    with mock.patch.object(mod, "ZAI_PEAK_START_MIN", 14 * 60 + 30), \
-            mock.patch.object(mod, "ZAI_PEAK_END_MIN", 18 * 60 + 45):
-        status = mod._zai_billing_status(moment)
-        note = mod._zai_billing_note(status)
-    assert status["peak_hours"] == "Mon-Fri 14:30-18:45 UTC+8"
-    assert status["off_peak_hours"] == (
-        "Mon-Fri 00:00-14:30 and 18:45-24:00 UTC+8; all day Sat-Sun")
-    assert note == (
-        "z.ai billing: peak 1x now; peak Mon-Fri 14:30-18:45 UTC+8; "
-        "off-peak Mon-Fri 00:00-14:30 and 18:45-24:00 UTC+8; "
-        "all day Sat-Sun; next off-peak starts 2026-01-05 18:45 UTC+8 "
-        "(in 30m)."), note
+    cases = [
+        # Monday 18:15, inside the moved window and past the old 18:00 end.
+        (14 * 60 + 30, 18 * 60 + 45, 18, 15,
+         "Mon-Fri 14:30-18:45 UTC+8",
+         "Mon-Fri 00:00-14:30 and 18:45-24:00 UTC+8; all day Sat-Sun",
+         "z.ai billing: peak 1x now; peak Mon-Fri 14:30-18:45 UTC+8; "
+         "off-peak Mon-Fri 00:00-14:30 and 18:45-24:00 UTC+8; "
+         "all day Sat-Sun; next off-peak starts 2026-01-05 18:45 UTC+8 "
+         "(in 30m)."),
+        # Monday 09:30, inside a window whose hours are both single-digit.
+        (9 * 60 + 5, 9 * 60 + 50, 9, 30,
+         "Mon-Fri 09:05-09:50 UTC+8",
+         "Mon-Fri 00:00-09:05 and 09:50-24:00 UTC+8; all day Sat-Sun",
+         "z.ai billing: peak 1x now; peak Mon-Fri 09:05-09:50 UTC+8; "
+         "off-peak Mon-Fri 00:00-09:05 and 09:50-24:00 UTC+8; "
+         "all day Sat-Sun; next off-peak starts 2026-01-05 09:50 UTC+8 "
+         "(in 20m)."),
+    ]
+    for start, end, hour, minute, peak, off_peak, line in cases:
+        moment = datetime(2026, 1, 5, hour, minute, tzinfo=mod.ZAI_TZ)
+        with mock.patch.object(mod, "ZAI_PEAK_START_MIN", start), \
+                mock.patch.object(mod, "ZAI_PEAK_END_MIN", end):
+            status = mod._zai_billing_status(moment)
+            note = mod._zai_billing_note(status)
+        assert status["peak_hours"] == peak, status["peak_hours"]
+        assert status["off_peak_hours"] == off_peak, status["off_peak_hours"]
+        assert note == line, note
 
 
 def test_zai_human_and_json_output_include_billing_schedule(tmp):
