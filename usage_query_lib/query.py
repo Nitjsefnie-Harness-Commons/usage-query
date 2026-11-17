@@ -1476,7 +1476,7 @@ def _zai_billing_status(now=None):
     window constants at the top of this module encode IS the source of truth,
     and they carry the provenance needed to re-verify it when the policy
     moves. `now` is a UTC datetime by convention; the real clock is the default.
-    End-exclusive means the end minute itself is off-peak and the next peak
+    End-exclusive means the end minute is off-peak and the next peak
     begins on the next peak day. The all-day off-peak promotion suppresses peak
     entirely while it runs - including in the next-transition scan, which must
     never report a would-be peak the promotion bills at 0.5x - and reports
@@ -1510,7 +1510,6 @@ def _zai_billing_status(now=None):
     return {
         "state": "peak" if peak else "off-peak",
         "multiplier": 1.0 if peak else 0.5,
-        # Per call, not at import: the text follows the constants decided on.
         **zai_schedule.hours(ZAI_PEAK_DAYS, ZAI_PEAK_START_MIN, ZAI_PEAK_END_MIN, ZAI_TZ),
         "next_transition": {
             "state": next_state,
