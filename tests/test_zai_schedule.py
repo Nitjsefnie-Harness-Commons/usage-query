@@ -59,7 +59,6 @@ CASES = [
 def test_state_schedule_and_billing_line_follow_the_constants(tmp):
     mod = _util.load(_util.script("query.py"), "usage_query_zai_schedule")
     assert os.path.samefile(mod.zai_schedule.__file__, _util.script("zai_schedule.py")), "not this checkout's zai_schedule"
-    wrong = []
     for patches, moment, state, hours, at, within, promo in CASES:
         with mock.patch.multiple(mod, ZAI_CAMPAIGN_LAST_NIGHT=date(2026, 9, 3), **patches):
             status = mod._zai_billing_status(datetime.fromisoformat(moment))
@@ -67,9 +66,7 @@ def test_state_schedule_and_billing_line_follow_the_constants(tmp):
         peak, nxt = state == "peak", "off-peak" if state == "peak" else "peak"
         want = ({"state": state, "multiplier": 1.0 if peak else 0.5, "peak_hours": hours[0], "off_peak_hours": hours[1], "next_transition": {"state": nxt, "at": at, "in": within}},
                 f"z.ai billing: {state} {1 if peak else 0.5}x now; peak {hours[0]}; off-peak {hours[1]}; next {nxt} starts {at[:10]} {at[11:16]} {hours[0].rsplit(' ', 1)[1]} (in {within}){promo}.", True)
-        if ({key: status[key] for key in want[0]}, note, status["promotion"]["active"] is bool(promo)) != want:
-            wrong.append((moment, note))
-    assert not wrong, wrong
+        assert ({key: status[key] for key in want[0]}, note, status["promotion"]["active"] is bool(promo)) == want, (moment, note)
 
 
 def main():
