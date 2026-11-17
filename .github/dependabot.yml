@@ -1,14 +1,11 @@
 # Dependabot bumps the pins it manages here (the two ecosystems below);
-# not every dependency CI uses is pinned (see the workflows). Pins exist
-# so that a tool or library release does not turn CI red on an unchanged
-# commit. The cost is that pins go stale silently, and a stale pin is how
-# a fixed CVE stays exploitable. Dependabot pays that cost back — it is
-# the counterpart to audit.yml, which detects the problem but cannot
-# fix it.
+# not every dependency CI uses is pinned (see the workflows). Pins keep a
+# tool release from turning CI red on an unchanged commit, but go stale
+# silently, and a stale pin is how a fixed CVE stays exploitable.
+# Dependabot is the counterpart to audit.yml, which detects that but
+# cannot fix it.
 #
-# Dependabot PRs are built like any other PR: lint, types, tests, audit and
-# codeql run on every `pull_request`, and actionlint on those that touch
-# the workflows or this file, so a bump is built as soon as it is opened.
+# Dependabot PRs get the same `pull_request` checks as any other PR.
 #
 # There is no npm entry: this repo has no JavaScript at all.
 
@@ -47,13 +44,11 @@ updates:
       prefix: "ci"
     labels:
       - dependencies
-    # codeql.yml runs github/codeql-action/init and /analyze, and a job whose
-    # two steps sit on different release versions fails at `analyze`. Dependabot
-    # names each sub-action as its own dependency, so without a group it opens
-    # one pull request per sub-action, each of which is red alone. Version
-    # updates only: a group with no `applies-to` covers nothing else, and this
-    # repository has Dependabot security updates off. Turning them on needs a
-    # second group here with `applies-to: security-updates`.
+    # codeql.yml's init and analyze steps must sit on the same release or
+    # `analyze` fails, so one group keeps their bumps in one pull request.
+    # Version updates only: this repository has Dependabot security updates
+    # off, and turning them on needs a second group here with `applies-to:
+    # security-updates`.
     groups:
       codeql-action:
         patterns:
