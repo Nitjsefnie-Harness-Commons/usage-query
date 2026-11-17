@@ -937,10 +937,10 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
     now, account = time.time(), _claude_cache_account(cred_path)
 
     def access_token():
-        nonlocal cache_path
+        nonlocal cache_path, c, stale
         token = _claude_access_token(cred_path, errors)
         if _claude_cache_account(cred_path) != account:
-            cache_path = None
+            cache_path, c, stale = None, {}, None
         return token
     c, data, stale = cache_store.read(cache_path, cache_ttl, account)
     age, stale_error = 0, None
