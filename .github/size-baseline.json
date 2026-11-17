@@ -6,8 +6,8 @@
   "baseline": {
     "tests/test_claude_accounts.py": 511,
     "tests/test_refresh_coordination.py": 817,
-    "tests/test_usage_query_behavior.py": 873,
+    "tests/test_usage_query_behavior.py": 792,
     "tests/test_usage_query_oauth.py": 681,
-    "usage_query_lib/query.py": 2593
+    "usage_query_lib/query.py": 2590
   }
 }
