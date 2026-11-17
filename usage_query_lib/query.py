@@ -294,12 +294,14 @@ KIMI_EXPIRY_MARGIN = 120
 KIMI_WEEKLY_SECS = 7 * 86400
 # This user's own cache files (cache_store): a recent reading answers without
 # a network round-trip, and no other local user can supply or read one.
-CACHE_DIR = os.path.expanduser("~/.cache/usage-query")
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "usage-query")
 CACHE = os.path.join(CACHE_DIR, ".claude_usage_cache.json")
 KIMI_CACHE = os.path.join(CACHE_DIR, ".claude_kimi_usage_cache.json")
 CODEX_CACHE = os.path.join(CACHE_DIR, ".codex_usage_cache.json")
 ZAI_CACHE = os.path.join(CACHE_DIR, ".zai_usage_cache.json")
 ZAI_RESETS_CACHE = os.path.join(CACHE_DIR, ".zai_resets_cache.json")
+# Earlier versions kept them world-readable in the temp dir; main() removes the user's own.
+LEGACY_CACHES = tuple(os.path.basename(path) for path in (CACHE, KIMI_CACHE, CODEX_CACHE, ZAI_CACHE, ZAI_RESETS_CACHE))
 CACHE_TTL = 30
 # Every Claude account, the live one included: a 30 s TTL under a 60 s status-line
 # refresh fetched the live token every minute until its usage endpoint answered 429.
@@ -2419,6 +2421,7 @@ def main(argv=None):
     ap.add_argument("--quiet", action="store_true",
                     help="suppress per-account error lines")
     args = ap.parse_args(argv)
+    cache_store.retire(os.path.join(tempfile.gettempdir(), name) for name in LEGACY_CACHES)
 
     want_claude = not (args.kimi or args.codex or args.zai)
     want_kimi = not (args.claude or args.codex or args.zai)

@@ -189,7 +189,7 @@ def test_a_removed_provider_is_not_spoken_for_by_its_leftover_cache(tmp):
     """The credential check runs before the cache read, so a cache written
     while the provider was installed cannot answer for it afterwards."""
     mod, cache, absent = _load(), os.path.join(tmp, "cache.json"), os.path.join(tmp, "absent.json")
-    for age in (60, 10 ** 5):
+    for age in (1, 10 ** 5):
         with open(cache, "w", encoding="utf-8") as fh:
             json.dump({"data": {"limits": []}, "fetched_at": time.time() - age}, fh)
         for query, removed in ((mod.query_kimi, mock.patch.multiple(mod, KIMI_CACHE=cache, KIMI_CRED=absent)),

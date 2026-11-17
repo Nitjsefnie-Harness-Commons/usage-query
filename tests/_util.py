@@ -72,7 +72,7 @@ def runner(tests, tmp_prefix="usagequerytests_"):
             d = os.path.join(tmp, t.__name__)
             os.makedirs(d, exist_ok=True)
             try:
-                with mock.patch.dict(os.environ, {"HOME": d, "USERPROFILE": d}):
+                with mock.patch.dict(os.environ, {"HOME": d, "USERPROFILE": d}), mock.patch.object(tempfile, "tempdir", d):
                     t(d)
                 print(f"  PASS  {t.__name__}")
             except Skipped as e:
