@@ -19,6 +19,28 @@ The `usage-query` command queries all four providers by default, or one with
 `--quiet` suppresses per-account error lines. The command reports its own
 version with `--version`.
 
+With `--json` the output is one object: `usage` holds each provider's reading,
+`errors` each failure, and `unconfigured` each provider a default sweep found
+absent from this machine, as `ProviderNotConfigured: <message>`. A
+provider is absent when its credentials are: `~/.claude/.credentials.json`,
+`~/.kimi-code/credentials/kimi-code.json` or `$CODEX_HOME/auth.json` does not
+exist, or no z.ai key is found in any of the places listed below. In a default
+sweep an absent provider goes under `unconfigured`, not `errors`, prints
+nothing in the table, and does not by itself make the command exit nonzero;
+asked for by name with `--claude`, `--kimi`, `--codex` or `--zai`, it is
+reported under `errors` like any other failure. The command exits 1 whenever
+`errors` is non-empty, else 0.
+
+A reading under `usage` served from an old cache carries `_stale_age`, the
+cache's age in seconds, and, when this run tried to refresh it and failed,
+`_stale_error`, that failure as `<ExceptionType>: <message>`; every provider
+does this. The table marks such an account `(cached Ns)` or
+`(cached Ns; refresh failed: <error>)`. Outside a 429 backoff, Claude serves
+its cache with `_stale_age` alone when a pending swap, or Claude Code's
+refresh lock or the accounts lock still held at its wait, stopped the query
+before any request (both below). Entries under `claude_accounts` carry
+neither key.
+
 Claude reads the live account from `~/.claude/.credentials.json` as usual.
 When `~/.claude/accounts/live` names an installed `*.json` stash in that
 directory, the default query and `--claude` also report every installed Claude
@@ -65,12 +87,12 @@ that a swap made live meanwhile is refreshed on the live route. A live refresh
 also runs under Claude Code's own refresh lock, taken first and the way Claude
 Code takes it: the directories `~/.claude/.oauth_refresh.lock` and then
 `~/.claude.lock`, each reclaimed once its modification time is over 60 seconds
-old and touched every 5 seconds while held, waiting up to 30 seconds. Under
+old and touched every 5 seconds while held, waiting up to 2 seconds. Under
 that lock it re-reads the credentials and uses a pair Claude Code rotated
 meanwhile instead of refreshing. Every write to `.credentials.json` takes Claude
-Code's credential write lock (`~/.claude/.storage-write.lock`, reclaimed after
-15 seconds), re-reads the file under it, and replaces only its `claudeAiOauth`
-entry, so keys another writer saved meanwhile (MCP OAuth tokens, for one) are
+Code's credential write lock (`~/.claude/.storage-write.lock`, waiting up to 30
+seconds and reclaimed after 15 seconds), re-reads the file under it, and
+replaces only its `claudeAiOauth` entry, so keys another writer saved meanwhile (MCP OAuth tokens, for one) are
 kept. Like Claude Code's own save, it writes only while the `claudeAiOauth`
 entry exists and its refresh token is empty or the one this refresh sent. A
 newer pair (a `/login` to another account, say), a removed entry or a removed
@@ -78,7 +100,7 @@ file (a `/logout`) is left as it is, and the rotated pair is saved to the
 posting account's stash instead, or `write_skipped_newer` is logged when no
 stash knows the account. The query also takes a brief lock to read the
 account name and credentials together before HTTP. Accounts-lock acquisition
-retries for up to 30 seconds and reclaims a lock whose modification time is
+retries for up to 2 seconds and reclaims a lock whose modification time is
 older than 30 seconds; a held lock's modification time is touched every 5
 seconds. A timeout on Claude Code's refresh lock or on the accounts lock (and
 only those) stops the query before a refresh grant and serves the last cached
@@ -113,6 +135,26 @@ cache. A failed account is omitted and named under `errors` as
 them, in the same columns. Each account's scoped rows follow its `5h` and `7d`
 rows, preserving the reading's scoped-list order. An unreadable directory or marker is reported as
 `errors.claude_accounts`, preserving the live result.
+
+Claude's usage endpoint (`/api/oauth/usage`) shares its rate limit with every
+running Claude Code session and can answer 429 for hours. A 429 records a
+backoff in that account's usage cache file: 300 seconds for the first 429
+since the last successful usage read, doubling with each further one up to
+3600 seconds, or the response's `Retry-After` seconds when longer (still capped
+at 3600). Until it expires this command does not ask the usage endpoint for
+that account. Instead, right after the 429 and on every run during the backoff
+whose cache is older than its five-minute TTL, it sends
+`POST https://api.anthropic.com/v1/messages` with the account's OAuth access
+token, model `claude-haiku-5-5` (`CLAUDE_PROBE_MODEL`) and `max_tokens` 1, and
+takes the 5h and 7d windows from the response's
+`anthropic-ratelimit-unified-5h-utilization`, `-5h-reset`,
+`-7d-utilization` and `-7d-reset` headers; the rest of the last cached payload,
+scoped limits included, stays as it was. That probe is an inference request,
+so each one is a model call on the account. If it fails or carries no 7d
+header, the last cached reading is served with `_stale_error` naming the 429
+(`HTTPError: HTTP Error 429: backing off until <time>` during the backoff), or
+the account reports an error when nothing is cached. The next successful usage
+read clears the backoff.
 
 When `~/.agent-bundle/scripts/openrouter_key.py` exists, every provider selection
 also runs it as `credits --json` with a timeout. Its returned object appears

@@ -13,6 +13,8 @@ Sources (same endpoints/credentials the hook uses):
             header anthropic-beta: oauth-2025-04-20
             5h window  = five_hour.utilization  (+ resets_at)
             weekly     = seven_day.utilization  (+ resets_at)
+            429/backoff: POST /v1/messages (a CLAUDE_PROBE_MODEL call, max_tokens
+            1), windows from anthropic-ratelimit-unified-* headers
   - Kimi:   GET https://api.kimi.com/coding/v1/usages
             bearer = ~/.kimi-code/credentials/kimi-code.json -> access_token
             5h window  = limits[] entry with window.duration==300 MINUTE (used/limit)
@@ -114,8 +116,8 @@ Flags:
   --quiet         suppress per-account error lines (still exits non-zero on
                   any requested-account failure)
 
-Exit status: 0 if every requested account was queried successfully; 1 if any
-requested account failed (missing creds, HTTP error, unexpected payload).
+Exit status: 1 if `errors` is non-empty (HTTP error, bad payload, a flag-named
+provider with absent creds), else 0; a default sweep files those in `unconfigured`.
 
 Cross-platform: stdlib urllib only (no curl). Reset timestamps are rendered in
 the machine's own timezone and labelled "machine-local ... no tz conversion" so
@@ -932,18 +934,16 @@ def _claude_refresh_grant(full, cred_path, account_name, source, errors):
 
 def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE_TTL, errors=None):
     """{'five_hour': {...}, 'weekly': {...}, '_stale_age': int?,
-    '_stale_error': str?} normalized, or
-    raises. A fresh cache is used as-is; otherwise we fetch live once, unless a 429
-    backoff in the cache file holds every fetch off. If the live fetch fails, we fall back to the last cached
-    payload however stale, tagged with '_stale_age' (seconds) and
-    '_stale_error' (the failure, as '<ExceptionType>: <message>', the form
-    `errors` uses) so the caller can label it — better a known-old number than
-    an error. A pending swap, or
-    Claude Code's refresh lock or the accounts lock still held at its 30 s
-    deadline, uses the last cached reading the same way, tagged with
-    '_stale_age' only (no fetch ran, so no '_stale_error'), or raises if none
-    exists. (The storage write lock never gets here: its timeout comes after
-    the grant and is written through, see _write_live_claude_cred.)"""
+    '_stale_error': str?} normalized, or raises. A fresh cache answers as-is,
+    else one live fetch; on its 429 (recorded as a cache-file backoff) or
+    in the backoff, _claude_header_probe reads the windows. Failing those, the
+    last cache answers however stale, with '_stale_age' (s) and
+    '_stale_error' ('<ExceptionType>: <message>', as in `errors`). Outside a
+    backoff, a pending swap, or Claude Code's refresh lock or the accounts lock
+    held past CLAUDE_CODE_LOCK_WAIT (2 s), serves the cache with '_stale_age'
+    only (no fetch ran), or raises without one. A storage write
+    lock timeout comes after the grant and is written through
+    (_write_live_claude_cred)."""
     cred_path = cred_path or CLAUDE_CRED
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
