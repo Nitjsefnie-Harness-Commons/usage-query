@@ -8,7 +8,6 @@ from unittest import mock
 import _util
 from test_claude_accounts import credentials, install, run_json, setup
 from test_claude_accounts_lock import assert_new_pair, refreshing, replace_bytes
-from test_claude_backoff import throttled
 
 
 def pending_state(accounts, value=None):
@@ -212,41 +211,6 @@ def test_without_accounts_the_cache_follows_the_logged_in_account(tmp):
                 reading = run_json(mod)[3]["usage"]["claude"]
             assert (reading["five_hour"]["pct"], "_stale_error" in reading) == (pct, stale), (uuid, token, reading)
         assert http.calls == [("usage", "Bearer live-token"), ("usage", "Bearer other-token"), ("usage", "Bearer refreshed")]
-
-
-def test_a_switch_during_the_token_read_files_no_reading_under_the_wrong_account(tmp):
-    with setup(tmp, {"live-token": 10, "beta-token": 40, "other-token": 77}) as (mod, accounts, http):
-        install(accounts)
-        real, probe = mod._claude_access_token, mock.Mock(return_value={"seven_day": {"utilization": 33.0, "resets_at": None}})
-
-        def switch(name, token, uuid=None):
-            credentials(Path(mod.CLAUDE_CRED), token)
-            (accounts / "live").write_text(name + "\n", encoding="utf-8")
-            (Path(tmp) / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": uuid}}), encoding="utf-8")
-
-        def query(name, token, uuid=None, **patches):  # the switch lands inside the token read, after the identity read
-            with mock.patch.object(mod, "_claude_access_token", side_effect=lambda *a: switch(name, token, uuid) or real(*a)), \
-                    mock.patch.multiple(mod, _claude_header_probe=probe, **patches):
-                return mod.query_claude(errors={})
-        assert query("beta", "beta-token")["five_hour"]["pct"] == 40
-        switch("alpha", "live-token")
-        assert mod.query_claude(errors={})["five_hour"]["pct"] == 10
-        switch("alpha", "other-token", "u-2")  # a /login past the switcher keeps the marker
-        assert mod.query_claude(errors={})["five_hour"]["pct"] == 77
-        record = json.loads(Path(mod.CACHE).read_text(encoding="utf-8"))
-        Path(mod.CACHE).write_text(json.dumps({**record, "fetched_at": 0, "backoff": {"streak": 1, "until": time.time() + 60}}), encoding="utf-8")
-        before, got = Path(mod.CACHE).read_bytes(), query("beta", "beta-token")  # inside a 429 backoff the probe reads the windows
-        assert (got["weekly"]["pct"], "five_hour" in got, "_stale_error" in got, Path(mod.CACHE).read_bytes()) == (33.0, False, False, before)
-        switch("alpha", "other-token", "u-2")
-        Path(mod.CACHE).write_text(json.dumps({**record, "fetched_at": 0}), encoding="utf-8")
-        try:  # a /login inside the token read, then the fetch fails: the old login's stale 77 is not this run's
-            query("alpha", "other-token", "u-3", _get_retry=mock.Mock(side_effect=RuntimeError("down")))
-            raise AssertionError("the previous login's stale reading was served")
-        except RuntimeError as exc:
-            assert str(exc) == "down", exc
-        got = query("beta", "beta-token", _get_retry=mock.Mock(side_effect=throttled()))  # a switched run's 429: the probe alone
-        assert (got["weekly"]["pct"], "five_hour" in got) == (33.0, False)
-        assert http.calls == [("usage", "Bearer beta-token"), ("usage", "Bearer live-token"), ("usage", "Bearer other-token")]
 
 
 if __name__ == "__main__":

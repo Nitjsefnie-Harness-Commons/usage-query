@@ -935,13 +935,6 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
     now, account = time.time(), _claude_cache_account(cred_path)
-
-    def access_token():
-        nonlocal cache_path, c, stale
-        token = _claude_access_token(cred_path, errors)
-        if _claude_cache_account(cred_path) != account:
-            cache_path, c, stale = None, {}, None
-        return token
     c, data, stale = cache_store.read(cache_path, cache_ttl, account)
     age, stale_error = 0, None
     until = (c.get("backoff") or {}).get("until")
@@ -950,15 +943,15 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
         note = ("HTTPError: HTTP Error 429: backing off until "
                 + time.strftime("%H:%M:%S", time.localtime(until)))
         try:
-            token = access_token()
-            data = _write_probed(cache_path, c, _claude_header_probe(token), account)
+            data = _write_probed(cache_path, c, _claude_header_probe(
+                _claude_access_token(cred_path, errors)), account)
         except Exception as exc:
             if stale is None:
                 raise RuntimeError(note) from exc
             (data, age), stale_error = stale, note
     if data is None:
         try:
-            token = access_token()
+            token = _claude_access_token(cred_path, errors)
         except (_ClaudeSwapPending, _LockTimeout):
             # A pending swap, or Claude Code's refresh lock or the accounts
             # lock still held at its deadline: no refresh this run, serve the cache.
