@@ -118,13 +118,6 @@ def assert_legacy(mod):
     assert text.splitlines()[1].startswith("Claude ")
 
 
-def test_no_accounts_directory_keeps_legacy_output(tmp):
-    with setup(tmp) as (mod, accounts, http):
-        assert not accounts.exists()
-        assert_legacy(mod)
-        assert http.calls == [("usage", "Bearer live-token")]
-
-
 def test_empty_accounts_directory_does_not_read_marker(tmp):
     with setup(tmp) as (mod, accounts, _):
         accounts.mkdir()
@@ -138,18 +131,15 @@ def test_empty_accounts_directory_does_not_read_marker(tmp):
             assert_legacy(mod)
 
 
-def test_missing_marker_keeps_legacy_output(tmp):
-    with setup(tmp) as (mod, accounts, http):
-        install(accounts, marker=None)
-        assert_legacy(mod)
-        assert http.calls == [("usage", "Bearer live-token")]
-
-
-def test_unknown_marker_keeps_legacy_output(tmp):
-    with setup(tmp) as (mod, accounts, http):
-        install(accounts, marker="absent")
-        assert_legacy(mod)
-        assert http.calls == [("usage", "Bearer live-token")]
+def test_no_accounts_directory_or_a_missing_or_unknown_marker_keeps_legacy_output(tmp):
+    for marker in (False, None, "absent"):  # False: no accounts directory at all
+        with setup(os.path.join(tmp, str(marker))) as (mod, accounts, http):
+            if marker is False:
+                assert not accounts.exists()
+            else:
+                install(accounts, marker=marker)
+            assert_legacy(mod)
+            assert http.calls == [("usage", "Bearer live-token")], marker
 
 
 def test_fresh_inactive_account_uses_its_token_and_live_is_reused(tmp):
