@@ -52,6 +52,8 @@ class HTTP:  # pylint: disable=too-few-public-methods
             token = token.removeprefix("Bearer ")
             assert token in self.tokens, "unexpected usage token: " + token
             pct = self.tokens[token]
+            if isinstance(pct, Exception):
+                raise pct
             return Response({
                 "five_hour": {"utilization": pct, "resets_at": None},
                 "seven_day": {"utilization": pct + 1, "resets_at": None},

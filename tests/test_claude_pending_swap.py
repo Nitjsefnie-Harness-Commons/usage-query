@@ -8,6 +8,7 @@ from unittest import mock
 import _util
 from test_claude_accounts import credentials, install, run_json, setup
 from test_claude_accounts_lock import SWITCHED, assert_new_pair, refreshing, replace_bytes, switch_error
+from test_claude_backoff import throttled
 
 
 def pending_state(accounts, value=None):
@@ -51,8 +52,7 @@ def test_pending_swap_uses_stale_cached_stash_without_refresh(tmp):
         seed_cache(accounts / ".beta.usage-cache", 42)
         old = (accounts / "beta.json").read_bytes()
         rc, raw, _, got = run_json(mod)
-        assert rc == 0 and got["errors"] == {}, raw
-        assert set(got["claude_accounts"]) == {"alpha", "beta"}
+        assert rc == 0 and got["errors"] == {} and set(got["claude_accounts"]) == {"alpha", "beta"}, raw
         assert [got["claude_accounts"]["beta"][window]["pct"] for window in ("five_hour", "weekly")] == [42, 43], got
         assert (accounts / "beta.json").read_bytes() == old
         assert http.calls == [], "pending swap made a Claude request"
@@ -64,8 +64,7 @@ def test_pending_key_without_cache_records_error_and_skips_stash(tmp):
         pending_state(accounts, value)
         old = (accounts / "beta.json").read_bytes()
         rc, raw, _, got = run_json(mod)
-        assert rc == 1 and set(got["errors"]) == {"claude:beta"}, raw
-        assert "pending" in got["errors"]["claude:beta"].lower()
+        assert rc == 1 and set(got["errors"]) == {"claude:beta"} and "pending" in got["errors"]["claude:beta"].lower(), raw
         assert set(got["claude_accounts"]) == {"alpha"}
         assert (accounts / "beta.json").read_bytes() == old
         assert http.calls == []
@@ -98,11 +97,9 @@ def test_state_without_pending_allows_refresh_and_is_not_an_account(tmp):
     for text, mod, accounts, http in beta_cases(tmp, ("{}", '"no pending swap"', "5", "[]", "null")):
         (accounts / "state.json").write_text(text, encoding="utf-8")
         rc, raw, _, got = run_json(mod)
-        assert rc == 0 and got["errors"] == {}, raw
-        assert set(got["claude_accounts"]) == {"alpha", "beta"}
+        assert rc == 0 and got["errors"] == {} and set(got["claude_accounts"]) == {"alpha", "beta"}, raw
         assert got["claude_accounts"]["beta"]["five_hour"]["pct"] == 55
-        assert http.calls == [("usage", "Bearer live-token"), ("refresh", "beta-token-refresh"),
-                              ("usage", "Bearer beta-new")]
+        assert http.calls == [("usage", "Bearer live-token"), ("refresh", "beta-token-refresh"), ("usage", "Bearer beta-new")]
 
 
 def test_pending_swap_reports_error_for_uncached_live_reading(tmp):
@@ -110,8 +107,7 @@ def test_pending_swap_reports_error_for_uncached_live_reading(tmp):
         pending_state(accounts)
         before = home_files(tmp)
         rc, raw, _, got = run_json(mod)
-        assert rc == 1 and set(got["errors"]) == {"claude", "claude:beta"}, raw
-        assert "pending" in got["errors"]["claude"].lower()
+        assert rc == 1 and set(got["errors"]) == {"claude", "claude:beta"} and "pending" in got["errors"]["claude"].lower(), raw
         assert got["usage"] == {} and got["claude_accounts"] == {}
         assert http.calls == [], "uncached live reading refreshed during a pending swap"
         assert home_files(tmp) == before, "pending live query changed files"
@@ -124,8 +120,7 @@ def test_pending_swap_reports_stale_cached_live_reading(tmp):
         before = home_files(tmp)
         rc, raw, _, got = run_json(mod)
         assert rc == 1 and set(got["errors"]) == {"claude:beta"}, raw
-        assert got["usage"]["claude"]["five_hour"]["pct"] == 17
-        assert got["usage"]["claude"]["weekly"]["pct"] == 18
+        assert [got["usage"]["claude"][window]["pct"] for window in ("five_hour", "weekly")] == [17, 18], got
         assert got["usage"]["claude"]["_stale_age"] >= 1000
         assert got["claude_accounts"]["alpha"]["five_hour"]["pct"] == 17
         assert http.calls == [], "stale cached live reading refreshed during a pending swap"
@@ -164,8 +159,7 @@ def test_state_without_pending_allows_live_refresh(tmp):
     with refreshing(tmp) as (mod, accounts, http):
         (accounts / "state.json").write_text("{}", encoding="utf-8")
         rc, raw, _, got = run_json(mod)
-        assert rc == 0 and got["errors"] == {}, raw
-        assert got["usage"]["claude"]["five_hour"]["pct"] == 25
+        assert rc == 0 and got["errors"] == {} and got["usage"]["claude"]["five_hour"]["pct"] == 25, raw
         assert_new_pair(Path(mod.CLAUDE_CRED))
         assert http.calls == [("refresh", "live-token-refresh"), ("usage", "Bearer new-access"),
                               ("usage", "Bearer beta-token")]
@@ -199,9 +193,9 @@ def test_without_accounts_the_cache_follows_the_logged_in_account(tmp):
 
 
 def test_a_switch_during_the_token_read_files_no_reading_under_the_wrong_account(tmp):
-    with setup(tmp, {"live-token": 10, "beta-token": 40, "other-token": 77}) as (mod, accounts, http):
+    with setup(tmp, {"live-token": 10, "beta-token": 40, "other-token": 77, "limited-token": throttled()}) as (mod, accounts, http):
         install(accounts)
-        cache, probe = Path(mod.CACHE), mock.Mock(return_value={"seven_day": {"utilization": 33.0, "resets_at": None}})
+        cache, probe = Path(mod.CACHE), mock.Mock(side_effect=lambda token: http.calls.append(("probe", token)) or {"seven_day": {"utilization": 33.0, "resets_at": None}})
 
         def switch(name, token, uuid=None):  # what the switcher, or a /login (`uuid`), leaves behind
             credentials(Path(mod.CLAUDE_CRED), token)
@@ -210,20 +204,24 @@ def test_a_switch_during_the_token_read_files_no_reading_under_the_wrong_account
         mod.query_claude(errors={})
         fresh, until = json.loads(cache.read_text(encoding="utf-8")), time.time() + 60
         stale, token_read = fresh | {"fetched_at": 0}, (mod, "_claude_access_token")
-        for row, (record, (where, what), name, token, uuid, kept, sent) in enumerate((  # where the switch lands; then the account it leaves live
-                ({"account": fresh["account"], "backoff": {"streak": 1, "until": until}}, token_read, "beta", "beta-token", None, True, []),  # the 429-backoff probe, no stale reading to serve
-                (stale | {"backoff": {"streak": 1, "until": until}}, token_read, "beta", "beta-token", None, True, []),  # the 429-backoff probe
-                (stale, token_read, "alpha", "other-token", "u-2", True, []),  # a /login past the switcher keeps the marker
-                (fresh, (mod.cache_store, "read"), "beta", "beta-token", None, True, []),  # a fresh hit reads no token: the end check
-                (stale, (mod, "_get_retry"), "beta", "beta-token", None, False, [("usage", "Bearer live-token")]),  # after the token check
-                (stale, token_read, "beta", "beta-token", None, True, [])), 1):  # the switcher, vs row 3's /login
-            switch("alpha", "live-token")
+        for row, (record, (where, what), name, token, uuid, kept, sent, held) in enumerate((  # where the switch lands; the account it leaves live; the token held before
+                ({"account": fresh["account"], "backoff": {"streak": 1, "until": until}}, token_read, "beta", "beta-token", None, True, [], "live-token"),  # the 429-backoff probe, no stale reading to serve
+                (stale | {"backoff": {"streak": 1, "until": until}}, token_read, "beta", "beta-token", None, True, [], "live-token"),  # the 429-backoff probe
+                (stale, token_read, "alpha", "other-token", "u-2", True, [], "live-token"),  # a /login past the switcher keeps the marker
+                (fresh, (mod.cache_store, "read"), "beta", "beta-token", None, True, [], "live-token"),  # a fresh hit reads no token: the end check
+                (stale, (mod, "_get_retry"), "beta", "beta-token", None, True, [("usage", "Bearer live-token")], "live-token"),  # after the token check: the pre-write check
+                (stale, (mod, "_get_retry"), "alpha", "other-token", "u-2", True, [("usage", "Bearer other-token")], "other-token"),  # a /login whose credentials beat the token read, ~/.claude.json not
+                (stale | {"backoff": {"streak": 1, "until": until}}, (mod, "_claude_header_probe"), "alpha", "other-token", "u-2", True, [("probe", "other-token")], "other-token"),  # the same, around the backoff probe
+                (stale, (mod, "_get_retry"), "alpha", "limited-token", "u-2", True, [("usage", "Bearer limited-token")], "limited-token"),  # the same, around a 429: no backoff written
+                ({"account": fresh["account"]}, (mod, "_claude_header_probe"), "alpha", "limited-token", "u-2", False, [("usage", "Bearer limited-token"), ("probe", "limited-token")], "limited-token"),  # around its probe
+                (stale, token_read, "beta", "beta-token", None, True, [], "live-token")), 1):  # the switcher, vs row 3's /login
+            switch("alpha", held)
             cache.write_text(json.dumps(record), encoding="utf-8")
-            before, calls, real = cache.read_bytes(), len(http.calls), getattr(where, what)
-            with mock.patch.object(where, what, side_effect=lambda *a, r=real, n=name, t=token, u=uuid: switch(n, t, u) or r(*a)), \
-                    mock.patch.object(mod, "_claude_header_probe", probe):
+            before, calls = cache.read_bytes(), len(http.calls)
+            with mock.patch.object(mod, "_claude_header_probe", probe), \
+                    mock.patch.object(where, what, side_effect=lambda *a, r=getattr(where, what), n=name, t=token, u=uuid: switch(n, t, u) or r(*a)):
                 assert switch_error(mod.query_claude, errors={}) == SWITCHED, (row, what, token)
-            assert (cache.read_bytes() == before, probe.call_count, http.calls[calls:]) == (kept, 0, sent), (row, what, token)
+            assert (cache.read_bytes() == before, json.loads(cache.read_bytes()).get("fetched_at"), http.calls[calls:]) == (kept, record.get("fetched_at"), sent), (row, what, token)
         switch("alpha", "live-token")  # the previous run filed nothing: alpha's next run reads its own
         assert run_json(mod)[3]["usage"]["claude"]["five_hour"]["pct"] == 10
         credentials(accounts / "alpha.json", "live-token")  # the switcher stashes alpha, installs beta: a switch inside the TTL
@@ -234,8 +232,8 @@ def test_a_switch_during_the_token_read_files_no_reading_under_the_wrong_account
         with mock.patch.object(mod, "query_claude", side_effect=lambda *a, q=mod.query_claude, **k: q(*a, **k) if a else (q(**k), switch("alpha", "live-token"))[0]):
             got = run_json(mod)[3]
         assert (got["usage"]["claude"]["five_hour"]["pct"], got["claude_accounts"]["alpha"]["live"], got["claude_accounts"]["alpha"]["five_hour"]["pct"]) == (77, True, 10), got
-        assert http.calls == [("usage", "Bearer live-token"), ("usage", "Bearer live-token"), ("usage", "Bearer live-token"),
-                              ("usage", "Bearer beta-token"), ("usage", "Bearer beta-token"), ("usage", "Bearer live-token"), ("usage", "Bearer other-token")]
+        assert http.calls == [("usage", "Bearer live-token"), ("usage", "Bearer live-token"), ("usage", "Bearer other-token"), ("probe", "other-token"), ("usage", "Bearer limited-token"),
+                              ("usage", "Bearer limited-token"), ("probe", "limited-token"), ("usage", "Bearer live-token"), ("usage", "Bearer beta-token"), ("usage", "Bearer beta-token"), ("usage", "Bearer live-token"), ("usage", "Bearer other-token")]
 
 
 if __name__ == "__main__":
