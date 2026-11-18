@@ -127,6 +127,12 @@ that pending swap. A `state.json` that exists but cannot be read or parsed count
 one that is not a JSON object has no `pending` key, and without a `pending` key live
 queries behave normally. `state.json` is switcher metadata and is not an account.
 
+A Claude query re-reads its account (the live marker and `~/.claude.json`'s
+`oauthAccount.accountUuid`, or the stash name) after its token read and before it
+answers. When a switch or a `/login` changed it, that query reports no reading
+and raises `the Claude account changed during the reading` (under `errors`);
+a change seen after the token read sends no request and writes no cache.
+
 Their readings have separate five-minute caches
 beside the stashes (`.<name>.usage-cache`); the live account keeps its existing
 cache. A failed account is omitted and named under `errors` as
