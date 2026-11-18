@@ -654,6 +654,16 @@ class _ClaudeSwapPending(RuntimeError):
     """A Claude reading is paused while the switcher has pending state."""
 
 
+class _ClaudeSwitched(RuntimeError):
+    """Account changed mid-run."""
+
+
+class _ClaudeReading(dict):
+    def __init__(self, fetched_for, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fetched_for = fetched_for
+
+
 def _claude_credential_snapshot(cred_path):
     """(credentials, account name, file read), bound under a brief lock."""
     directory = os.path.join(os.path.dirname(CLAUDE_CRED), "accounts")
@@ -909,11 +919,10 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
     now, account = time.time(), _claude_cache_account(cred_path)
-    switched = RuntimeError("the Claude account changed during the reading")
 
     def same(value=None):
         if _claude_cache_account(cred_path) != account:
-            raise switched
+            raise _ClaudeSwitched("the Claude account changed during the reading")
         return value
     c, data, stale = cache_store.read(cache_path, cache_ttl, account)
     age, stale_error = 0, None
@@ -925,9 +934,9 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
         try:
             data = cache_store.write_probed(cache_path, c, _claude_header_probe(
                 same(_claude_access_token(cred_path, errors))), account)
+        except _ClaudeSwitched:
+            raise
         except Exception as exc:
-            if exc is switched:
-                raise
             if stale is None:
                 raise RuntimeError(note) from exc
             (data, age), stale_error = stale, note
@@ -961,7 +970,7 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
                     data, age = stale
                     stale_error = f"{type(e).__name__}: {e}"
     same()
-    out = {}
+    out = _ClaudeReading(account)
     session_listed = any(str(it.get("group") or "") == "session"
                          for it in (data.get("limits") or []))
     for key, src in (("five_hour", "five_hour"), ("weekly", "seven_day")):
@@ -1037,7 +1046,7 @@ def query_claude_accounts(live_result, errors):
     accounts = {}
     for name, path in stashes.items():
         try:
-            reading = live_result if name == live else query_claude(
+            reading = live_result if name == live and (live_result is None or live_result.fetched_for[0] == live) else query_claude(
                 path, os.path.join(directory, f".{name}.usage-cache"),
                 CLAUDE_ACCOUNT_CACHE_TTL, errors=errors)
             if reading is not None:

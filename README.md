@@ -72,7 +72,10 @@ no `limits[]` entry has group `session`) omits the `five_hour` key, in
 it. A null `five_hour` beside a listed session group still reads as an inactive
 0% window.
 
-The live entry reuses `usage.claude`'s window readings. Each account also retains
+The live entry reuses `usage.claude`'s window readings when the marker still
+names the account that reading was fetched for. After a switch between the two,
+that reading is filed under no account, and the newly live account is read
+through its stash path and `.<name>.usage-cache`. Each account also retains
 the reading's optional `_scoped` list, in the same shape as
 `usage.claude._scoped`; readings without scoped limits omit that key.
 Inactive accounts use

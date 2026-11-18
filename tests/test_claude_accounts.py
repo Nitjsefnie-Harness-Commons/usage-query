@@ -436,8 +436,8 @@ def test_live_entry_preserves_scoped_limits_and_omits_cache_metadata(tmp):
         install(accounts)
         window = {"pct": 10.0, "resets_at": "reset", "resets_in": "1h",
                   "pace_pct": 20.0, "recover_in": None}
-        live = {"five_hour": window, "weekly": window,
-                "_scoped": [{"label": "7d:scoped", **window}], "_stale_age": 60}
+        live = mod._ClaudeReading(["alpha", None], {"five_hour": window, "weekly": window,
+                                                     "_scoped": [{"label": "7d:scoped", **window}], "_stale_age": 60})
         original_query = mod.query_claude
 
         def query(*args, **kwargs):
