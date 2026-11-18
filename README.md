@@ -133,11 +133,12 @@ one that is not a JSON object has no `pending` key, and without a `pending` key 
 queries behave normally. `state.json` is switcher metadata and is not an account.
 
 A Claude query re-reads its account (the live marker and `~/.claude.json`'s
-`oauthAccount.accountUuid`, or the stash name) after its token read and before it
-answers. When it changed (a switch or a `/login`, but also the marker, the
+`oauthAccount.accountUuid`, or the stash name) after its token read, before each
+cache write and before it answers. When it changed (a switch or a `/login`, but also the marker, the
 stash it names or that account UUID appearing or disappearing), that query reports no reading
 and raises `the Claude account changed during the reading` (under `errors`);
-a change seen after the token read sends no request and writes no cache.
+a change seen after the token read sends no request and writes no cache, and one
+seen before a later cache write (during the request, say) leaves that write out.
 
 Their readings have separate five-minute caches
 beside the stashes (`.<name>.usage-cache`); the live account keeps its existing

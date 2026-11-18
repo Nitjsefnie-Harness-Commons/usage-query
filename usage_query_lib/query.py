@@ -913,8 +913,8 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
     held past CLAUDE_CODE_LOCK_WAIT (2 s), serves the cache with '_stale_age'
     only (no fetch ran), or raises without one. A storage write
     lock timeout comes after the grant and is written through
-    (_write_live_claude_cred). Raises, reporting nothing, when the account
-    changed by the token read (before any request or cache write) or by the end."""
+    (_write_live_claude_cred). Raises, reporting nothing, if the account
+    changed by the token read (no request sent), a cache write (none made) or the end."""
     cred_path = cred_path or CLAUDE_CRED
     cache_path = cache_path or CACHE
     _require_configured("Claude", cred_path)
@@ -933,7 +933,7 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
                 + time.strftime("%H:%M:%S", time.localtime(until)))
         try:
             data = cache_store.write_probed(cache_path, c, _claude_header_probe(
-                same(_claude_access_token(cred_path, errors))), account)
+                same(_claude_access_token(cred_path, errors))), same(account))
         except _ClaudeSwitched:
             raise
         except Exception as exc:
@@ -955,13 +955,15 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
                     "Authorization": f"Bearer {token}",
                     "anthropic-beta": "oauth-2025-04-20",
                 })
-                _write_cache(cache_path, data, account)
+                _write_cache(cache_path, data, same(account))
             except Exception as e:
                 if getattr(e, "code", None) == 429 and isinstance(e, urllib.error.HTTPError):
-                    cache_store.write_backoff(cache_path, c, account, _retry_after(e))
+                    cache_store.write_backoff(cache_path, c, same(account), _retry_after(e))
                     try:
                         backed = cache_store.read(cache_path, cache_ttl, account)[0]
-                        data = cache_store.write_probed(cache_path, backed, _claude_header_probe(token), account)
+                        data = cache_store.write_probed(cache_path, backed, _claude_header_probe(token), same(account))
+                    except _ClaudeSwitched:
+                        raise
                     except Exception:
                         data = None
                 if data is None:
