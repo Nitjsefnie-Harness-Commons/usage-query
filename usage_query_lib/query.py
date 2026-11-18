@@ -405,8 +405,8 @@ def _write_cache(path, data, account):
 
 # After a 429 (cache_store.write_backoff), no process of this user asks that
 # account's usage endpoint again until the backoff in its cache file expires:
-# BACKOFF_BASE doubling per consecutive 429 up to BACKOFF_CAP, or the server's
-# Retry-After when longer (still capped). A success rewrites the file without it.
+# cache_store.BACKOFF_BASE doubling per consecutive 429, or a longer Retry-After,
+# capped at its BACKOFF_CAP. A success rewrites the file without it.
 def _retry_after(error):
     value = (getattr(error, "headers", None) or {}).get("Retry-After")
     try:
