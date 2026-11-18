@@ -69,6 +69,33 @@ def write(path, record, account) -> None:
             os.remove(tmp)
 
 
+BACKOFF_BASE = 300
+BACKOFF_CAP = 3600
+
+
+def write_backoff(path, cached, account, retry_after=None):
+    """Atomically record the next 429 backoff in the cache file, keeping its payload."""
+    record = {k: v for k, v in (cached or {}).items() if k in ("fetched_at", "data")}
+    try:
+        streak = min(max(int(((cached or {}).get("backoff") or {}).get("streak") or 0), 0), 16) + 1
+    except (TypeError, ValueError, OverflowError):
+        streak = 1
+    delay = min(BACKOFF_CAP, max(BACKOFF_BASE * 2 ** (streak - 1), retry_after or 0))
+    record["backoff"] = {"streak": streak, "until": time.time() + delay}
+    write(path, record, account)
+    return record["backoff"]["until"]
+
+
+def write_probed(path, cached, probed, account):
+    """Cache the probed windows over the last payload, keeping any backoff."""
+    record = {k: v for k, v in (cached or {}).items() if k == "backoff"}
+    data = dict((cached or {}).get("data") or {})
+    data.update(probed)
+    record.update({"fetched_at": time.time(), "data": data})
+    write(path, record, account)
+    return data
+
+
 def retire(paths) -> None:
     """Remove this user's own regular files at `paths` (POSIX)."""
     for path in paths if hasattr(os, "geteuid") else ():
