@@ -7,7 +7,7 @@ from unittest import mock
 
 import _util
 from test_claude_accounts import credentials, install, run_json, setup
-from test_claude_accounts_lock import assert_new_pair, refreshing, replace_bytes
+from test_claude_accounts_lock import SWITCHED, assert_new_pair, refreshing, replace_bytes, switch_error
 
 
 def pending_state(accounts, value=None):
@@ -181,26 +181,9 @@ def test_marker_naming_state_file_uses_live_destination(tmp):
         state.write_text("{}", encoding="utf-8")
         (accounts / "live").write_text("state\n", encoding="utf-8")
         errors = {}
-        got = mod.query_claude(errors=errors)
-        assert errors == {} and got["five_hour"]["pct"] == 25
+        assert switch_error(mod.query_claude, errors=errors) == SWITCHED and errors == {}
         assert_new_pair(Path(mod.CLAUDE_CRED))
         assert state.read_text(encoding="utf-8") == "{}", "refresh overwrote switcher state"
-
-
-def test_a_switch_inside_the_ttl_reads_the_new_live_account(tmp):
-    with setup(tmp, {"live-token": 10, "beta-token": 40, "other-token": 77}) as (mod, accounts, http):
-        install(accounts)
-        assert run_json(mod)[3]["usage"]["claude"]["five_hour"]["pct"] == 10
-        credentials(accounts / "alpha.json", "live-token")  # the switcher stashes alpha, installs beta
-        credentials(Path(mod.CLAUDE_CRED), "beta-token")
-        (accounts / "live").write_text("beta\n", encoding="utf-8")
-        got = run_json(mod)[3]
-        assert got["usage"]["claude"]["five_hour"]["pct"] == 40 and got["claude_accounts"]["beta"] == {"live": True, **got["usage"]["claude"]}
-        assert got["claude_accounts"]["alpha"]["five_hour"]["pct"] == 10
-        assert http.calls[2:] == [("usage", "Bearer beta-token"), ("usage", "Bearer live-token")]
-        (Path(tmp) / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "u-2"}}), encoding="utf-8")
-        credentials(Path(mod.CLAUDE_CRED), "other-token")  # a /login past the switcher keeps the marker
-        assert run_json(mod)[3]["usage"]["claude"]["five_hour"]["pct"] == 77 and http.calls[4:] == [("usage", "Bearer other-token")]
 
 
 def test_without_accounts_the_cache_follows_the_logged_in_account(tmp):
@@ -214,6 +197,45 @@ def test_without_accounts_the_cache_follows_the_logged_in_account(tmp):
                 reading = run_json(mod)[3]["usage"]["claude"]
             assert (reading["five_hour"]["pct"], "_stale_error" in reading) == (pct, stale), (uuid, token, reading)
         assert http.calls == [("usage", "Bearer live-token"), ("usage", "Bearer other-token"), ("usage", "Bearer refreshed")]
+
+
+def test_a_switch_during_the_token_read_files_no_reading_under_the_wrong_account(tmp):
+    with setup(tmp, {"live-token": 10, "beta-token": 40, "other-token": 77}) as (mod, accounts, http):
+        install(accounts)
+        cache, probe = Path(mod.CACHE), mock.Mock(return_value={"seven_day": {"utilization": 33.0, "resets_at": None}})
+
+        def switch(name, token, uuid=None):  # what the switcher, or a /login (`uuid`), leaves behind
+            credentials(Path(mod.CLAUDE_CRED), token)
+            (accounts / "live").write_text(name + "\n", encoding="utf-8")
+            (Path(tmp) / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": uuid}}), encoding="utf-8")
+        mod.query_claude(errors={})
+        fresh, until = json.loads(cache.read_text(encoding="utf-8")), time.time() + 60
+        stale, token_read = fresh | {"fetched_at": 0}, (mod, "_claude_access_token")
+        for record, (where, what), name, token, uuid, kept, sent in (  # where the switch lands; then the account it leaves live
+                ({"account": fresh["account"], "backoff": {"streak": 1, "until": until}}, token_read, "beta", "beta-token", None, True, []),
+                (stale | {"backoff": {"streak": 1, "until": until}}, token_read, "beta", "beta-token", None, True, []),  # the 429-backoff probe
+                (stale, token_read, "alpha", "other-token", "u-2", True, []),  # a /login past the switcher keeps the marker
+                (fresh, (mod.cache_store, "read"), "beta", "beta-token", None, True, []),  # a fresh hit reads no token: the end check
+                (stale, (mod, "_get_retry"), "beta", "beta-token", None, False, [("usage", "Bearer live-token")]),  # after the token check
+                (stale, token_read, "beta", "beta-token", None, True, [])):
+            switch("alpha", "live-token")
+            cache.write_text(json.dumps(record), encoding="utf-8")
+            before, calls, real = cache.read_bytes(), len(http.calls), getattr(where, what)
+            with mock.patch.object(where, what, side_effect=lambda *a, r=real, n=name, t=token, u=uuid: switch(n, t, u) or r(*a)), \
+                    mock.patch.object(mod, "_claude_header_probe", probe):
+                assert switch_error(mod.query_claude, errors={}) == SWITCHED, (what, token)
+            assert (cache.read_bytes() == before, probe.call_count, http.calls[calls:]) == (kept, 0, sent), (what, token)
+        switch("alpha", "live-token")  # the previous run filed nothing: alpha's next run reads its own
+        assert run_json(mod)[3]["usage"]["claude"]["five_hour"]["pct"] == 10
+        credentials(accounts / "alpha.json", "live-token")  # the switcher stashes alpha, installs beta: a switch inside the TTL
+        switch("beta", "beta-token")
+        got = run_json(mod)[3]
+        assert got["usage"]["claude"]["five_hour"]["pct"] == 40 and got["claude_accounts"]["beta"] == {"live": True, **got["usage"]["claude"]}
+        assert got["claude_accounts"]["alpha"]["five_hour"]["pct"] == 10
+        switch("beta", "other-token", "u-2")
+        assert run_json(mod)[3]["usage"]["claude"]["five_hour"]["pct"] == 77
+        assert http.calls == [("usage", "Bearer live-token"), ("usage", "Bearer live-token"), ("usage", "Bearer live-token"),
+                              ("usage", "Bearer beta-token"), ("usage", "Bearer beta-token"), ("usage", "Bearer live-token"), ("usage", "Bearer other-token")]
 
 
 if __name__ == "__main__":

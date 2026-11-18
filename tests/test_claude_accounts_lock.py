@@ -76,6 +76,18 @@ def query(mod, accounts, name, errors):
                             str(accounts / f".{name}.usage-cache"), errors=errors)
 
 
+SWITCHED = "the Claude account changed during the reading"
+
+
+def switch_error(run, *args, **kwargs):
+    """The message of the RuntimeError `run(*args, **kwargs)` raises; a run that returns fails."""
+    try:
+        got = run(*args, **kwargs)
+    except RuntimeError as exc:
+        return str(exc)
+    raise AssertionError(f"a switched run reported {got}")
+
+
 def assert_new_pair(path):
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["claudeAiOauth"]["accessToken"] == "new-access"
@@ -152,95 +164,72 @@ def on_lock_entry(mod, accounts, entry, action):
     return mock.patch.object(mod, "_claude_accounts_lock", side_effect=lock)
 
 
-def test_inactive_becomes_live_before_locked_reread_writes_live_file(tmp):
+def test_inactive_becomes_live_before_locked_reread_writes_live_file_with_or_without_its_stash(tmp):
     # Entry 1 is the first snapshot, entry 2 the stash refresh's own lock: a
     # swap between them moves the refresh to the live route.
-    with refreshing(tmp, "beta") as (mod, accounts, http):
-        old_beta = (accounts / "beta.json").read_bytes()
-        old_alpha = Path(mod.CLAUDE_CRED).read_bytes()
-        errors = {}
-        with on_lock_entry(mod, accounts, 2, lambda a: swap(a, "beta")):
-            got = query(mod, accounts, "beta", errors)
-        assert errors == {} and got["five_hour"]["pct"] == 25
-        assert_new_pair(Path(mod.CLAUDE_CRED))
-        assert (accounts / "beta.json").read_bytes() == old_beta, "rotation went to inactive snapshot"
-        assert (accounts / "alpha.json").read_bytes() == old_alpha
-        assert (accounts / "live").read_text(encoding="utf-8").strip() == "beta"
-        assert not (accounts / ".lock").exists()
-        assert http.calls == [("refresh", "beta-token-refresh"), ("usage", "Bearer new-access")]
-
-
-def test_inactive_becomes_live_without_stash_uses_live_file(tmp):
-    def swap_and_remove_stash(accounts):
-        swap(accounts, "beta")
-        (accounts / "beta.json").unlink()
-
-    with refreshing(tmp, "beta") as (mod, accounts, _):
-        errors = {}
-        with on_lock_entry(mod, accounts, 2, swap_and_remove_stash):
-            got = query(mod, accounts, "beta", errors)
-        assert errors == {} and got["five_hour"]["pct"] == 25
-        assert_new_pair(Path(mod.CLAUDE_CRED))
-        assert not (accounts / "beta.json").exists(), "live pair was written to a recreated stash"
+    for kept in (True, False):  # False: the swap also removes the stash, which is not recreated
+        def change(accounts, kept=kept):
+            swap(accounts, "beta")
+            if not kept:
+                (accounts / "beta.json").unlink()
+        with refreshing(os.path.join(tmp, str(kept)), "beta") as (mod, accounts, http):
+            old_beta = (accounts / "beta.json").read_bytes()
+            old_alpha = Path(mod.CLAUDE_CRED).read_bytes()
+            errors = {}
+            with on_lock_entry(mod, accounts, 2, change):
+                got = query(mod, accounts, "beta", errors)
+            assert errors == {} and got["five_hour"]["pct"] == 25
+            assert_new_pair(Path(mod.CLAUDE_CRED))
+            if kept:
+                assert (accounts / "beta.json").read_bytes() == old_beta, "rotation went to inactive snapshot"
+            else:
+                assert not (accounts / "beta.json").exists(), "live pair was written to a recreated stash"
+            assert (accounts / "alpha.json").read_bytes() == old_alpha
+            assert (accounts / "live").read_text(encoding="utf-8").strip() == "beta"
+            assert not (accounts / ".lock").exists()
+            assert http.calls == [("refresh", "beta-token-refresh"), ("usage", "Bearer new-access")]
 
 
 def test_live_swapped_out_by_an_unlocked_writer_during_refresh_writes_original_accounts_stash(tmp):
-    with refreshing(tmp, change=lambda accounts: swap(accounts, "beta", locked=False)) as (mod, accounts, http):
-        beta = (accounts / "beta.json").read_bytes()
-        errors = {}
-        got = query(mod, accounts, "alpha", errors)
-        assert errors == {} and got["five_hour"]["pct"] == 25
-        assert_new_pair(accounts / "alpha.json")
-        assert Path(mod.CLAUDE_CRED).read_bytes() == beta, "rotation overwrote the new live account"
-        assert (accounts / "beta.json").read_bytes() == beta
-        assert (accounts / "live").read_text(encoding="utf-8").strip() == "beta"
-        assert not (accounts / ".lock").exists()
-        assert http.calls == [("refresh", "live-token-refresh"), ("usage", "Bearer new-access")]
+    for kept in (True, False):  # False: the swapped-in account's stash is gone too, and is not overwritten
+        def change(accounts, kept=kept):
+            swap(accounts, "beta", locked=False)
+            if not kept:
+                (accounts / "beta.json").unlink()
+        with refreshing(os.path.join(tmp, str(kept)), change=change) as (mod, accounts, http):
+            beta = (accounts / "beta.json").read_bytes()
+            errors = {}
+            assert switch_error(query, mod, accounts, "alpha", errors) == SWITCHED and errors == {}
+            assert_new_pair(accounts / "alpha.json")
+            assert Path(mod.CLAUDE_CRED).read_bytes() == beta, "rotation overwrote the new live account"
+            assert (accounts / "beta.json").read_bytes() == beta if kept else not (accounts / "beta.json").exists()
+            assert (accounts / "live").read_text(encoding="utf-8").strip() == "beta"
+            assert not (accounts / ".lock").exists()
+            assert http.calls == [("refresh", "live-token-refresh")]
 
 
-def test_live_stash_removed_during_refresh_still_updates_live_file(tmp):
-    with refreshing(tmp, change=lambda accounts: (accounts / "alpha.json").unlink()) as (mod, accounts, _):
-        errors = {}
-        got = query(mod, accounts, "alpha", errors)
-        assert errors == {} and got["five_hour"]["pct"] == 25
-        assert_new_pair(Path(mod.CLAUDE_CRED))
-        assert not (accounts / "alpha.json").exists(), "live rotation was redirected to a recreated stash"
-
-
-def test_live_marker_lost_during_refresh_still_updates_live_file(tmp):
-    for index, marker in enumerate((None, "", "../escape", b"\xff")):
+def test_live_marker_or_stash_lost_during_refresh_still_updates_live_file(tmp):
+    for index, (name, value) in enumerate((("live", None), ("live", ""), ("live", "../escape"), ("live", b"\xff"), ("alpha.json", None))):
         home = Path(tmp) / f"case{index}"
         home.mkdir()
 
-        def lose_marker(accounts, value=marker):
+        def lose(accounts, name=name, value=value):
             if value is None:
-                (accounts / "live").unlink()
+                (accounts / name).unlink()
             elif isinstance(value, bytes):
-                (accounts / "live").write_bytes(value)
+                (accounts / name).write_bytes(value)
             else:
-                (accounts / "live").write_text(value + "\n", encoding="utf-8")
+                (accounts / name).write_text(value + "\n", encoding="utf-8")
 
-        with refreshing(str(home), change=lose_marker) as (mod, accounts, _):
+        with refreshing(str(home), change=lose) as (mod, accounts, _):
             stash = (accounts / "alpha.json").read_bytes()
             errors = {}
-            got = query(mod, accounts, "alpha", errors)
-            assert errors == {} and got["five_hour"]["pct"] == 25
+            assert switch_error(query, mod, accounts, "alpha", errors) == SWITCHED and errors == {}, (name, value)
             assert_new_pair(Path(mod.CLAUDE_CRED))
-            assert (accounts / "alpha.json").read_bytes() == stash
-
-
-def test_swapped_in_account_without_stash_is_not_overwritten(tmp):
-    def swap_and_remove_stash(accounts):
-        swap(accounts, "beta", locked=False)
-        (accounts / "beta.json").unlink()
-
-    with refreshing(tmp, change=swap_and_remove_stash) as (mod, accounts, _):
-        beta = (accounts / "beta.json").read_bytes()
-        errors = {}
-        got = query(mod, accounts, "alpha", errors)
-        assert errors == {} and got["five_hour"]["pct"] == 25
-        assert Path(mod.CLAUDE_CRED).read_bytes() == beta, "missing stash invalidated the current live marker"
-        assert_new_pair(accounts / "alpha.json")
+            if name == "live":
+                assert (accounts / "alpha.json").read_bytes() == stash, value
+            else:
+                assert not (accounts / "alpha.json").exists(), "live rotation was redirected to a recreated stash"
 
 
 def test_swap_between_marker_and_credential_read_cannot_misidentify_pair(tmp):
@@ -275,12 +264,11 @@ def test_swap_between_marker_and_credential_read_cannot_misidentify_pair(tmp):
         errors = {}
         with mock.patch("builtins.open", side_effect=opened), \
                 mock.patch("urllib.request.urlopen", side_effect=request):
-            got = query(mod, accounts, "alpha", errors)
-        assert got["five_hour"]["pct"] == 20, "live query refreshed the wrong account"
+            assert switch_error(query, mod, accounts, "alpha", errors) == SWITCHED
         assert errors == {} and attempted
         assert json.loads((accounts / "alpha.json").read_text(encoding="utf-8"))["claudeAiOauth"]["refreshToken"] == "alpha-refresh-new"
         assert Path(mod.CLAUDE_CRED).read_bytes() == beta, "new live account was modified"
-        assert http.calls == [("refresh", "live-token-refresh"), ("usage", "Bearer alpha-new")]
+        assert http.calls == [("refresh", "live-token-refresh")], "live query refreshed the wrong account"
 
 
 @contextmanager
