@@ -79,7 +79,7 @@ def test_the_caches_are_private_files_in_this_users_home(tmp):
 
 def test_a_backoff_past_the_cap_or_not_finite_is_ignored(tmp):
     mod, cache, cred = rig(tmp, "uq_store_backoff", cached_age=600)
-    in_range = time.time() + mod.BACKOFF_CAP - 60
+    in_range = time.time() + mod.cache_store.BACKOFF_CAP - 60
     for until, held, account in [(until, False, "credentials") for until in (1e300, 10 ** 400, float("inf"), float("nan"), in_range + 120)] + [(in_range, True, "credentials"), (in_range, False, "another")]:
         Path(cache).write_text(json.dumps({"fetched_at": time.time() - 600, "data": PAYLOAD, "backoff": {"streak": 1, "until": until}, "account": account}), encoding="utf-8")
         got, get = query(mod, cache, cred, lambda *_: PAYLOAD)

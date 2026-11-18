@@ -43,7 +43,7 @@ def test_a_429_backs_off_every_later_fetch_until_it_expires(tmp):
     assert get.call_count == 1 and got["weekly"]["pct"] == 8 and "429" in got["_stale_error"]
     backoff = json.load(open(cache, encoding="utf-8"))["backoff"]
     assert backoff["streak"] == 1
-    assert mod.BACKOFF_BASE - 5 <= backoff["until"] - time.time() <= mod.BACKOFF_BASE
+    assert mod.cache_store.BACKOFF_BASE - 5 <= backoff["until"] - time.time() <= mod.cache_store.BACKOFF_BASE
     got, get = query(mod, cache, cred, AssertionError("fetched inside the backoff"))
     assert get.call_count == 0 and "backing off" in got["_stale_error"]
 
@@ -58,7 +58,7 @@ def test_consecutive_429s_double_the_backoff_up_to_the_cap(tmp):
             json.dump(record, open(cache, "w", encoding="utf-8"))
         query(mod, cache, cred, throttled())
         delays.append(round(json.load(open(cache, encoding="utf-8"))["backoff"]["until"] - time.time(), -1))
-    base, cap = mod.BACKOFF_BASE, mod.BACKOFF_CAP
+    base, cap = mod.cache_store.BACKOFF_BASE, mod.cache_store.BACKOFF_CAP
     assert delays == [min(cap, base * 2 ** n) for n in range(6)], delays
     query(mod, cache, cred, throttled(retry_after=cap * 10))
     assert json.load(open(cache, encoding="utf-8"))["backoff"]["until"] - time.time() <= cap
