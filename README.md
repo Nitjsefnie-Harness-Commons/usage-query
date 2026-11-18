@@ -75,7 +75,9 @@ it. A null `five_hour` beside a listed session group still reads as an inactive
 The live entry reuses `usage.claude`'s window readings when the marker still
 names the account that reading was fetched for. After a switch between the two,
 that reading is filed under no account, and the newly live account is read
-through its stash path and `.<name>.usage-cache`. Each account also retains
+through its stash path and `.<name>.usage-cache`. When the live query itself
+failed, including when the switch landed inside it, the live name gets no entry
+and no `claude:<name>` error; `errors.claude` names the failure. Each account also retains
 the reading's optional `_scoped` list, in the same shape as
 `usage.claude._scoped`; readings without scoped limits omit that key.
 Inactive accounts use
