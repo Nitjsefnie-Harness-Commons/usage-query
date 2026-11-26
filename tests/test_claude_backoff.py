@@ -30,9 +30,10 @@ def throttled(retry_after=None):
     return urllib.error.HTTPError("u", 429, "Too Many Requests", headers, io.BytesIO(b""))
 
 
-def query(mod, cache, cred, fetch, probe=RuntimeError("no probe")):
+def query(mod, cache, cred, fetch, probe=RuntimeError("no probe"), scoped=None):
     with mock.patch.object(mod, "_claude_access_token", return_value="t"), \
             mock.patch.object(mod, "_claude_header_probe", side_effect=probe), \
+            mock.patch.object(mod, "_claude_scoped_probe", return_value=scoped or {}), \
             mock.patch.object(mod, "_get_retry", side_effect=fetch) as get:
         return mod.query_claude(cred, cache), get
 
@@ -85,13 +86,60 @@ def test_a_throttled_endpoint_is_read_from_the_inference_headers(tmp):
     got, get = query(mod, cache, cred, throttled(), probe=lambda _t: probed)
     assert get.call_count == 1 and got["weekly"]["pct"] == 49.0 and "_stale_error" not in got
     record = json.load(open(cache, encoding="utf-8"))
-    assert record["backoff"]["streak"] == 1 and record["data"]["five_hour"] == PAYLOAD["five_hour"]
+    assert record["backoff"]["streak"] == 1 and record["data"]["five_hour"]["utilization"] == 7
     record["fetched_at"] = 0  # past the TTL, still inside the backoff
     json.dump(record, open(cache, "w", encoding="utf-8"))
     probed["seven_day"]["utilization"] = 51.0
     got, get = query(mod, cache, cred, AssertionError("fetched inside the backoff"),
                      probe=lambda _t: probed)
     assert get.call_count == 0 and got["weekly"]["pct"] == 51.0 and "_stale_error" not in got
+
+
+def test_a_row_the_header_reading_did_not_refresh_carries_its_own_age(tmp):
+    mod, cache, cred = rig(tmp, "uq_backoff_scoped", cached_age=600)
+    record = json.load(open(cache, encoding="utf-8"))
+    record["data"] = {**PAYLOAD, "limits": [
+        {"group": "weekly", "scope": {"model": {"display_name": name}}, "percent": 40, "resets_at": None}
+        for name in ("ModelX", "ModelY")]}
+    json.dump(record, open(cache, "w", encoding="utf-8"))
+    probed = {"seven_day": {"utilization": 85.0, "resets_at": None}}
+    live = {("ModelX", "weekly"): {"percent": 60.0, "resets_at": None}}
+    for _ in range(2):  # the age is the full reading's, so a second header reading does not reset it
+        got, _ = query(mod, cache, cred, throttled(), probe=lambda _t: probed, scoped=live)
+        fresh, old = got["_scoped"]
+        assert (fresh["pct"], "stale_age" in fresh, old["pct"]) == (60.0, False, 40.0), got
+        assert 600 <= old["stale_age"] < 660 and 600 <= got["five_hour"]["stale_age"] < 660, got
+        assert "stale_age" not in got["weekly"] and "_stale_age" not in got, got
+        labels = [row[1] for row in mod._table_rows("Claude", got)]
+        assert labels[2] == "7d:ModelX" and labels[3].startswith("7d:ModelY (cached 6"), labels
+        record = json.load(open(cache, encoding="utf-8"))
+        record["fetched_at"] -= mod.CLAUDE_ACCOUNT_CACHE_TTL  # past the TTL for the second pass
+        record["backoff"]["until"] = 0
+        json.dump(record, open(cache, "w", encoding="utf-8"))
+    full = {**PAYLOAD, "limits": [{"group": "weekly", "scope": {"surface": "s"}, "percent": 1, "resets_at": None}]}
+    got, _ = query(mod, cache, cred, lambda *_: full)
+    assert "stale_age" not in got["_scoped"][0] and "stale_age" not in got["five_hour"], got
+
+
+def test_a_scoped_window_is_read_from_a_request_on_its_own_model(tmp):
+    mod = _util.load(USAGE_QUERY, "uq_backoff_scoped_probe")
+    asked = []
+
+    def headers(_token, model, *_):
+        asked.append(model)
+        return {"anthropic-ratelimit-unified-7d-utilization": "0.29",
+                "anthropic-ratelimit-unified-7d_oi-utilization": "0.21",
+                "anthropic-ratelimit-unified-7d_oi-reset": "86400"}
+    listing = {"data": [{"id": "model-x-2", "display_name": "Vendor ModelX 2"},
+                        {"id": "model-x-1", "display_name": "Vendor ModelX 1"},
+                        {"id": "model-xl-9", "display_name": "Vendor ModelXL 9"}]}
+    limits = [{"group": "weekly", "scope": {"model": {"display_name": name}}}
+              for name in ("ModelX", "Absent")] + [{"group": "weekly", "scope": None}]
+    with mock.patch.object(mod.claude_probe, "_open", side_effect=lambda *_: io.StringIO(json.dumps(listing))), \
+            mock.patch.object(mod.claude_probe, "response_headers", side_effect=headers):
+        live = mod._claude_scoped_probe("t", limits)
+    assert asked == ["model-x-2"], asked
+    assert live == {("ModelX", "weekly"): {"percent": 21.0, "resets_at": "1970-01-02T00:00:00Z"}}, live
 
 
 if __name__ == "__main__":
