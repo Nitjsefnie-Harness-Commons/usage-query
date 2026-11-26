@@ -145,7 +145,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from . import cache_store, claude_probe, claude_state, zai_schedule
 
-__version__ = "1.10.6"
+__version__ = "1.11.0"
 
 CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CRED = os.path.expanduser("~/.claude/.credentials.json")
