@@ -158,12 +158,18 @@ at 3600). Until it expires this command does not ask the usage endpoint for
 that account. Instead, right after the 429 and on every run during the backoff
 whose cache holds no reading or one older than its five-minute TTL, it sends
 `POST https://api.anthropic.com/v1/messages` with the account's OAuth access
-token, model `claude-haiku-5-5` (`CLAUDE_PROBE_MODEL`) and `max_tokens` 1, and
+token, model `claude-haiku-5-5` (`claude_probe.PROBE_MODEL`) and `max_tokens` 1, and
 takes the 5h and 7d windows from the response's
 `anthropic-ratelimit-unified-5h-utilization`, `-5h-reset`,
-`-7d-utilization` and `-7d-reset` headers; the rest of the last cached payload,
-scoped limits included, stays as it was. That probe is an inference request,
-so each one is a model call on the account. If it fails or carries no 7d
+`-7d-utilization` and `-7d-reset` headers. A model-scoped limit of the last
+cached payload is read the same way from a second request on its own model, the
+newest one `GET https://api.anthropic.com/v1/models` lists under the scope's
+name, whose response alone carries that window (`-7d_<suffix>-utilization` and
+`-7d_<suffix>-reset`). A row neither request refreshed keeps its last value and
+carries `stale_age`, the seconds since the full reading it came from: in JSON on
+that `five_hour` or `_scoped` entry, in the table as `(cached Ns)` after the
+window label. Each probe is an inference request, so each one is a model call
+on the account. If it fails or carries no 7d
 header, the last cached reading is served with `_stale_error` naming the 429
 (`HTTPError: HTTP Error 429: backing off until <time>` during the backoff), or
 the account reports an error when nothing is cached. The next successful usage

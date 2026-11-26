@@ -143,7 +143,7 @@ import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from . import cache_store, claude_state, zai_schedule
+from . import cache_store, claude_probe, claude_state, zai_schedule
 
 __version__ = "1.10.6"
 
@@ -425,36 +425,12 @@ def _get_retry(url, headers):
 # session, so on a box with many sessions it answers 429 for hours. Every
 # inference response carries the same utilization in its
 # anthropic-ratelimit-unified-* headers; a one-token request reads them.
-CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
-CLAUDE_PROBE_MODEL = "claude-haiku-5-5"
-
-
 def _claude_header_probe(token):
-    """The usage payload's five_hour/seven_day blocks, from one minimal
-    inference request's rate-limit headers. Raises when none come back."""
-    body = json.dumps({
-        "model": CLAUDE_PROBE_MODEL, "max_tokens": 1,
-        "system": [{"type": "text",
-                    "text": "You are Claude Code, Anthropic's official CLI for Claude."}],
-        "messages": [{"role": "user", "content": "."}]}).encode()
-    req = urllib.request.Request(CLAUDE_MESSAGES_URL, data=body, method="POST", headers={
-        "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
-        "anthropic-version": "2023-06-01", "content-type": "application/json",
-        "User-Agent": CLAUDE_UA})
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-        headers = r.headers
-    out = {}
-    for name, window in (("five_hour", "5h"), ("seven_day", "7d")):
-        util = headers.get(f"anthropic-ratelimit-unified-{window}-utilization")
-        if util is None:
-            continue
-        reset = headers.get(f"anthropic-ratelimit-unified-{window}-reset")
-        out[name] = {"utilization": round(float(util) * 100, 1),
-                     "resets_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                                time.gmtime(int(reset))) if reset else None}
-    if "seven_day" not in out:
-        raise RuntimeError("no anthropic-ratelimit-unified-7d-utilization header")
-    return out
+    return claude_probe.windows(token, CLAUDE_UA, TIMEOUT)
+
+
+def _claude_scoped_probe(token, limits):
+    return claude_probe.scoped(token, limits, CLAUDE_UA, TIMEOUT)
 
 
 def _claude_live_marker(directory):
@@ -932,8 +908,10 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
         note = ("HTTPError: HTTP Error 429: backing off until "
                 + time.strftime("%H:%M:%S", time.localtime(until)))
         try:
-            data = cache_store.write_probed(cache_path, c, _claude_header_probe(
-                same(_claude_access_token(cred_path, errors))), same(account))
+            token = same(_claude_access_token(cred_path, errors))
+            data = cache_store.write_probed(
+                cache_path, c, _claude_header_probe(token), same(account),
+                _claude_scoped_probe(token, (c.get("data") or {}).get("limits")))
         except _ClaudeSwitched:
             raise
         except Exception as exc:
@@ -961,7 +939,9 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
                     cache_store.write_backoff(cache_path, c, same(account), _retry_after(e))
                     try:
                         backed = cache_store.read(cache_path, cache_ttl, account)[0]
-                        data = cache_store.write_probed(cache_path, backed, _claude_header_probe(token), same(account))
+                        data = cache_store.write_probed(
+                            cache_path, backed, _claude_header_probe(token), same(account),
+                            _claude_scoped_probe(token, (backed.get("data") or {}).get("limits")))
                     except _ClaudeSwitched:
                         raise
                     except Exception:
@@ -991,6 +971,8 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
                     "recover_in": _recover_dur(block["resets_at"],
                                                CLAUDE_WINDOW_SECS.get(key),
                                                float(block["utilization"]))}
+        if block.get("_full_at"):
+            out[key]["stale_age"] = int(now - block["_full_at"])
     # Model- or surface-SCOPED caps live ONLY in the limits[] array — the flat
     # five_hour/seven_day utilization fields above never carry them, and the
     # per-model seven_day_opus/seven_day_sonnet keys are null. A scoped weekly
@@ -1018,6 +1000,8 @@ def query_claude(cred_path=None, cache_path=None, cache_ttl=CLAUDE_ACCOUNT_CACHE
                        "recover_in": _recover_dur(it.get("resets_at"),
                                                   group_secs.get(group),
                                                   float(it.get("percent") or 0))})
+        if it.get("_full_at"):
+            scoped[-1]["stale_age"] = int(now - it["_full_at"])
     if scoped:
         out["_scoped"] = scoped
     if age:
@@ -2360,6 +2344,8 @@ def _table_rows(account, res):
             continue
         if w.get("peak_note"):
             label += f" ({w['peak_note']})"
+        if w.get("stale_age"):
+            label += f" (cached {w['stale_age']}s)"
         pace = w.get("pace_pct")
         rec = w.get("recover_in")
         flag = ("OVER PACE" + (f" (on pace in {rec})" if rec else "")
@@ -2380,6 +2366,8 @@ def _table_rows(account, res):
     for sc in res.get("_scoped") or []:
         label = sc["label"] + (f" ({sc['peak_note']})"
                                if sc.get("peak_note") else "")
+        if sc.get("stale_age"):
+            label += f" (cached {sc['stale_age']}s)"
         pace = sc.get("pace_pct")
         rec = sc.get("recover_in")
         flag = ("OVER PACE" + (f" (on pace in {rec})" if rec else "")

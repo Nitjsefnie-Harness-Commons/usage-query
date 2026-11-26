@@ -86,10 +86,25 @@ def write_backoff(path, cached, account, retry_after=None):
     return record["backoff"]["until"]
 
 
-def write_probed(path, cached, probed, account):
-    """Cache the probed windows over the last payload, keeping any backoff."""
+def write_probed(path, cached, probed, account, live=None):
+    """Cache the probed windows and live scoped limits over the last payload, keeping any backoff."""
     record = {k: v for k, v in (cached or {}).items() if k == "backoff"}
     data = dict((cached or {}).get("data") or {})
+    read_at = {"_full_at": (cached or {}).get("fetched_at")}
+    if isinstance(data.get("five_hour"), dict):
+        data["five_hour"] = {**read_at, **data["five_hour"]}
+    limits = []
+    for it in data.get("limits") or []:
+        scope = it.get("scope") or {}
+        fresh = (live or {}).get(((scope.get("model") or {}).get("display_name"),
+                                  it.get("group")))
+        if fresh:
+            it = {k: v for k, v in it.items() if k != "_full_at"} | fresh
+        elif scope:
+            it = {**read_at, **it}
+        limits.append(it)
+    if limits:
+        data["limits"] = limits
     data.update(probed)
     record.update({"fetched_at": time.time(), "data": data})
     write(path, record, account)
